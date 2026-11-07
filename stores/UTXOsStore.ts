@@ -1,0 +1,402 @@
+import { action, observable, runInAction } from 'mobx';
+import Storage from '../storage';
+
+import SettingsStore from './SettingsStore';
+import SyncStore from './SyncStore';
+
+import BackendUtils from '../utils/BackendUtils';
+import { toWalletrpcAddressTypeName } from '../utils/LndUtils';
+
+import Account from '../models/Account';
+import Utxo from '../models/Utxo';
+
+export const LEGACY_HIDDEN_ACCOUNTS_KEY = 'hidden-accounts';
+export const HIDDEN_ACCOUNTS_KEY = 'zeus-hidden-accounts';
+
+export default class UTXOsStore {
+    // utxos
+    @observable public loading = false;
+    @observable public success = false;
+    @observable public error = false;
+    @observable public errorMsg: string;
+    @observable public utxos: Array<Utxo> = [];
+    // accounts
+    @observable public loadingAccounts = false;
+    @observable public importingAccount = false;
+    @observable public accounts: any = [];
+    @observable public accountToImport: any | null;
+    @observable public start_height?: number;
+    @observable public addresses_to_generate: number = 50;
+    @observable public addresses_to_generate_progress: number = 1;
+    // rescan
+    @observable public attemptingRescan = false;
+    @observable public rescanErrorMsg: string;
+    // addresses
+    @observable public loadingAddresses: boolean = false;
+    @observable public accountsWithAddresses = [];
+    @observable public loadingAddressesError: string = '';
+    //
+    settingsStore: SettingsStore;
+    syncStore: SyncStore;
+
+    constructor(settingsStore: SettingsStore, syncStore: SyncStore) {
+        this.settingsStore = settingsStore;
+        this.syncStore = syncStore;
+    }
+
+    @action
+    public reset = () => {
+        this.error = false;
+        this.loading = false;
+        this.success = false;
+        this.loadingAccounts = false;
+        this.importingAccount = false;
+        this.errorMsg = '';
+        this.accounts = [];
+        this.accountToImport = null;
+        this.utxos = [];
+        // addresses
+        this.loadingAddresses = false;
+        this.accountsWithAddresses = [];
+        this.loadingAddressesError = '';
+    };
+
+    @action
+    private getUtxosError = () => {
+        this.error = true;
+        this.loading = false;
+        this.utxos = [];
+    };
+
+    @action
+    public getUTXOs = (data: any) => {
+        this.errorMsg = '';
+        this.loading = true;
+
+        const request: any = {
+            min_confs: 0,
+            max_confs: 200000
+        };
+
+        if (data && data.account) {
+            request.account = data.account;
+        }
+
+        BackendUtils.getUTXOs(data)
+            .then((data: any) => {
+                runInAction(() => {
+                    this.loading = false;
+                    const utxos = data.utxos || data.outputs;
+                    this.utxos = utxos.map((utxo: any) => new Utxo(utxo));
+                    this.error = false;
+                });
+            })
+            .catch((error: any) => {
+                runInAction(() => {
+                    this.errorMsg = error.toString();
+                    this.getUtxosError();
+                });
+            });
+    };
+
+    @action
+    public hideAccount = async (name: string) => {
+        let hiddenAccounts: Array<string> = [];
+        try {
+            const hiddenString = await Storage.getItem(HIDDEN_ACCOUNTS_KEY);
+            hiddenAccounts = JSON.parse(hiddenString || '[]');
+
+            if (!hiddenAccounts.includes(name)) hiddenAccounts.push(name);
+
+            await Storage.setItem(HIDDEN_ACCOUNTS_KEY, hiddenAccounts);
+
+            this.listAccounts();
+        } catch (error) {
+            console.log('Error loading hidden account list:', error);
+        }
+    };
+    @action
+    public unhideAccount = async (name: string) => {
+        let hiddenAccounts: Array<string> = [];
+        try {
+            const hiddenString = await Storage.getItem(HIDDEN_ACCOUNTS_KEY);
+            hiddenAccounts = JSON.parse(hiddenString || '[]');
+
+            if (hiddenAccounts.includes(name)) {
+                hiddenAccounts = hiddenAccounts.filter((item) => item !== name);
+            }
+
+            await Storage.setItem(HIDDEN_ACCOUNTS_KEY, hiddenAccounts);
+
+            this.listAccounts();
+        } catch (error) {
+            console.log('Error loading hidden account list:', error);
+        }
+    };
+
+    @action
+    public listAccounts = async (data?: any) => {
+        let hiddenAccounts: Array<string> = [];
+        try {
+            const hiddenString = await Storage.getItem(HIDDEN_ACCOUNTS_KEY);
+            if (hiddenString) {
+                hiddenAccounts = JSON.parse(hiddenString);
+            }
+        } catch (error) {
+            console.log('Error loading hidden account list:', error);
+        }
+
+        runInAction(() => {
+            this.errorMsg = '';
+            this.loadingAccounts = true;
+        });
+
+        return BackendUtils.listAccounts(data)
+            .then(async (data: any) => {
+                const accounts: any = [];
+                for (const i in data.accounts) {
+                    const account = new Account(data.accounts[i]);
+                    const { name } = account;
+                    if (
+                        name &&
+                        name !== 'default' &&
+                        name !== 'imported' &&
+                        !name.includes('act:')
+                    ) {
+                        await BackendUtils.getBlockchainBalance({
+                            account: name
+                        })
+                            .then((data: any) => {
+                                accounts.push({
+                                    ...account,
+                                    XFP: account.XFP,
+                                    balance: data.total_balance,
+                                    hidden: hiddenAccounts.includes(name)
+                                });
+
+                                return;
+                            })
+                            .catch((e: Error) => {
+                                console.error(
+                                    'error fetching account balance',
+                                    e
+                                );
+                                return;
+                            });
+                    }
+                }
+                runInAction(() => {
+                    this.accounts = accounts;
+                    this.loadingAccounts = false;
+                    this.error = false;
+                });
+                return this.accounts;
+            })
+            .catch((error: any) => {
+                runInAction(() => {
+                    this.errorMsg = error.toString();
+                    this.getUtxosError();
+                });
+            });
+    };
+
+    // Resolves an imported account's address type (as the walletrpc enum
+    // name) so address requests can match the account's key scope; lnd
+    // rejects requests whose type doesn't match it (ZEUS-2223 / ZEUS-2932).
+    public getAccountAddressType = async (
+        name: string
+    ): Promise<string | undefined> => {
+        const cached = this.accounts.find(
+            (account: any) => account.name === name
+        );
+        const cachedType = toWalletrpcAddressTypeName(cached?.address_type);
+        if (cachedType) return cachedType;
+        try {
+            const data = await BackendUtils.listAccounts();
+            const match = (data?.accounts || []).find(
+                (account: any) => account.name === name
+            );
+            return toWalletrpcAddressTypeName(match?.address_type);
+        } catch (e) {
+            console.error('error resolving account address type', e);
+            return undefined;
+        }
+    };
+
+    @action
+    public importAccount = (data: any) => {
+        this.errorMsg = '';
+        this.success = false;
+        this.importingAccount = true;
+        if (data.dry_run) {
+            this.start_height = undefined;
+            this.addresses_to_generate = 50;
+        }
+
+        if (data.birthday_height) {
+            this.start_height = data.birthday_height;
+        }
+
+        if (data.addresses_to_generate) {
+            this.addresses_to_generate_progress = 1;
+            this.addresses_to_generate = data.addresses_to_generate || 50;
+        }
+
+        // the dry run captures the birthday into start_height; the real
+        // import from ImportingAccount doesn't resend it
+        const birthday_height = data.birthday_height || this.start_height;
+
+        // addresses_to_generate only drives the Zeus-side address
+        // pre-generation above; no backend knows it. birthday_height is a
+        // Zeus lnd-fork extension (walletrpc ImportAccountRequest field 6)
+        // the embedded node uses to move the wallet birthday back to the
+        // account's; upstream lnd stops at dry_run = 5, and while REST
+        // silently drops unknown fields, LNC's proto JSON unmarshaler
+        // rejects the whole request over them.
+        const {
+            birthday_height: _birthdayHeight,
+            addresses_to_generate: _addressesToGenerate,
+            ...importRequest
+        } = data;
+        if (birthday_height && BackendUtils.supportsAccountImportRescan()) {
+            importRequest.birthday_height = birthday_height;
+        }
+
+        return BackendUtils.importAccount(importRequest)
+            .then(async (response: any) => {
+                if (!data.dry_run) {
+                    if (this.start_height) {
+                        // generate N addresses from account
+                        for (let i = 0; i < this.addresses_to_generate; i++) {
+                            this.addresses_to_generate_progress = i + 1;
+                            await BackendUtils.getNewAddress({
+                                account: this.accountToImport.account.name,
+                                type: toWalletrpcAddressTypeName(
+                                    this.accountToImport.account.address_type
+                                )
+                            }).then((response: any) => {
+                                console.log(
+                                    `generated address ${i}`,
+                                    response.address
+                                );
+                            });
+                            await BackendUtils.getNewChangeAddress({
+                                account: this.accountToImport.account.name,
+                                type: toWalletrpcAddressTypeName(
+                                    this.accountToImport.account.address_type
+                                ),
+                                change: true
+                            }).then((response: any) => {
+                                console.log(
+                                    `generated change address ${i}`,
+                                    response.addr
+                                );
+                            });
+                        }
+
+                        // rescan is a Zeus lnd-fork RPC; on backends
+                        // without it BackendUtils.call returns false and
+                        // the .then would throw into the outer catch,
+                        // reporting a successful import as failed
+                        if (BackendUtils.supportsAccountImportRescan()) {
+                            console.log(
+                                'Starting rescan at height',
+                                this.start_height
+                            );
+
+                            BackendUtils.rescan({
+                                start_height: this.start_height
+                            })
+                                .then((response: any) => {
+                                    console.log('rescan resp', response);
+                                })
+                                .catch((err: Error) => {
+                                    console.log('rescan err', err);
+                                });
+                        }
+                    }
+
+                    runInAction(() => {
+                        this.importingAccount = false;
+                        this.error = false;
+                        this.success = true;
+                    });
+                    // refresh so the new account shows up on the balance
+                    // pane without a manual pull-to-refresh
+                    this.listAccounts();
+                    return;
+                } else {
+                    runInAction(() => {
+                        this.importingAccount = false;
+                        this.error = false;
+                        this.accountToImport = response;
+                    });
+                    return this.accountToImport;
+                }
+            })
+            .catch((error: any) => {
+                runInAction(() => {
+                    this.errorMsg = error.toString();
+                    this.success = false;
+                    this.accountToImport = null;
+                    this.importingAccount = false;
+                    this.start_height = undefined;
+                    this.getUtxosError();
+                });
+            });
+    };
+
+    @action
+    public rescan = (blockHeight: number) => {
+        this.rescanErrorMsg = '';
+        this.attemptingRescan = true;
+
+        // Start tracking rescan progress via logs
+        this.syncStore.startRescanTracking(blockHeight);
+
+        return BackendUtils.rescan({
+            start_height: blockHeight
+        })
+            .then((response: any) => {
+                console.log('rescan resp', response);
+                this.attemptingRescan = false;
+                // Note: Don't stop tracking here - let log parsing detect completion
+                return;
+            })
+            .catch((err: Error) => {
+                console.log('rescan err', err);
+                runInAction(() => {
+                    this.attemptingRescan = false;
+                    this.rescanErrorMsg = err.toString();
+                });
+                this.syncStore.stopRescanTracking();
+                return;
+            });
+    };
+
+    @action
+    public listAddresses = async () => {
+        this.loadingAddresses = true;
+        this.accountsWithAddresses = [];
+        this.loadingAddressesError = '';
+
+        return await new Promise((resolve, reject) => {
+            BackendUtils.listAddresses()
+                .then((response: any) => {
+                    runInAction(() => {
+                        this.accountsWithAddresses =
+                            response.account_with_addresses;
+                        this.loadingAddresses = false;
+                    });
+                    resolve(this.accountsWithAddresses);
+                })
+                .catch((err: Error) => {
+                    runInAction(() => {
+                        this.loadingAddressesError = err.toString();
+                        this.loadingAddresses = false;
+                    });
+                    reject();
+                });
+        });
+    };
+}

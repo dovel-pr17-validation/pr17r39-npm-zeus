@@ -1,0 +1,393 @@
+import url from 'url';
+import * as React from 'react';
+import { inject, observer } from 'mobx-react';
+import { Alert, StyleSheet, Text, View } from 'react-native';
+import querystring from 'querystring-es3';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Button from '../components/Button';
+import Header from '../components/Header';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Screen from '../components/Screen';
+import {
+    SuccessMessage,
+    ErrorMessage
+} from '../components/SuccessErrorMessage';
+
+import { themeColor } from '../utils/ThemeUtils';
+import { localeString } from '../utils/LocaleUtils';
+import BackendUtils from '../utils/BackendUtils';
+import { verifyLnurlAuthCallback } from '../utils/LnurlPayUtils';
+import {
+    LNURLAUTH_CANONICAL_PHRASE,
+    signLnurlAuthChallenge
+} from '../utils/LnurlAuthUtils';
+import { fetchLnurlUrl } from '../utils/LnurlFetchUtils';
+import DropdownSetting from '../components/DropdownSetting';
+import SettingsStore, { LNDHUB_AUTH_MODES } from '../stores/SettingsStore';
+
+interface LnurlAuthProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+    route: Route<'LnurlAuth', { lnurlParams: any }>;
+}
+
+interface LnurlAuthState {
+    domain: string;
+    action: string;
+    k1: string;
+    linkingKeyPub: string;
+    signedMessageDERHex: string;
+    preparingSignature: boolean;
+    authenticating: boolean;
+    signatureSuccess: boolean;
+    lnurlAuthSuccess: boolean;
+    errorMsgAuth: string;
+    lndHubLnAuthMode: string;
+    chooseAuthMode: boolean;
+}
+
+@inject('SettingsStore')
+@observer
+export default class LnurlAuth extends React.Component<
+    LnurlAuthProps,
+    LnurlAuthState
+> {
+    constructor(props: LnurlAuthProps) {
+        super(props);
+
+        try {
+            this.state = this.stateFromProps(props);
+        } catch (err: any) {
+            this.state = {
+                domain: '',
+                action: '',
+                k1: '',
+                linkingKeyPub: '',
+                signedMessageDERHex: '',
+                preparingSignature: false,
+                authenticating: false,
+                signatureSuccess: false,
+                lnurlAuthSuccess: false,
+                errorMsgAuth: '',
+                lndHubLnAuthMode: 'Alby',
+                chooseAuthMode: false
+            };
+
+            Alert.alert(
+                localeString('views.LnurlPay.LnurlPay.invalidParams'),
+                err.message,
+                [{ text: localeString('general.ok'), onPress: () => void 0 }],
+                { cancelable: false }
+            );
+        }
+    }
+
+    stateFromProps(props: LnurlAuthProps) {
+        const { route } = props;
+        const lnurl = route.params?.lnurlParams;
+
+        // the callback host must match the domain that is displayed and
+        // used for linking-key derivation, or an ambiguous URL could send
+        // a valid signature for one service to another
+        const callbackCheck = verifyLnurlAuthCallback(
+            lnurl.callback,
+            lnurl.domain
+        );
+        if (!callbackCheck.ok) {
+            // callbackCheck.reason is a developer-facing diagnostic; the user
+            // gets the localized message below
+            throw new Error(localeString('views.LnurlAuth.unsafeCallback'));
+        }
+
+        return {
+            domain: lnurl.domain,
+            action: lnurl.action,
+            k1: lnurl.k1,
+            linkingKeyPub: '',
+            signedMessageDERHex: '',
+            preparingSignature: false,
+            authenticating: false,
+            signatureSuccess: false,
+            lnurlAuthSuccess: false,
+            errorMsgAuth: 'Error',
+            lndHubLnAuthMode: 'Alby',
+            chooseAuthMode: false
+        };
+    }
+
+    async triggerSign() {
+        this.setState({ preparingSignature: true });
+
+        const body = LNURLAUTH_CANONICAL_PHRASE;
+
+        return BackendUtils.lnurlAuth(body)
+            .then((signature: any) => {
+                // got the signed message, now build the linking key
+                const { linkingKeyPub, signedMessageDERHex } =
+                    signLnurlAuthChallenge(
+                        signature.signature,
+                        this.state.domain,
+                        this.state.k1
+                    );
+
+                this.setState({
+                    linkingKeyPub,
+                    signedMessageDERHex,
+                    preparingSignature: false,
+                    signatureSuccess: true
+                });
+
+                return { linkingKeyPub, signedMessageDERHex };
+            })
+            .catch((error: any) => {
+                // handle error
+                this.setState({
+                    preparingSignature: false,
+                    errorMsgAuth: error.toString()
+                });
+            });
+    }
+
+    componentDidMount() {
+        // domain is only empty when constructor validation failed;
+        // never derive or sign in that state
+        if (!this.state.domain) return;
+
+        const { implementation } = this.props.SettingsStore;
+        if (implementation === 'lndhub') {
+            this.props.SettingsStore.updateSettings({
+                lndHubLnAuthMode: this.state.lndHubLnAuthMode
+            });
+            this.setState({ chooseAuthMode: true });
+        } else {
+            this.triggerSign();
+        }
+    }
+
+    sendValues(signResult?: {
+        linkingKeyPub: string;
+        signedMessageDERHex: string;
+    }) {
+        this.setState({ authenticating: true });
+
+        const linkingKeyPub =
+            signResult?.linkingKeyPub ?? this.state.linkingKeyPub;
+        const signedMessageDERHex =
+            signResult?.signedMessageDERHex ?? this.state.signedMessageDERHex;
+
+        const { route } = this.props;
+        const lnurl = route.params?.lnurlParams;
+
+        // last gate before the signature leaves the device: the host the
+        // request goes to must still be the domain the key was derived for
+        const callbackCheck = verifyLnurlAuthCallback(
+            lnurl.callback,
+            this.state.domain
+        );
+        if (!callbackCheck.ok) {
+            this.setState({
+                authenticating: false,
+                signatureSuccess: false,
+                errorMsgAuth: localeString('views.LnurlAuth.unsafeCallback')
+            });
+            return;
+        }
+
+        const u = url.parse(lnurl.callback);
+        const qs = querystring.parse(u.query);
+        qs.key = linkingKeyPub;
+        qs.sig = signedMessageDERHex;
+
+        u.search = querystring.stringify(qs);
+        u.query = querystring.stringify(qs);
+
+        fetchLnurlUrl(url.format(u))
+            .then((response: any) => {
+                try {
+                    const data = response.json();
+                    return data;
+                } catch (err) {
+                    this.setState({
+                        signatureSuccess: false,
+                        authenticating: false,
+                        errorMsgAuth: response.text()
+                    });
+                    return { status: 'ERROR', reason: response.text() };
+                }
+            })
+            .catch((err: any) => ({
+                status: 'ERROR',
+                reason: err.message
+            }))
+            .then((data: any) => {
+                if (data.status === 'ERROR') {
+                    this.setState({
+                        authenticating: false,
+                        signatureSuccess: false,
+                        errorMsgAuth: data.reason
+                    });
+                    return;
+                } else {
+                    this.setState({
+                        authenticating: false,
+                        signatureSuccess: false,
+                        lnurlAuthSuccess: true
+                    });
+                }
+            });
+    }
+
+    render() {
+        const { navigation, SettingsStore } = this.props;
+        const {
+            domain,
+            preparingSignature,
+            signatureSuccess,
+            authenticating,
+            lnurlAuthSuccess,
+            errorMsgAuth,
+            chooseAuthMode
+        } = this.state;
+
+        const hasError =
+            !preparingSignature &&
+            !signatureSuccess &&
+            !chooseAuthMode &&
+            !authenticating &&
+            !lnurlAuthSuccess;
+
+        const LndHubAuthMode = () => (
+            <DropdownSetting
+                title={localeString('views.LnurlAuth.lndHubAuthMode')}
+                selectedValue={this.state.lndHubLnAuthMode}
+                onValueChange={async (value: string) => {
+                    this.setState({
+                        lndHubLnAuthMode: value
+                    });
+                    await SettingsStore.updateSettings({
+                        lndHubLnAuthMode: value
+                    });
+                    this.triggerSign();
+                }}
+                values={LNDHUB_AUTH_MODES}
+            />
+        );
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.LnurlAuth.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    navigation={navigation}
+                />
+                <View style={styles.content}>
+                    <Text
+                        style={{
+                            padding: 20,
+                            fontSize: 22,
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Medium',
+                            textAlign: 'center'
+                        }}
+                    >
+                        {domain}
+                    </Text>
+
+                    {this.state.chooseAuthMode && (
+                        <View style={styles.content}>
+                            <View style={styles.dropdown}>
+                                <LndHubAuthMode />
+                            </View>
+                        </View>
+                    )}
+                    {(preparingSignature || authenticating) && (
+                        <LoadingIndicator />
+                    )}
+                    {lnurlAuthSuccess && (
+                        <SuccessMessage
+                            message={localeString(
+                                'views.LnurlAuth.loginSuccess'
+                            )}
+                        />
+                    )}
+                    {hasError && (
+                        <ErrorMessage
+                            message={
+                                errorMsgAuth || localeString('general.error')
+                            }
+                        />
+                    )}
+                </View>
+
+                <View style={{ marginBottom: 15 }}>
+                    {(hasError || lnurlAuthSuccess) && (
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString('general.goBack')}
+                                onPress={() => {
+                                    navigation.navigate('Wallet');
+                                }}
+                            />
+                        </View>
+                    )}
+                    {!hasError && !lnurlAuthSuccess && (
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString('views.LnurlAuth.login')}
+                                icon={{
+                                    name: 'vpn-key',
+                                    size: 25,
+                                    color: 'white'
+                                }}
+                                onPress={async () => {
+                                    if (chooseAuthMode && !signatureSuccess) {
+                                        this.setState({
+                                            chooseAuthMode: false
+                                        });
+                                        const signResult =
+                                            await this.triggerSign();
+                                        if (signResult)
+                                            this.sendValues(signResult);
+                                    } else {
+                                        this.sendValues();
+                                    }
+                                }}
+                                disabled={
+                                    (!signatureSuccess && !chooseAuthMode) ||
+                                    authenticating
+                                }
+                                buttonStyle={{
+                                    backgroundColor: themeColor('highlight')
+                                }}
+                            />
+                        </View>
+                    )}
+                </View>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    content: {
+        flex: 1,
+        paddingLeft: 20,
+        paddingRight: 20
+    },
+    button: {
+        paddingTop: 15,
+        paddingBottom: 15
+    },
+    dropdown: {
+        paddingLeft: 20,
+        paddingRight: 20
+    }
+});

@@ -1,0 +1,435 @@
+import CashuDevKit, { CDKToken } from '../cashu-cdk';
+
+export enum MintPaymentStatus {
+    IDLE = 'idle',
+    REQUESTING = 'requesting',
+    PAYING = 'paying',
+    SUCCESS = 'success',
+    FAILED = 'failed'
+}
+
+export interface MintProgressInfo {
+    mintUrl: string;
+    mintName?: string;
+    balance: number;
+    selected: boolean;
+    status: MintPaymentStatus;
+    allocatedAmount?: number;
+    feePaid?: number;
+    error?: string;
+}
+
+export enum MultinutPaymentStep {
+    SELECT = 'select',
+    PROCESSING = 'processing',
+    COMPLETE = 'complete',
+    FAILED = 'failed'
+}
+
+export type MultimintProgressCallback = (progress: {
+    step: MultinutPaymentStep;
+    mints: MintProgressInfo[];
+    totalSelectedBalance: number;
+    isProcessing: boolean;
+}) => void;
+
+export const cashuTokenPrefixes = [
+    'https://wallet.nutstash.app/#',
+    'https://wallet.cashu.me/?token=',
+    'web+cashu://',
+    'cashu://',
+    'cashu:'
+];
+
+/**
+ * Where a wallet's cashu seed came from. All three are stored under the
+ * same `v2-bip39` seed version, but they carry very different backup and
+ * disclosure consequences, so the seed export screen has to tell them
+ * apart before it can describe the words it is about to reveal.
+ */
+export enum CashuSeedOrigin {
+    /**
+     * The cashu seed *is* the wallet's own seed, verbatim. A 12-word LDK
+     * mnemonic already carries 128 bits of entropy, so `getCDKMnemonic`
+     * uses it directly rather than deriving from it. Revealing these
+     * words reveals the whole wallet, not just the ecash in it.
+     */
+    WalletSeed = 'wallet-seed',
+    /**
+     * Deterministically derived from the wallet seed (bytes 48:64 of the
+     * BIP-39 seed) for 24-word LDK and LND wallets. Distinct from the
+     * wallet seed, and re-derivable from it, so the wallet backup covers
+     * it.
+     */
+    DerivedFromWalletSeed = 'derived-from-wallet-seed',
+    /**
+     * Generated independently because the wallet has no seed to derive
+     * from (remote nodes). Nothing else can reproduce it, so these words
+     * are the only copy and must be backed up separately.
+     */
+    Independent = 'independent'
+}
+
+/**
+ * Classifies a wallet's cashu seed, mirroring the branches in
+ * `CashuStore.getCDKMnemonic`.
+ *
+ * Assumes a stored cashu seed on a wallet that has its own seed was
+ * derived from it, which holds because that is the only way one is
+ * persisted on such wallets.
+ */
+export const classifyCashuSeedOrigin = (
+    cashuSeedPhrase?: string[],
+    ldkMnemonic?: string,
+    lndSeedPhrase?: string[]
+): CashuSeedOrigin => {
+    const cashuSeed = cashuSeedPhrase?.join(' ').trim();
+    const walletSeed = ldkMnemonic?.trim().split(/\s+/).join(' ');
+
+    if (cashuSeed && walletSeed && cashuSeed === walletSeed) {
+        return CashuSeedOrigin.WalletSeed;
+    }
+
+    if (walletSeed || (lndSeedPhrase && lndSeedPhrase.length > 0)) {
+        return CashuSeedOrigin.DerivedFromWalletSeed;
+    }
+
+    return CashuSeedOrigin.Independent;
+};
+
+/**
+ * Resolves the lock target SendEcash keeps after returning from Lock
+ * Settings. A contact name only labels the pubkey it was chosen with, so it
+ * is dropped whenever the resolved pubkey is empty (the lock was removed) or
+ * changed without a new name. Otherwise Lock Settings reopens showing a
+ * contact chip with no pubkey behind it and LOCK disabled (#4637).
+ */
+export const resolveLockTarget = (
+    params: { pubkey?: string; contactName?: string },
+    current: { pubkey?: string; contactName?: string }
+): { pubkey: string; contactName: string } => {
+    const pubkey = params.pubkey ?? current.pubkey ?? '';
+    if (!pubkey) return { pubkey: '', contactName: '' };
+    const contactName =
+        params.contactName ??
+        (pubkey === current.pubkey ? current.contactName ?? '' : '');
+    return { pubkey, contactName };
+};
+
+/**
+ * Normalizes the lifecycle state CDK reports for a melt. Candidates are read
+ * in order and the first non-empty one wins, so a caller can fall back from
+ * the melt result to the quote it was executed against.
+ *
+ * An absent state stays unknown. CDK's result type and both native bridges
+ * require a state, so ambiguity must not be reported as payment success.
+ */
+export const normalizeMeltState = (
+    ...candidates: Array<string | undefined | null>
+): string => {
+    const state = candidates.find(
+        (candidate) => !!candidate && candidate.toString().length > 0
+    );
+    return state ? state.toString().toUpperCase() : '';
+};
+
+/**
+ * Whether the mint has actually paid the invoice a melt was executed for.
+ *
+ * The melt result carries a state, and the bridge types allow any of them.
+ * CDK 0.18 only resolves a melt once the mint reports it Paid (it waits out
+ * Pending and throws otherwise), but nothing in the bridge contract promises
+ * that. Treating a resolved melt as a completed payment without checking would
+ * show the user a successful payment, and record one with an empty preimage,
+ * for an invoice nobody has paid.
+ */
+export const isMeltPaid = (
+    ...candidates: Array<string | undefined | null>
+): boolean => normalizeMeltState(...candidates) === 'PAID';
+
+// States in which the mint has finished with a melt without paying it. The
+// quote is settled, so nothing is in flight and nothing can change later.
+// Unpaid is the one CDK actually reports; the others are accepted so a mint
+// that spells the failure differently is not mistaken for a payment still on
+// its way.
+const SETTLED_UNPAID_MELT_STATES = ['UNPAID', 'FAILED', 'EXPIRED'];
+
+/**
+ * Whether the mint has settled a melt without paying the invoice, i.e. the
+ * ecash is the wallet's again and the payment will never happen.
+ */
+export const isMeltSettledUnpaid = (
+    ...candidates: Array<string | undefined | null>
+): boolean =>
+    SETTLED_UNPAID_MELT_STATES.includes(normalizeMeltState(...candidates));
+
+export type MeltOutcome = 'paid' | 'unpaid' | 'inFlight';
+
+/**
+ * Classifies what a melt state means for a melt the wallet is tracking.
+ *
+ * An unrecognized or absent state counts as in flight rather than failed: the
+ * mint may still be paying, and the melt quote can be re-checked to find out.
+ * Dropping it instead would be the same mistake in the other direction as
+ * reporting it paid.
+ */
+export const meltOutcome = (
+    ...candidates: Array<string | undefined | null>
+): MeltOutcome => {
+    if (isMeltPaid(...candidates)) return 'paid';
+    if (isMeltSettledUnpaid(...candidates)) return 'unpaid';
+    return 'inFlight';
+};
+
+/**
+ * Classifies a melt quote as CDK's checkMeltQuote returns it.
+ *
+ * The state alone is not enough. While a melt saga still holds the quote
+ * (the mint is still paying, or could not be asked), CDK returns its local
+ * copy of the quote, which stays Unpaid until the saga finishes. The saga
+ * releases the quote when it finishes either way, so Unpaid only means unpaid
+ * once `used_by_operation` is gone.
+ */
+export const meltQuoteOutcome = (
+    quote?: { state?: string | null; used_by_operation?: string | null } | null
+): MeltOutcome => {
+    const outcome = meltOutcome(quote?.state);
+    if (outcome === 'unpaid' && quote?.used_by_operation) return 'inFlight';
+    return outcome;
+};
+
+/**
+ * A melt the mint has taken the ecash for but has not settled, recorded so it
+ * can be re-checked later. `source` is what the wallet was doing: `payment` is
+ * a Lightning invoice the user paid and expects in their history, while
+ * `sweep` and `claim` pay an invoice from the user's own node, which records
+ * the incoming payment itself once it settles.
+ */
+export type PendingMeltSource = 'payment' | 'sweep' | 'claim';
+
+export interface PendingMelt {
+    quote: string;
+    mintUrl: string;
+    source: PendingMeltSource;
+    amount: number;
+    feeReserve: number;
+    request?: string;
+    // melt quote expiry, in seconds, as the mint reported it
+    expiry?: number;
+    createdAt: number;
+}
+
+// Limits to mitigate resource exhaustion from malicious P2PK secret payloads
+const MAX_P2PK_SECRET_LENGTH = 2048;
+const MAX_P2PK_SECRET_DEPTH = 10;
+
+/**
+ * Safely parse JSON for P2PK secret. Rejects oversized or deeply nested
+ * payloads to prevent resource exhaustion (DoS) from attacker-controlled input.
+ */
+function safeParseP2PKSecret(secret: string): unknown | null {
+    if (typeof secret !== 'string') return null;
+    if (secret.length > MAX_P2PK_SECRET_LENGTH) return null;
+
+    let depth = 0;
+    let maxDepth = 0;
+    for (let i = 0; i < secret.length; i++) {
+        const c = secret[i];
+        if (c === '[' || c === '{') {
+            depth++;
+            maxDepth = Math.max(maxDepth, depth);
+            if (maxDepth > MAX_P2PK_SECRET_DEPTH) return null;
+        } else if (c === ']' || c === '}') {
+            depth--;
+        }
+    }
+    if (depth !== 0) return null; // unbalanced brackets
+
+    try {
+        return JSON.parse(secret);
+    } catch {
+        return null;
+    }
+}
+
+class CashuUtils {
+    /**
+     * Extract raw token string from various URL formats.
+     * Supports both cashuA (v3 JSON) and cashuB (v4 CBOR) token prefixes.
+     * Accepts both base64url (`-`/`_`) and standard-base64 (`+`/`/`/`=`)
+     * alphabets, since real wallets emit either.
+     */
+    extractTokenString = (token: string): string => {
+        if (!token || typeof token !== 'string') {
+            return '';
+        }
+        token = token.trim();
+
+        // Greedy-match the cashu prefix + base64 body. This naturally stops
+        // at the first non-base64 character, trimming any trailing URL noise
+        // like `&memo=foo` that may follow the token in a web wrapper.
+        const match = token.match(/cashu[AB][0-9A-Za-z+/_=-]+/);
+        if (match) {
+            return match[0];
+        }
+
+        // No embedded cashu prefix found — strip a known URL prefix if any.
+        for (const prefix of cashuTokenPrefixes) {
+            if (token.startsWith(prefix)) {
+                token = token.slice(prefix.length).trim();
+                break;
+            }
+        }
+
+        return token.trim();
+    };
+
+    isValidCashuToken = (token: string): boolean => {
+        if (!token || typeof token !== 'string') {
+            return false;
+        }
+
+        const cleanToken = this.extractTokenString(token);
+        if (!cleanToken) {
+            return false;
+        }
+
+        // Structural shape check: cashuA/cashuB prefix + base64 body.
+        // Cryptographic validation lives in isValidCashuTokenAsync (CDK).
+        return /^cashu[AB][0-9A-Za-z+/_=-]{10,}$/.test(cleanToken);
+    };
+
+    isValidCashuTokenAsync = async (token: string): Promise<boolean> => {
+        if (!token || typeof token !== 'string') {
+            return false;
+        }
+
+        const cleanToken = this.extractTokenString(token);
+        if (!cleanToken) {
+            return false;
+        }
+
+        return await CashuDevKit.isValidToken(cleanToken);
+    };
+
+    sumProofsValue = (proofs: any) => {
+        if (!proofs || !Array.isArray(proofs)) {
+            return 0;
+        }
+        return proofs.reduce((r: number, c: any) => {
+            const amount = Number(c?.amount) || 0;
+            return r + amount;
+        }, 0);
+    };
+
+    decodeCashuTokenAsync = async (token: string): Promise<CDKToken> => {
+        const cleanToken = this.extractTokenString(token);
+        return await CashuDevKit.decodeToken(cleanToken);
+    };
+
+    getTokenValue = async (token: string): Promise<number> => {
+        try {
+            const decoded = await CashuDevKit.decodeToken(
+                this.extractTokenString(token)
+            );
+            return decoded.value;
+        } catch {
+            return 0;
+        }
+    };
+
+    getTokenMintUrl = async (token: string): Promise<string | null> => {
+        try {
+            const decoded = await CashuDevKit.decodeToken(
+                this.extractTokenString(token)
+            );
+            return decoded.mint_url;
+        } catch {
+            return null;
+        }
+    };
+
+    isTokenP2PKLocked = (token: { proofs?: Array<{ secret: string }> }) => {
+        if (!token.proofs || !Array.isArray(token.proofs)) {
+            return false;
+        }
+        for (const proof of token.proofs) {
+            if (typeof proof.secret !== 'string') continue;
+            if (this.getP2PKPubkeySecret(proof.secret)) {
+                const locktime = this.getP2PKLocktime(proof.secret);
+                const currentTime = Date.now() / 1000;
+                if (!locktime) {
+                    return true;
+                } else if (locktime > currentTime) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    getP2PKPubkeySecret = (secret: string) => {
+        const secretObject = safeParseP2PKSecret(secret);
+        if (secretObject == null) return undefined;
+        if (
+            Array.isArray(secretObject) &&
+            secretObject[0] === 'P2PK' &&
+            secretObject[1] != null &&
+            typeof secretObject[1] === 'object' &&
+            secretObject[1]['data'] != undefined
+        ) {
+            return secretObject[1]['data'];
+        }
+        return undefined;
+    };
+
+    getP2PKLocktime = (secret: string) => {
+        const secretObject = safeParseP2PKSecret(secret);
+        if (secretObject == null) return undefined;
+        if (
+            Array.isArray(secretObject) &&
+            secretObject[0] === 'P2PK' &&
+            secretObject[1] != null &&
+            typeof secretObject[1] === 'object' &&
+            Array.isArray(secretObject[1]['tags'])
+        ) {
+            const tag = secretObject[1]['tags'].find(
+                ([name]: [string, string]) => name === 'locktime'
+            );
+            return tag ? tag[1] : undefined;
+        }
+        return undefined;
+    };
+
+    /**
+     * True when a CDK claim/receive error means "you don't hold the private
+     * key this token is P2PK-locked to" (as opposed to e.g. already-spent,
+     * network, or mint errors). CDK's exact wording for this varies by
+     * version/code path - e.g. "Witness is missing ... for P2PK" or
+     * "Witness signatures not provided. P2PK signatures are required but
+     * not provided" - so this matches on the P2PK + missing-signature
+     * combination rather than one exact phrase.
+     */
+    isTokenLockedError = (error: unknown): boolean => {
+        const message =
+            error &&
+            typeof error === 'object' &&
+            'message' in error &&
+            typeof (error as { message?: unknown }).message === 'string'
+                ? (error as { message: string }).message.toLowerCase()
+                : '';
+
+        return (
+            // CDK 0.18's wallet-side NUT-11 error (SignatureMissingOrInvalid)
+            // is exactly this phrase, with no "p2pk" substring at all.
+            message.includes('signature missing or invalid') ||
+            (message.includes('p2pk') &&
+                message.includes('signature') &&
+                (message.includes('missing') ||
+                    message.includes('not provided') ||
+                    message.includes('required')))
+        );
+    };
+}
+
+const cashuUtils = new CashuUtils();
+export default cashuUtils;

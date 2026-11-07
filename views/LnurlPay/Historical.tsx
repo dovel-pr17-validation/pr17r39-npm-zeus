@@ -1,0 +1,85 @@
+import * as React from 'react';
+import { Text, View, TouchableOpacity } from 'react-native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import { LnurlPayTransaction } from './../../stores/LnurlPayStore';
+import LnurlPayMetadata from './Metadata';
+import LnurlPaySuccess from './Success';
+import { themeColor } from './../../utils/ThemeUtils';
+
+interface LnurlPayHistoricalProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    lnurlpaytx: LnurlPayTransaction;
+    preimage: string;
+}
+
+interface LnurlPayHistoricalState {
+    showLnurlSuccess: boolean;
+}
+
+export default class LnurlPayHistorical extends React.Component<
+    LnurlPayHistoricalProps,
+    LnurlPayHistoricalState
+> {
+    state = {
+        showLnurlSuccess: false
+    };
+
+    render() {
+        const { navigation, lnurlpaytx, preimage } = this.props;
+        const { showLnurlSuccess } = this.state;
+        const { lnurl, domain, successAction } = lnurlpaytx;
+        // Do not collapse metadata into an empty, untappable success panel.
+        const hasSuccessDetails = Boolean(
+            domain ||
+                ['message', 'url', 'aes'].includes(successAction?.tag || '')
+        );
+        const metadata =
+            (lnurlpaytx.metadata && lnurlpaytx.metadata.metadata) ||
+            'No metadata available';
+        return (
+            <View>
+                {lnurl && (
+                    <TouchableOpacity
+                        onPress={() =>
+                            navigation.navigate('Send', {
+                                destination: lnurlpaytx.lnurl
+                            })
+                        }
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Medium',
+                                marginBottom: 20
+                            }}
+                        >
+                            {lnurl}
+                        </Text>
+                    </TouchableOpacity>
+                )}
+                <TouchableOpacity
+                    disabled={!hasSuccessDetails}
+                    onPress={() => {
+                        this.setState(({ showLnurlSuccess }) => ({
+                            showLnurlSuccess: !showLnurlSuccess
+                        }));
+                    }}
+                >
+                    {showLnurlSuccess && hasSuccessDetails ? (
+                        <LnurlPaySuccess
+                            domain={domain}
+                            successAction={successAction}
+                            preimage={preimage}
+                        />
+                    ) : (
+                        <LnurlPayMetadata
+                            metadata={metadata}
+                            showArrow={hasSuccessDetails}
+                        />
+                    )}
+                </TouchableOpacity>
+            </View>
+        );
+    }
+}

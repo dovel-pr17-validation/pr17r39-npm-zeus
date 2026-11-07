@@ -1,0 +1,279 @@
+package app.zeusln.zeus;
+
+import android.content.Context
+import android.util.Log
+import com.facebook.react.bridge.*
+import com.facebook.react.modules.core.DeviceEventManagerModule
+import okhttp3.OkHttpClient
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Proxy;
+import java.security.cert.X509Certificate
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+import app.zeusln.zeus.AndroidCallback
+
+import lndmobile.Lndmobile;
+
+class LncModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
+
+  private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+  override fun getName(): String {
+    return "LncModule"
+  }
+
+  override fun invalidate() {
+    super.invalidate()
+    scope.cancel()
+  }
+
+  @ReactMethod
+  fun registerLocalPrivCreateCallback(namespace: String, eventName: String) {
+     val lpccb = AndroidStreamingCallback()
+     lpccb.setEventName(eventName)
+     lpccb.setCallback { event, data -> sendKeyEvent(namespace, event, data) }
+
+     Lndmobile.registerLocalPrivCreateCallback(namespace, lpccb)
+  }
+
+  @ReactMethod
+  fun registerRemoteKeyReceiveCallback(namespace: String, eventName: String) {
+     val rkrcb = AndroidStreamingCallback()
+     rkrcb.setEventName(eventName)
+     rkrcb.setCallback { event, data -> sendKeyEvent(namespace, event, data) }
+
+     Lndmobile.registerRemoteKeyReceiveCallback(namespace, rkrcb)
+  }
+
+  @ReactMethod
+  fun registerAuthDataCallback(namespace: String, eventName: String) {
+     val oacb = AndroidStreamingCallback()
+     oacb.setEventName(eventName)
+     oacb.setCallback { event, data -> sendKeyEvent(namespace, event, data) }
+
+     Lndmobile.registerAuthDataCallback(namespace, oacb)
+  }
+
+  @ReactMethod
+  fun initLNC(namespace: String, promise: Promise) {
+     try {
+        Lndmobile.initLNC(namespace, "info")
+        promise.resolve(null)
+     } catch(e: Throwable) {
+        Log.e("LncModule", "initLNC error", e)
+        promise.reject("initLNC_error", e)
+     }
+  }
+
+  @ReactMethod
+  fun isConnected(namespace: String, promise: Promise) {
+     try {
+        var response = Lndmobile.isConnected(namespace)
+        promise.resolve(response);
+     } catch(e: Throwable) {
+        promise.reject("request Error", e);
+     }
+  }
+
+  @ReactMethod
+  fun status(namespace: String, promise: Promise) {
+     try {
+        var response = Lndmobile.status(namespace)
+        promise.resolve(response);
+     } catch(e: Throwable) {
+        promise.reject("request Error", e);
+     }
+  }
+
+  @ReactMethod
+  fun expiry(namespace: String, promise: Promise) {
+     try {
+        var response = Lndmobile.getExpiry(namespace)
+        promise.resolve(response);
+     } catch(e: Throwable) {
+        promise.reject("request Error", e);
+     }
+  }
+
+  @ReactMethod
+  fun isReadOnly(namespace: String, promise: Promise) {
+     try {
+        var response = Lndmobile.isReadOnly(namespace)
+        promise.resolve(response);
+     } catch(e: Throwable) {
+        promise.reject("request Error", e);
+     }
+  }
+
+  @ReactMethod
+  fun hasPerms(namespace: String, permission: String, promise: Promise) {
+     try {
+        var response = Lndmobile.hasPermissions(namespace, permission)
+        promise.resolve(response);
+     } catch(e: Throwable) {
+        promise.reject("request Error", e);
+     }
+  }
+
+  @ReactMethod
+  fun connectServer(namespace: String, mailboxServerAddr: String, isDevServer: Boolean = false, connectPhrase: String, localStatic: String, remoteStatic: String, promise: Promise) {
+     try {
+         Lndmobile.connectServer(namespace, mailboxServerAddr, isDevServer, connectPhrase, localStatic ?: "", remoteStatic ?: "")
+         promise.resolve(null)
+     } catch (e: Exception) {
+         val exceptionAsString = e.toString()
+         promise.resolve(exceptionAsString)
+     }
+  }
+
+  @ReactMethod
+  fun disconnect(namespace: String, promise: Promise) {
+     try {
+        Lndmobile.disconnect(namespace)
+     } catch(e: Throwable) {
+        // A namespace that was never initialized is already "disconnected";
+        // callers tear down before re-initializing and must not be blocked.
+        Log.e("LncModule", "disconnect error", e)
+     }
+     promise.resolve(null)
+  }
+
+  @ReactMethod
+  fun invokeRPC(namespace: String, route: String, requestData: String, rnCallback: Callback) {
+     val gocb = AndroidCallback()
+     gocb.setCallback(rnCallback)
+     try {
+        Lndmobile.invokeRPC(namespace, route, requestData, gocb)
+     } catch(e: Throwable) {
+        // InvokeRPC fails synchronously for "unknown namespace", "RPC
+        // connection not ready" and unknown routes, and never calls the
+        // callback in that case. Letting the exception escape left the JS
+        // promise pending forever, which surfaced as a wallet stuck on
+        // "connecting" instead of a connection error (ZEUS-4278). Route it
+        // through the same fire-once callback the Go side uses: JS treats a
+        // non-JSON payload as an error string.
+        Log.e("LncModule", "invokeRPC error", e)
+        gocb.sendResult(e.message ?: e.toString())
+     }
+  }
+
+  // The key callbacks share one event name across namespaces, and a dial
+  // that outlives a wallet switch keeps reporting on it, so they carry the
+  // namespace for JS to filter on.
+  private fun sendKeyEvent(namespace: String, event: String, data: String) {
+      val params = Arguments.createMap().apply {
+        putString("result", data)
+        putString("namespace", namespace)
+      }
+      getReactApplicationContext()
+        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        .emit(event, params)
+  }
+
+  // Every stream of a method emits under the method name, so a non-empty
+  // requestId is echoed in each event for JS to tell concurrent streams
+  // apart. Nullable so a stray null from JS counts as no id.
+  private fun sendStreamEvent(event: String, requestId: String?, data: String) {
+      val params = Arguments.createMap().apply {
+        putString("result", data)
+        if (!requestId.isNullOrEmpty()) putString("request_id", requestId)
+      }
+      getReactApplicationContext()
+        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        .emit(event, params)
+  }
+
+  @ReactMethod
+  fun initListener(namespace: String, method: String, request: String, requestId: String?) {
+     val gocb = AndroidStreamingCallback()
+     gocb.setEventName(method)
+     gocb.setCallback { event, data -> sendStreamEvent(event, requestId, data) }
+     try {
+        Lndmobile.invokeRPC(namespace, method, request, gocb)
+     } catch(e: Throwable) {
+        // Same synchronous-failure path as invokeRPC. Emit the message on the
+        // stream's own event so subscribers reject rather than wait forever;
+        // they already treat a non-JSON result as a raw Go error string.
+        Log.e("LncModule", "initListener error", e)
+        gocb.sendResult(e.message ?: e.toString())
+     }
+  }
+
+   // chantools
+
+   @ReactMethod
+   fun sweepRemoteClosed(
+      seedPhrase: String,
+      apiURL: String,
+      sweepAddr: String,
+      recoveryWindow: Int,
+      feeRate: Int,
+      sleepSeconds: Int,
+      publish: Boolean?,
+      isTestnet: Boolean?,
+      promise: Promise
+   ) {
+      // Launch a coroutine in the background to avoid blocking the main thread
+      scope.launch {
+         try {
+               // Perform the long-running task
+               val response = Lndmobile.sweepRemoteClosed(seedPhrase, apiURL, sweepAddr, recoveryWindow, feeRate, sleepSeconds, publish ?: false, isTestnet ?: false)
+               
+               // When done, switch back to the main thread to resolve the promise
+               withContext(Dispatchers.Main) {
+                  promise.resolve(response)
+               }
+         } catch (e: Throwable) {
+               // Handle errors, and make sure to switch back to the main thread to reject the promise
+               withContext(Dispatchers.Main) {
+                  promise.reject("request Error", e)
+               }
+         }
+      }
+   }
+
+  // Swaps
+
+  @ReactMethod
+  fun createClaimTransaction(endpoint: String, swapId: String, claimLeaf: String, refundLeaf: String, privateKey: String, servicePubKey: String, transactionHash: String, pubNonce: String, promise: Promise) {
+     Log.d("createClaimTransaction called", "");
+
+     try {
+         Lndmobile.createClaimTransaction(endpoint, swapId, claimLeaf, refundLeaf, privateKey, servicePubKey, transactionHash, pubNonce)
+         promise.resolve(null)
+     } catch (e: Exception) {
+         promise.reject("CREATE_CLAIM_ERROR", e.toString())
+     }
+  }
+
+  // Builds and signs a reverse swap claim and returns its hex without
+  // broadcasting it; the app stores it and broadcasts it itself
+  @ReactMethod
+  fun buildReverseClaimTransaction(endpoint: String, swapId: String, claimLeaf: String, refundLeaf: String, privateKey: String, servicePubKey: String, preimageHex: String, transactionHex: String, lockupAddress: String, destinationAddress: String, feeRate: Int, minerFee: Int, network: String, promise: Promise) {
+     try {
+         val txHex = Lndmobile.buildReverseClaimTransaction(endpoint, swapId, claimLeaf, refundLeaf, privateKey, servicePubKey, preimageHex, transactionHex, lockupAddress, destinationAddress, feeRate, minerFee, network)
+         promise.resolve(txHex)
+     } catch (e: Exception) {
+         promise.reject("BUILD_REVERSE_CLAIM_ERROR", e.toString())
+     }
+  }
+
+  // Builds and signs a submarine swap refund and returns its hex without
+  // broadcasting it
+  @ReactMethod
+  fun buildRefundTransaction(endpoint: String, swapId: String, claimLeaf: String, refundLeaf: String, transactionHex: String, privateKey: String, servicePubKey: String, feeRate: Int, minerFee: Int, timeoutBlockHeight: Int, destinationAddress: String, lockupAddress: String, cooperative: Boolean?, network: String, promise: Promise) {
+     try {
+         val txHex = Lndmobile.buildRefundTransaction(endpoint, swapId, claimLeaf, refundLeaf, transactionHex, privateKey, servicePubKey, feeRate, minerFee, timeoutBlockHeight, destinationAddress, lockupAddress, cooperative ?: false, network)
+         promise.resolve(txHex)
+     } catch (e: Exception) {
+         promise.reject("BUILD_REFUND_ERROR", e.toString())
+     }
+  }
+}

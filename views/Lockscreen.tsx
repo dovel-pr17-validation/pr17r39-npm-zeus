@@ -1,0 +1,919 @@
+import { inject, observer } from 'mobx-react';
+import * as React from 'react';
+import {
+    AppState,
+    AppStateStatus,
+    BackHandler,
+    NativeEventSubscription,
+    Platform,
+    StyleSheet,
+    Text,
+    View
+} from 'react-native';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Button from '../components/Button';
+import Header from '../components/Header';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Pin from '../components/Pin';
+import Screen from '../components/Screen';
+import { ErrorMessage } from '../components/SuccessErrorMessage';
+import TextInput from '../components/TextInput';
+import ShowHideToggle from '../components/ShowHideToggle';
+
+import SettingsStore from '../stores/SettingsStore';
+
+import { verifyBiometry } from '../utils/BiometricUtils';
+import {
+    blockNavigationDuringWipe,
+    clearAllData,
+    isWipePending,
+    markWipePending
+} from '../utils/DataClearUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { restartApp } from '../utils/RestartUtils';
+import {
+    authenticatedShareIntent,
+    ShareIntentPayload
+} from '../utils/ShareIntentProcessor';
+import { themeColor } from '../utils/ThemeUtils';
+
+interface LockscreenProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+    route: Route<
+        'Lockscreen',
+        {
+            modifySecurityScreen: string;
+            deletePin: boolean;
+            deleteDuressPin: boolean;
+            deletePassword: boolean;
+            deleteDuressPassword: boolean;
+            pendingNavigation?: { screen: string; params?: any };
+            shareIntentData?: ShareIntentPayload;
+        }
+    >;
+}
+
+interface LockscreenState {
+    passphrase: string;
+    passphraseAttempt: string;
+    duressPassphrase: string;
+    pin: string;
+    pinAttempt: string;
+    duressPin: string;
+    hidden: boolean;
+    error: boolean;
+    attemptNotSaved: boolean;
+    modifySecurityScreen: string;
+    deletePin: boolean;
+    deleteDuressPin: boolean;
+    deletePassword: boolean;
+    deleteDuressPassword: boolean;
+    authenticationAttempts: number;
+    wiping: boolean;
+}
+
+const maxAuthenticationAttempts = 5;
+
+@inject('SettingsStore')
+@observer
+export default class Lockscreen extends React.Component<
+    LockscreenProps,
+    LockscreenState
+> {
+    private subscription: NativeEventSubscription;
+    private backPressSubscription: NativeEventSubscription | undefined;
+    private releaseWipeGuard: (() => void) | null = null;
+    // Set while a verified login awaits the attempt reset: a second submit
+    // in that window would navigate twice, and a second pop() removes
+    // whatever screen is on top. An instance field, not state, so the
+    // guard holds before the next render.
+    private unlocking = false;
+    // Set while an entry's attempt is being saved, so that each entry is
+    // saved before the next one is taken
+    private savingAttempt = false;
+    // Set once a wipe is decided, while its pending record is saved and
+    // before `wiping` is set, so a second submit cannot start another wipe.
+    // Never cleared: the wipe ends in a restart.
+    private startingWipe = false;
+
+    constructor(props: any) {
+        super(props);
+        this.state = {
+            passphraseAttempt: '',
+            passphrase: '',
+            duressPassphrase: '',
+            pin: '',
+            pinAttempt: '',
+            duressPin: '',
+            hidden: true,
+            error: false,
+            attemptNotSaved: false,
+            modifySecurityScreen: '',
+            deletePin: false,
+            deleteDuressPin: false,
+            deletePassword: false,
+            deleteDuressPassword: false,
+            authenticationAttempts: 0,
+            wiping: false
+        };
+    }
+
+    get isSecurityManagementFlow(): boolean {
+        const {
+            modifySecurityScreen,
+            deletePin,
+            deleteDuressPin,
+            deletePassword,
+            deleteDuressPassword
+        } = this.state;
+
+        return (
+            !!modifySecurityScreen ||
+            deletePin ||
+            deleteDuressPin ||
+            deletePassword ||
+            deleteDuressPassword
+        );
+    }
+
+    // A share intent that reached a POS terminal. Staff without the PIN
+    // must be able to drop it and get back to POS; there is nothing else
+    // to go back to, and Android back would otherwise exit the app.
+    get isPosShareIntent(): boolean {
+        const { SettingsStore, route } = this.props;
+        return (
+            !!route.params?.shareIntentData &&
+            SettingsStore.posStatus === 'active'
+        );
+    }
+
+    dismissShareIntent = () => this.props.navigation.popTo('Wallet');
+
+    handleHardwareBackPress = () => {
+        if (!this.isPosShareIntent) return false;
+        this.dismissShareIntent();
+        return true;
+    };
+
+    proceed = (targetScreen?: string, navigationParams?: any) => {
+        const { SettingsStore, navigation, route } = this.props;
+        const shareIntentData = authenticatedShareIntent(
+            route.params?.shareIntentData
+        );
+
+        if (shareIntentData) {
+            if (SettingsStore.settings.selectNodeOnStartup) {
+                navigation.replace('Wallets', {
+                    fromStartup: true,
+                    shareIntentData
+                });
+            } else {
+                navigation.replace('Wallet', {
+                    shareIntentData
+                });
+            }
+            return;
+        }
+
+        if (targetScreen) {
+            navigation.popTo(targetScreen, { ...navigationParams });
+        } else if (SettingsStore.settings.selectNodeOnStartup) {
+            navigation.replace('Wallets', { fromStartup: true });
+        } else {
+            SettingsStore.triggerSettingsRefresh = true;
+            navigation.pop();
+        }
+    };
+
+    async componentDidMount() {
+        const { SettingsStore, navigation, route } = this.props;
+        const { settings } = SettingsStore;
+        const {
+            modifySecurityScreen,
+            deletePin,
+            deleteDuressPin,
+            deletePassword,
+            deleteDuressPassword,
+            pendingNavigation,
+            shareIntentData
+        } = route.params ?? {};
+
+        // Finish a wipe started by an earlier launch that was cut short,
+        // before anything else, POS and biometrics included. A saved
+        // attempt count at the limit does not wipe here: the last attempt
+        // may have been a correct entry whose reset was not saved, so it
+        // only means the next wrong entry wipes.
+        if (await isWipePending()) {
+            this.setState({ wiping: true });
+            await this.authenticationFailure();
+            return;
+        }
+
+        if (
+            SettingsStore.isPosEnabled() &&
+            SettingsStore.posStatus === 'active' &&
+            !pendingNavigation &&
+            !shareIntentData &&
+            !deletePin &&
+            !deleteDuressPin &&
+            !deletePassword &&
+            !deleteDuressPassword
+        ) {
+            // If POS is enabled and active, proceed without authentication.
+            // Not for a share intent: nothing sends an already-authenticated
+            // payload here, so one that arrived is one that still has to be
+            // authenticated, and waiving that in POS mode is the bypass this
+            // gate exists to close. POS boots unauthenticated, so the waiver
+            // would otherwise hand a shared QR straight to the processing
+            // screen and on to Send or WalletConfiguration.
+            SettingsStore.setLoginStatus(true);
+            this.proceed('Wallet');
+            return;
+        }
+
+        this.backPressSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            this.handleHardwareBackPress
+        );
+
+        const isBiometryConfigured = SettingsStore.isBiometryConfigured();
+
+        if (
+            isBiometryConfigured &&
+            !deletePin &&
+            !deleteDuressPin &&
+            !deletePassword &&
+            !deleteDuressPassword &&
+            !modifySecurityScreen
+        ) {
+            const isVerified = await verifyBiometry(
+                localeString('views.Lockscreen.Biometrics.prompt').replace(
+                    'Zeus',
+                    'ZEUS'
+                )
+            );
+
+            if (isVerified) {
+                SettingsStore.setPosStatus('inactive');
+                await this.resetAuthenticationAttempts();
+                SettingsStore.setLoginStatus(true);
+                this.proceed(
+                    pendingNavigation?.screen,
+                    pendingNavigation?.params
+                );
+                return;
+            }
+        }
+
+        if (settings.authenticationAttempts) {
+            this.setState({
+                authenticationAttempts: settings.authenticationAttempts
+            });
+        }
+
+        if (modifySecurityScreen) {
+            this.setState({
+                modifySecurityScreen
+            });
+        } else if (deletePin) {
+            this.setState({
+                deletePin
+            });
+        } else if (deleteDuressPin) {
+            this.setState({
+                deleteDuressPin
+            });
+        } else if (deletePassword) {
+            this.setState({
+                deletePassword
+            });
+        } else if (deleteDuressPassword) {
+            this.setState({
+                deleteDuressPassword
+            });
+        }
+
+        if (settings && settings.passphrase) {
+            this.setState({ passphrase: settings.passphrase });
+            if (settings.duressPassphrase) {
+                this.setState({
+                    duressPassphrase: settings.duressPassphrase
+                });
+            }
+        } else if (settings && settings.pin) {
+            this.setState({ pin: settings.pin });
+            if (settings.duressPin) {
+                this.setState({
+                    duressPin: settings.duressPin
+                });
+            }
+        } else if (settings && settings.nodes && settings?.nodes?.length > 0) {
+            this.proceed(pendingNavigation?.screen, pendingNavigation?.params);
+        } else {
+            navigation.popTo('IntroSplash');
+        }
+
+        this.subscription = AppState.addEventListener(
+            'change',
+            this.handleAppStateChange
+        );
+    }
+
+    componentWillUnmount() {
+        this.subscription?.remove();
+        this.backPressSubscription?.remove();
+        this.releaseWipeGuard?.();
+    }
+
+    handleAppStateChange = (nextAppState: AppStateStatus) => {
+        if (nextAppState === 'background') {
+            this.setState({ passphraseAttempt: '' });
+        }
+    };
+
+    onInputLabelPressed = () => {
+        this.setState({ hidden: !this.state.hidden });
+    };
+
+    onAttemptLogIn = async () => {
+        const { SettingsStore, navigation, route } = this.props;
+        const {
+            passphrase,
+            duressPassphrase,
+            passphraseAttempt,
+            pin,
+            pinAttempt,
+            duressPin,
+            modifySecurityScreen,
+            deletePin,
+            deleteDuressPin,
+            deletePassword,
+            deleteDuressPassword
+        } = this.state;
+        const { updateSettings, setPosStatus } = SettingsStore;
+
+        // a wipe is already running; a second submit must not start another
+        // wipe or mutate settings mid-wipe. Likewise while a verified login
+        // is still completing, a second submit would navigate twice.
+        if (
+            this.state.wiping ||
+            this.startingWipe ||
+            this.unlocking ||
+            this.savingAttempt
+        ) {
+            return;
+        }
+
+        const isCorrect = !!(
+            (passphraseAttempt && passphraseAttempt === passphrase) ||
+            (pinAttempt && pinAttempt === pin)
+        );
+
+        // The duress wipe does not depend on the attempt count, so it runs
+        // before the attempt is saved: a failed write (storage full) must
+        // not stop it. Duress creds only trigger the wipe on a genuine login
+        // attempt; in security management flows they count as an incorrect
+        // entry below.
+        if (
+            !isCorrect &&
+            !this.isSecurityManagementFlow &&
+            ((duressPassphrase && passphraseAttempt === duressPassphrase) ||
+                (duressPin && pinAttempt === duressPin))
+        ) {
+            // never mark the session logged in here: the wipe takes long
+            // enough that an unlocked app would expose the wallet UI (and
+            // the configs being wiped) before the restart lands. Keeping
+            // loggedIn false holds every auth gate shut for the duration,
+            // and the wipe guard pins the user to the wiping screen.
+            await this.startWipe(this.deleteNodes);
+            return;
+        }
+
+        this.setState({
+            error: false,
+            attemptNotSaved: false
+        });
+
+        // Save the attempt before checking the entry. An entry that is
+        // checked but not counted (a failed write, or the app closed before
+        // the write) would not count toward the wipe, so if the write fails
+        // the entry is not checked. The increment runs inside the settings
+        // update queue, so it always builds on the last saved count.
+        let authenticationAttempts: number;
+        this.savingAttempt = true;
+        try {
+            const updatedSettings = await updateSettings(
+                (currentSettings: any) => ({
+                    authenticationAttempts:
+                        (currentSettings?.authenticationAttempts || 0) + 1
+                })
+            );
+            if (typeof updatedSettings?.authenticationAttempts !== 'number') {
+                throw new Error('authentication attempt was not saved');
+            }
+            authenticationAttempts = updatedSettings.authenticationAttempts;
+        } catch (error) {
+            console.error('Failed to save authentication attempt', error);
+            this.setState({
+                error: true,
+                attemptNotSaved: true,
+                pinAttempt: ''
+            });
+            return;
+        } finally {
+            this.savingAttempt = false;
+        }
+
+        if (isCorrect) {
+            this.unlocking = true;
+            try {
+                SettingsStore.setLoginStatus(true);
+
+                // Check if we're modifying security settings first
+                if (modifySecurityScreen) {
+                    await this.resetAuthenticationAttempts();
+                    navigation.popTo(modifySecurityScreen);
+                    return;
+                } else if (deletePassword) {
+                    this.deletePassword();
+                    return;
+                } else if (deletePin) {
+                    this.deletePin();
+                    return;
+                } else if (deleteDuressPassword) {
+                    this.deleteDuressPassword();
+                    return;
+                } else if (deleteDuressPin) {
+                    this.deleteDuressPin();
+                    return;
+                } else if (route.params?.pendingNavigation) {
+                    // must be handled before selectNodeOnStartup, which would
+                    // otherwise drop the re-auth target and land on the wallet
+                    // picker
+                    if (SettingsStore.isPosEnabled()) {
+                        setPosStatus('inactive');
+                    }
+                    await this.resetAuthenticationAttempts();
+                    const { pendingNavigation } = route.params;
+                    this.proceed(
+                        pendingNavigation.screen,
+                        pendingNavigation.params
+                    );
+                    return;
+                } else if (SettingsStore.settings.selectNodeOnStartup) {
+                    // Only handle wallet selection when NOT modifying security
+                    // A share intent reaches this branch with POS active (the
+                    // POS waiver does not apply to it), so leave POS here as
+                    // the other login branches do
+                    if (SettingsStore.isPosEnabled()) {
+                        setPosStatus('inactive');
+                    }
+                    await this.resetAuthenticationAttempts();
+
+                    const shareIntentData = authenticatedShareIntent(
+                        route.params?.shareIntentData
+                    );
+
+                    if (shareIntentData) {
+                        navigation.replace('Wallets', {
+                            fromStartup: true,
+                            shareIntentData
+                        });
+                    } else {
+                        navigation.replace('Wallets', { fromStartup: true });
+                    }
+                    return;
+                }
+                if (!SettingsStore.settings.selectNodeOnStartup) {
+                    if (SettingsStore.isPosEnabled()) {
+                        setPosStatus('inactive');
+                    }
+                    await this.resetAuthenticationAttempts();
+                    this.proceed();
+                }
+            } finally {
+                this.unlocking = false;
+            }
+        } else {
+            this.setState({
+                authenticationAttempts
+            });
+            if (authenticationAttempts >= maxAuthenticationAttempts) {
+                // See the duress branch: loggedIn must stay false so the
+                // wallet UI stays gated while the wipe runs.
+                // wipe node configs, passwords, and pins
+                await this.startWipe(this.authenticationFailure);
+            } else {
+                this.setState({
+                    error: true,
+                    pinAttempt: ''
+                });
+            }
+        }
+    };
+
+    // Saves the pending wipe before the screen changes, so that closing the
+    // app once the result shows cannot stop the wipe. markWipePending()
+    // does not reject.
+    startWipe = async (wipe: () => Promise<void>) => {
+        this.startingWipe = true;
+        await markWipePending();
+        this.setState({ wiping: true });
+        await wipe();
+    };
+
+    onSubmitPin = (value: string) => {
+        this.setState({ pinAttempt: value }, () => {
+            this.onAttemptLogIn();
+        });
+    };
+
+    deletePassword = () => {
+        const { SettingsStore, navigation } = this.props;
+        const { updateSettings } = SettingsStore;
+
+        // duress passphrase is also deleted when passphrase is deleted
+        // biometry is also disabled when passphrase is deleted
+        updateSettings({
+            passphrase: '',
+            duressPassphrase: '',
+            authenticationAttempts: 0,
+            isBiometryEnabled: false
+        }).then(() => {
+            navigation.popTo('Security');
+        });
+    };
+
+    deleteDuressPassword = () => {
+        const { SettingsStore, navigation } = this.props;
+        const { updateSettings } = SettingsStore;
+
+        updateSettings({
+            duressPassphrase: '',
+            authenticationAttempts: 0
+        }).then(() => {
+            navigation.popTo('Security');
+        });
+    };
+
+    deletePin = () => {
+        const { SettingsStore, navigation } = this.props;
+        const { updateSettings } = SettingsStore;
+
+        // duress pin is also deleted when pin is deleted
+        // biometry is also disabled when pin is deleted
+        updateSettings({
+            pin: '',
+            duressPin: '',
+            authenticationAttempts: 0,
+            isBiometryEnabled: false
+        }).then(() => {
+            navigation.popTo('Security');
+        });
+    };
+
+    deleteDuressPin = () => {
+        const { SettingsStore, navigation } = this.props;
+        const { updateSettings } = SettingsStore;
+
+        updateSettings({
+            duressPin: '',
+            authenticationAttempts: 0
+        }).then(() => {
+            navigation.popTo('Security');
+        });
+    };
+
+    deleteNodes = async () => {
+        // Fully wipe wallet data (node data dirs, Cashu seeds + CDK db, swap
+        // rescue key, keychain) so the duress action leaves no recoverable key
+        // material behind - not just the settings `nodes` pointer. Restart
+        // instead of writing settings: updateSettings() would merge into the
+        // pre-wipe in-memory blob and re-persist it (pins, passphrases and
+        // all), and a restart is also the only way to drop node credentials
+        // still held in memory by the stores.
+        this.releaseWipeGuard = blockNavigationDuringWipe(
+            this.props.navigation
+        );
+        try {
+            await clearAllData();
+        } catch (e) {
+            // never surface an error here: it would disclose the duress
+            // mechanism and there is no meaningful recovery mid-wipe
+            console.warn('[Lockscreen] wipe failed part-way', e);
+        } finally {
+            // the restart must run even after a partial wipe: the wipe is
+            // still recorded as pending, so the next launch finishes it
+            // rather than stranding the user on a dead lockscreen
+            restartApp();
+        }
+    };
+
+    authenticationFailure = async () => {
+        // Fully wipe wallet data on repeated failed logins. clearAllData()
+        // removes the node data dirs, Cashu seeds + CDK db, swap rescue key
+        // and the settings blob itself (including pins and passphrases).
+        // Restart instead of writing settings back - see deleteNodes above.
+        this.releaseWipeGuard = blockNavigationDuringWipe(
+            this.props.navigation
+        );
+        try {
+            await clearAllData();
+        } catch (e) {
+            // see deleteNodes: log only, never surface, always restart
+            console.warn('[Lockscreen] wipe failed part-way', e);
+        } finally {
+            restartApp();
+        }
+    };
+
+    // Must be awaited before navigating away: updateSettings() persists to
+    // storage before it sets SettingsStore.triggerSettingsRefresh, so a
+    // fire-and-forget call lands that flag *after* the Wallet screen has
+    // regained focus and cleared it. The flag then survives until the next
+    // focus event and forces a needless full node refetch there.
+    // A failed write is logged and swallowed: it must never block unlocking.
+    resetAuthenticationAttempts = async () => {
+        const { SettingsStore } = this.props;
+        const { updateSettings } = SettingsStore;
+
+        try {
+            await updateSettings({ authenticationAttempts: 0 });
+        } catch (error) {
+            console.error('Failed to reset authentication attempts', error);
+        }
+    };
+
+    generateErrorMessage = (): string => {
+        const { passphrase, authenticationAttempts, attemptNotSaved } =
+            this.state;
+        let incorrect = '';
+
+        if (attemptNotSaved) {
+            return localeString('views.Lockscreen.attemptNotSaved');
+        }
+
+        if (passphrase) {
+            incorrect = localeString('views.Lockscreen.incorrectPassword');
+        } else {
+            incorrect = localeString('views.Lockscreen.incorrectPin');
+        }
+
+        return (
+            incorrect +
+            '\n' +
+            (maxAuthenticationAttempts - authenticationAttempts).toString() +
+            ' ' +
+            localeString('views.Lockscreen.authenticationAttempts')
+        );
+    };
+
+    render() {
+        const { navigation, SettingsStore } = this.props;
+        const pendingNavigation = this.props.route.params?.pendingNavigation;
+        const { settings } = SettingsStore;
+        const {
+            passphrase,
+            passphraseAttempt,
+            pin,
+            hidden,
+            error,
+            modifySecurityScreen,
+            deletePin,
+            deleteDuressPin,
+            deletePassword,
+            deleteDuressPassword,
+            wiping
+        } = this.state;
+
+        // neutral cover while the wipe runs, for both the duress and the
+        // failed-attempts paths: an indistinct loading state discloses
+        // nothing about the wipe and leaves nothing interactive until the
+        // restart lands
+        if (wiping) {
+            return (
+                <Screen>
+                    <View
+                        style={{
+                            flex: 1,
+                            justifyContent: 'center',
+                            alignItems: 'center'
+                        }}
+                    >
+                        <LoadingIndicator />
+                    </View>
+                </Screen>
+            );
+        }
+
+        return (
+            <Screen>
+                {/* the POS route guard can add a pendingNavigation to a
+                    share intent Lockscreen; proceed() serves the share
+                    intent first, so its Back is the one to show */}
+                {this.isPosShareIntent ? (
+                    <Header
+                        leftComponent="Back"
+                        onBack={this.dismissShareIntent}
+                        navigateBackOnBackPress={false}
+                    />
+                ) : (
+                    (this.isSecurityManagementFlow || pendingNavigation) && (
+                        <Header leftComponent="Back" navigation={navigation} />
+                    )
+                )}
+                {!!passphrase && (
+                    <View
+                        style={{
+                            ...styles.content,
+                            flex: 1,
+                            justifyContent: 'center',
+                            marginTop:
+                                Platform.OS === 'android' &&
+                                SettingsStore.loginRequired()
+                                    ? 30
+                                    : 0
+                        }}
+                    >
+                        {error && (
+                            <ErrorMessage
+                                message={this.generateErrorMessage()}
+                            />
+                        )}
+                        <View style={{ marginBottom: 40 }}>
+                            <Text
+                                style={{
+                                    ...styles.mainText,
+                                    color: themeColor('text')
+                                }}
+                            >
+                                {modifySecurityScreen === 'SetDuressPassword'
+                                    ? localeString(
+                                          'views.Lockscreen.enterExistingPassword'
+                                      )
+                                    : deleteDuressPassword
+                                    ? localeString(
+                                          'views.Lockscreen.enterLoginPassword'
+                                      )
+                                    : localeString(
+                                          'views.Lockscreen.enterPassword'
+                                      )}
+                            </Text>
+                        </View>
+                        <View style={styles.inputContainer}>
+                            <TextInput
+                                placeholder={'****************'}
+                                placeholderTextColor="darkgray"
+                                value={passphraseAttempt}
+                                onChangeText={(text: string) =>
+                                    this.setState({
+                                        passphraseAttempt: text,
+                                        error: false
+                                    })
+                                }
+                                autoCapitalize="none"
+                                autoCorrect={false}
+                                secureTextEntry={hidden}
+                                autoFocus={true}
+                                style={{
+                                    ...styles.textInput,
+                                    paddingTop: passphraseAttempt === '' ? 6 : 2
+                                }}
+                                onSubmitEditing={() => this.onAttemptLogIn()}
+                            />
+                            <View style={styles.showHideToggle}>
+                                <ShowHideToggle
+                                    onPress={() => this.onInputLabelPressed()}
+                                />
+                            </View>
+                        </View>
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString(
+                                    deletePassword
+                                        ? 'views.Settings.SetPassword.deletePassword'
+                                        : deleteDuressPassword
+                                        ? 'views.Settings.SetDuressPassword.deletePassword'
+                                        : 'views.Lockscreen.login'
+                                )}
+                                onPress={() => this.onAttemptLogIn()}
+                                containerStyle={{ width: 300 }}
+                                adaptiveWidth
+                                warning={deletePassword || deleteDuressPassword}
+                            />
+                        </View>
+                    </View>
+                )}
+                {!!pin && (
+                    <View style={styles.container}>
+                        <View style={{ flex: 1 }}>
+                            <>
+                                {(!!modifySecurityScreen ||
+                                    deletePin ||
+                                    deleteDuressPin) && (
+                                    <View
+                                        style={{
+                                            flex: 2,
+                                            marginTop: 25,
+                                            marginBottom: 25
+                                        }}
+                                    >
+                                        {error && (
+                                            <ErrorMessage
+                                                message={this.generateErrorMessage()}
+                                            />
+                                        )}
+                                    </View>
+                                )}
+                                {!modifySecurityScreen &&
+                                    !deletePin &&
+                                    !deleteDuressPin && (
+                                        <View
+                                            style={{
+                                                flex: 2,
+                                                marginTop: 25,
+                                                marginBottom: 25
+                                            }}
+                                        >
+                                            {error && (
+                                                <ErrorMessage
+                                                    message={this.generateErrorMessage()}
+                                                />
+                                            )}
+                                        </View>
+                                    )}
+                                <Text
+                                    style={{
+                                        ...styles.mainText,
+                                        color: themeColor('text'),
+                                        flex: 1,
+                                        justifyContent: 'flex-end'
+                                    }}
+                                >
+                                    {modifySecurityScreen === 'SetDuressPin'
+                                        ? localeString(
+                                              'views.Lockscreen.existingPin'
+                                          )
+                                        : deleteDuressPin
+                                        ? localeString(
+                                              'views.Lockscreen.enterLoginPin'
+                                          )
+                                        : localeString('views.Lockscreen.pin')}
+                                </Text>
+                                <View
+                                    style={{
+                                        flex: 8,
+                                        justifyContent: 'flex-end'
+                                    }}
+                                >
+                                    <Pin
+                                        onSubmit={this.onSubmitPin}
+                                        onPinChange={() =>
+                                            this.setState({ error: false })
+                                        }
+                                        hidePinLength={true}
+                                        pinLength={pin.length}
+                                        shuffle={settings.scramblePin}
+                                    />
+                                </View>
+                            </>
+                        </View>
+                    </View>
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    content: {
+        paddingLeft: 20,
+        paddingRight: 20,
+        alignItems: 'center'
+    },
+    container: {
+        flex: 1
+    },
+    button: {
+        paddingTop: 15,
+        paddingBottom: 15
+    },
+    inputContainer: {
+        flexDirection: 'row'
+    },
+    textInput: {
+        flex: 1
+    },
+    showHideToggle: {
+        alignSelf: 'center',
+        marginLeft: 10
+    },
+    mainText: {
+        fontFamily: 'PPNeueMontreal-Book',
+        fontSize: 20,
+        textAlign: 'center'
+    }
+});

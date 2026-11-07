@@ -1,0 +1,570 @@
+import React, { Component } from 'react';
+import { FlatList, StyleSheet, Text, View, I18nManager } from 'react-native';
+import LinearGradient from '../LinearGradient';
+import { RectButton } from 'react-native-gesture-handler';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { LNURLWithdrawParams } from 'js-lnurl';
+
+import { Spacer } from '../layout/Spacer';
+import OnchainSwipeableRow from './OnchainSwipeableRow';
+import LightningSwipeableRow from './LightningSwipeableRow';
+import EcashSwipeableRow from './EcashSwipeableRow';
+import Amount from '../Amount';
+
+import BackendUtils from '../../utils/BackendUtils';
+import { decodeNoffer, NofferPriceType } from '../../utils/ClinkUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+
+import OnChainSvg from '../../components/SVG/OnChainSvg';
+import LightningSvg from '../../components/SVG/LightningSvg';
+import EcashSvg from '../../components/SVG/EcashSvg';
+
+import { nodeInfoStore, settingsStore } from '../../stores/Stores';
+
+interface PaymentMethodListProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    value?: string;
+    satAmount?: number | string;
+    feeRate?: string;
+    lightning?: string;
+    lightningAddress?: string;
+    ecash?: string;
+    offer?: string;
+    clinkNoffer?: string;
+    lnurlParams?: LNURLWithdrawParams | undefined;
+    lightningBalance?: number | string;
+    lightningBalanceLabel?: string;
+    // Balance the lightning rows are judged against, when it differs from the
+    // one displayed (e.g. capacity locked in a momentarily offline channel).
+    lightningEligibilityBalance?: number | string;
+    onchainBalance?: number | string;
+    ecashBalance?: number | string;
+    accounts?: Array<{
+        name: string;
+        balance: number;
+        XFP?: string;
+        watch_only?: boolean;
+        hidden?: boolean;
+    }>;
+}
+
+//  To toggle LTR/RTL change to `true`
+I18nManager.allowRTL(false);
+
+type DataRow = {
+    layer: string;
+    subtitle?: string;
+    disabled?: boolean;
+    balance?: number | string;
+    balanceLabel?: string;
+    // Defaults to `balance`. Set when the row should be judged against a
+    // different figure than the one it shows.
+    eligibilityBalance?: number | string;
+    account?: string;
+    hidden?: boolean;
+    satAmount?: number;
+    // LNURL withdraws fund the wallet, so rows must not be
+    // disabled or flagged on the wallet's existing balance
+    isWithdraw?: boolean;
+};
+
+const LAYER_LOCALE_MAP: Record<string, string> = {
+    Lightning: 'general.lightning',
+    'Lightning via ecash': 'components.LayerBalances.lightningViaEcash',
+    'Lightning address': 'general.lightningAddress',
+    Offer: 'views.Settings.Bolt12Offer',
+    CLINK: 'views.Settings.Noffer',
+    'On-chain': 'general.onchain'
+};
+
+const getGradientColors = (): [string, string] => {
+    const gradient = themeColor('buttonGradient');
+    if (gradient) return gradient;
+    const bg = themeColor('buttonBackground') ?? themeColor('secondary');
+    return [bg, bg];
+};
+
+const LayerIcon = ({ layer }: { layer: string }) => {
+    if (layer === 'Lightning via ecash') return <EcashSvg />;
+    if (layer === 'On-chain') return <OnChainSvg />;
+    if (['Lightning', 'Lightning address', 'Offer', 'CLINK'].includes(layer))
+        return <LightningSvg />;
+    return <OnChainSvg />;
+};
+
+const hasInsufficientBalance = (
+    balance: number | string | undefined,
+    satAmount: number | undefined
+) =>
+    Number(balance) === 0 ||
+    (satAmount !== undefined && satAmount > Number(balance));
+
+const isRowInsufficient = (item: DataRow) =>
+    !item.isWithdraw &&
+    hasInsufficientBalance(
+        item.eligibilityBalance ?? item.balance,
+        item.satAmount
+    );
+
+const Row = ({ item }: { item: DataRow }) => {
+    const insufficient = isRowInsufficient(item);
+    const layerLabel = LAYER_LOCALE_MAP[item.layer]
+        ? localeString(LAYER_LOCALE_MAP[item.layer])
+        : item.layer;
+    return (
+        <RectButton
+            style={{
+                opacity: item.disabled ? 0.5 : 1
+            }}
+        >
+            <LinearGradient
+                colors={getGradientColors()}
+                style={styles.rectButton}
+            >
+                <View style={styles.left}>
+                    <LayerIcon layer={item.layer} />
+                    <Spacer width={5} />
+                    <View
+                        style={{
+                            flexDirection: 'column',
+                            flex: 1
+                        }}
+                    >
+                        <Text
+                            style={{
+                                ...styles.layerText,
+                                color:
+                                    themeColor('buttonText') ||
+                                    themeColor('text')
+                            }}
+                        >
+                            {layerLabel}
+                        </Text>
+                        {item.subtitle && (
+                            <Text
+                                numberOfLines={1}
+                                ellipsizeMode="middle"
+                                style={[
+                                    styles.layerText,
+                                    styles.subtitle,
+                                    {
+                                        color:
+                                            themeColor('buttonTextSecondary') ||
+                                            themeColor('secondaryText')
+                                    }
+                                ]}
+                            >
+                                {item.subtitle}
+                            </Text>
+                        )}
+                    </View>
+                </View>
+                {item.balance !== undefined && (
+                    <View style={styles.balanceContainer}>
+                        <Amount
+                            sats={item.balance}
+                            sensitive
+                            colorOverride={
+                                insufficient
+                                    ? themeColor('error')
+                                    : themeColor('buttonText')
+                            }
+                        />
+                        {item.balanceLabel && (
+                            <Text
+                                style={[
+                                    styles.balanceLabel,
+                                    {
+                                        color:
+                                            themeColor('buttonTextSecondary') ||
+                                            themeColor('secondaryText')
+                                    }
+                                ]}
+                            >
+                                {item.balanceLabel}
+                            </Text>
+                        )}
+                    </View>
+                )}
+            </LinearGradient>
+        </RectButton>
+    );
+};
+
+const SwipeableRow = ({
+    item,
+    navigation,
+    value,
+    satAmount,
+    feeRate,
+    lightning,
+    lightningAddress,
+    offer,
+    clinkNoffer,
+    lnurlParams
+}: {
+    item: DataRow;
+    index: number;
+    navigation: NativeStackNavigationProp<any, any>;
+    value?: string;
+    satAmount?: number;
+    feeRate?: string;
+    lightning?: string;
+    lightningAddress?: string;
+    offer?: string;
+    clinkNoffer?: string;
+    lnurlParams?: LNURLWithdrawParams | undefined;
+}) => {
+    const insufficient = isRowInsufficient(item);
+    const rowDisabled = item.disabled || insufficient;
+    if (item.layer === 'Lightning') {
+        return (
+            <LightningSwipeableRow
+                navigation={navigation}
+                lightning={lightning}
+                locked={true}
+                lnurlParams={lnurlParams}
+                disabled={rowDisabled}
+            >
+                <Row item={item} />
+            </LightningSwipeableRow>
+        );
+    }
+
+    if (item.layer === 'Lightning address') {
+        return (
+            <LightningSwipeableRow
+                navigation={navigation}
+                lightningAddress={lightningAddress}
+                locked={true}
+                disabled={rowDisabled}
+            >
+                <Row item={item} />
+            </LightningSwipeableRow>
+        );
+    }
+
+    if (item.layer === 'Lightning via ecash') {
+        return (
+            <EcashSwipeableRow
+                navigation={navigation}
+                lightning={lightning}
+                locked={true}
+                lnurlParams={lnurlParams}
+                disabled={rowDisabled}
+            >
+                <Row item={item} />
+            </EcashSwipeableRow>
+        );
+    }
+
+    if (item.layer === 'Offer') {
+        return (
+            <LightningSwipeableRow
+                navigation={navigation}
+                offer={offer}
+                locked={true}
+                disabled={rowDisabled}
+            >
+                <Row item={item} />
+            </LightningSwipeableRow>
+        );
+    }
+
+    if (item.layer === 'CLINK') {
+        // The row's balance/satAmount (when populated for Fixed noffers)
+        // already reflects the larger of lightning and ecash, so the
+        // standard insufficient-balance check is correct here. For
+        // Variable/Spontaneous noffers item.balance is unset and only
+        // item.disabled (driven by a fully empty combined balance) applies.
+        return (
+            <LightningSwipeableRow
+                navigation={navigation}
+                clinkNoffer={clinkNoffer}
+                locked={true}
+                disabled={rowDisabled}
+            >
+                <Row item={item} />
+            </LightningSwipeableRow>
+        );
+    }
+
+    if (item.layer === 'On-chain' || item.account) {
+        return (
+            <OnchainSwipeableRow
+                navigation={navigation}
+                value={value}
+                satAmount={satAmount}
+                feeRate={feeRate}
+                locked={true}
+                hidden={item.hidden}
+                disabled={rowDisabled}
+                account={item.account}
+            >
+                <Row item={item} />
+            </OnchainSwipeableRow>
+        );
+    }
+};
+
+export default class PaymentMethodList extends Component<
+    PaymentMethodListProps,
+    {}
+> {
+    private buildData = (satAmount: number | undefined): DataRow[] => {
+        const {
+            value,
+            lightning,
+            lightningAddress,
+            offer,
+            clinkNoffer,
+            lnurlParams,
+            lightningBalance,
+            lightningEligibilityBalance,
+            onchainBalance,
+            ecashBalance,
+            accounts
+        } = this.props;
+        let DATA: DataRow[] = [];
+
+        const lightningEligibility =
+            lightningEligibilityBalance ?? lightningBalance;
+
+        const isWithdraw = lnurlParams?.tag === 'withdrawRequest';
+        const subtitle = isWithdraw
+            ? lnurlParams?.defaultDescription || lnurlParams?.domain
+            : lightning ?? lnurlParams?.tag;
+
+        if (lightning || lnurlParams) {
+            DATA.push({
+                layer: 'Lightning',
+                subtitle,
+                balance: lightningBalance,
+                balanceLabel: this.props.lightningBalanceLabel,
+                eligibilityBalance: lightningEligibility,
+                disabled: false,
+                isWithdraw,
+                satAmount
+            });
+
+            if (
+                BackendUtils.supportsCashuWallet() &&
+                settingsStore?.settings?.ecash?.enableCashu
+            ) {
+                DATA.push({
+                    layer: 'Lightning via ecash',
+                    subtitle,
+                    balance: ecashBalance,
+                    disabled: false,
+                    isWithdraw,
+                    satAmount
+                });
+            }
+        }
+
+        if (lightningAddress) {
+            DATA.push({
+                layer: 'Lightning address',
+                subtitle: lightningAddress,
+                balance: lightningBalance,
+                balanceLabel: this.props.lightningBalanceLabel,
+                eligibilityBalance: lightningEligibility,
+                disabled: false,
+                satAmount
+            });
+        }
+
+        if (offer) {
+            DATA.push({
+                layer: 'Offer',
+                subtitle: offer,
+                disabled: !nodeInfoStore.supportsOffers,
+                balance: lightningBalance,
+                balanceLabel: this.props.lightningBalanceLabel,
+                eligibilityBalance: lightningEligibility,
+                satAmount
+            });
+        }
+
+        // Only show on-chain balance for non-Lnbank accounts
+        if (value && BackendUtils.supportsOnchainReceiving()) {
+            DATA.push({
+                layer: 'On-chain',
+                subtitle: value,
+                disabled: !BackendUtils.supportsOnchainSends(),
+                balance: onchainBalance,
+                account: 'default',
+                satAmount
+            });
+
+            if (accounts && accounts.length > 0) {
+                accounts.forEach((account) => {
+                    if (!account.hidden && !account.watch_only) {
+                        DATA.push({
+                            layer: account.name,
+                            subtitle: value ?? account.XFP,
+                            disabled: false,
+                            balance: account.balance,
+                            account: account.name,
+                            hidden: account.hidden,
+                            satAmount
+                        });
+                    }
+                });
+            }
+        }
+
+        // Rendered after the balance-backed rows so the UI groups
+        // "buckets you can spend from" together up top, with the noffer
+        // (which spans lightning + ecash and may have no known amount)
+        // sitting beneath them.
+        if (clinkNoffer) {
+            // Only Fixed-price noffers carry the amount in the bech32 itself.
+            // Variable and Spontaneous noffers have no amount until the
+            // service returns a bolt11, so a balance comparison here would
+            // be meaningless.
+            let embeddedAmount: number | undefined;
+            try {
+                const decoded = decodeNoffer(clinkNoffer);
+                if (
+                    decoded.priceType === NofferPriceType.Fixed &&
+                    typeof decoded.price === 'number' &&
+                    decoded.price > 0
+                ) {
+                    embeddedAmount = decoded.price;
+                }
+            } catch {}
+            // ClinkPay can settle the returned bolt11 via either the
+            // lightning balance or ecash, so the row's balance is the
+            // larger of the two (ecash only counts when cashu is enabled).
+            // Using the max means the row is enabled iff at least one
+            // bucket alone can cover the amount.
+            const ecashAvailable =
+                BackendUtils.supportsCashuWallet() &&
+                settingsStore?.settings?.ecash?.enableCashu;
+            const clinkBalance = Math.max(
+                Number(lightningBalance ?? 0),
+                ecashAvailable ? Number(ecashBalance ?? 0) : 0
+            );
+            const clinkEligibility = Math.max(
+                Number(lightningEligibility ?? 0),
+                ecashAvailable ? Number(ecashBalance ?? 0) : 0
+            );
+            DATA.push({
+                layer: 'CLINK',
+                subtitle: clinkNoffer,
+                // No funds in either bucket means no path to pay,
+                // regardless of the noffer's pricing type.
+                disabled: clinkEligibility === 0,
+                ...(embeddedAmount !== undefined && {
+                    balance: clinkBalance,
+                    eligibilityBalance: clinkEligibility,
+                    // Compare against the noffer's embedded price (the
+                    // amount that will actually be paid) rather than any
+                    // BIP21 `amount=` that may have come in separately.
+                    satAmount: embeddedAmount
+                })
+            });
+        }
+        return DATA;
+    };
+
+    render() {
+        const {
+            navigation,
+            value,
+            satAmount,
+            feeRate,
+            lightning,
+            lightningAddress,
+            offer,
+            clinkNoffer,
+            lnurlParams
+        } = this.props;
+        const satAmountNum =
+            satAmount !== undefined && !isNaN(Number(satAmount))
+                ? Number(satAmount)
+                : undefined;
+        const DATA = this.buildData(satAmountNum);
+        return (
+            <View style={{ flex: 1 }}>
+                <FlatList
+                    data={DATA}
+                    ItemSeparatorComponent={() => (
+                        <View style={styles.separator} />
+                    )}
+                    renderItem={({ item, index }) => (
+                        // @ts-ignore:next-line
+                        <SwipeableRow
+                            item={item}
+                            index={index}
+                            navigation={navigation}
+                            // select pay method vars
+                            value={value}
+                            satAmount={satAmountNum}
+                            feeRate={feeRate}
+                            lightning={lightning}
+                            lightningAddress={lightningAddress}
+                            offer={offer}
+                            clinkNoffer={clinkNoffer}
+                            lnurlParams={lnurlParams}
+                        />
+                    )}
+                    keyExtractor={(item) =>
+                        item.account
+                            ? `account-${item.account}`
+                            : `layer-${item.layer}`
+                    }
+                    style={{ marginTop: 20 }}
+                    refreshing={false}
+                />
+            </View>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    rectButton: {
+        flex: 1,
+        height: 80,
+        paddingVertical: 10,
+        paddingLeft: 6,
+        paddingRight: 20,
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        flexDirection: 'row',
+        marginLeft: 15,
+        marginRight: 15,
+        borderRadius: 50
+    },
+    left: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'flex-start',
+        flex: 1
+    },
+    balanceContainer: {
+        flexShrink: 0,
+        marginLeft: 10,
+        maxWidth: '40%'
+    },
+    balanceLabel: {
+        fontSize: 12,
+        fontFamily: 'PPNeueMontreal-Medium',
+        textAlign: 'right',
+        marginTop: 2
+    },
+    separator: {
+        backgroundColor: 'transparent',
+        height: 20
+    },
+    layerText: {
+        backgroundColor: 'transparent',
+        fontSize: 15,
+        fontFamily: 'PPNeueMontreal-Medium'
+    },
+    subtitle: {
+        marginTop: 2
+    }
+});

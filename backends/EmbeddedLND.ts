@@ -1,0 +1,705 @@
+import LND from './LND';
+import OpenChannelRequest from '../models/OpenChannelRequest';
+import Base64Utils from './../utils/Base64Utils';
+import {
+    findPaymentByHash,
+    markNodeResponded
+} from './../utils/PaymentLookupUtils';
+import { TransactionPageRequest } from '../utils/OnchainTransactionUtils';
+
+import lndMobile from '../lndmobile/LndMobileInjection';
+import { decodeSubscribeTransactionsResult } from '../lndmobile/onchain';
+
+import {
+    checkLndStreamErrorResponse,
+    LndMobileEventEmitter
+} from '../utils/LndMobileUtils';
+import {
+    isEventForRequest,
+    newStreamRequestId
+} from '../utils/StreamRequestUtils';
+
+const {
+    addInvoice,
+    getInfo,
+    connectPeer,
+    listInvoices,
+    listUnspent,
+    getNodeInfo,
+    decodePayReq,
+    sendPaymentV2Sync,
+    sendKeysendPaymentV2,
+    listPayments,
+    getNetworkInfo,
+    getRecoveryInfo,
+    queryRoutes,
+    lookupInvoice,
+    fundingStateStep,
+    sendCustomMessage,
+    subscribeCustomMessages,
+    listPeers,
+    disconnectPeer
+} = lndMobile.index;
+const {
+    channelBalance,
+    getChanInfo,
+    listChannels,
+    pendingChannels,
+    closedChannels,
+    closeChannel,
+    abandonChannel,
+    openChannel,
+    openChannelSync,
+    decodeOpenStatusUpdate,
+    decodeCloseStatusUpdate,
+    updateChannelPolicy
+} = lndMobile.channel;
+const {
+    signMessageNodePubkey,
+    verifyMessageNodePubkey,
+    bumpFee,
+    bumpForceCloseFee,
+    fundPsbt,
+    signPsbt,
+    finalizePsbt,
+    publishTransaction,
+    listAccounts,
+    listAddresses,
+    importAccount,
+    rescan
+} = lndMobile.wallet;
+const {
+    walletBalance,
+    newAddress,
+    newChangeAddress,
+    getTransactions,
+    sendCoins
+} = lndMobile.onchain;
+
+const {
+    WatchtowerClientAddTower,
+    WatchtowerClientRemoveTower,
+    WatchtowerClientListTowers,
+    WatchtowerClientGetTowerInfo,
+    WatchtowerClientGetStats,
+    WatchtowerClientGetPolicy,
+    WatchtowerClientDeactivateTower,
+    WatchtowerClientTerminateSession
+} = lndMobile.wtclient;
+
+import {
+    signMessageWithAddr as signMsgWithAddr,
+    verifyMessageWithAddr as verifyMsgWithAddr
+} from '../lndmobile/wallet';
+
+import {
+    toLnrpcAddressTypeNum,
+    toWalletrpcAddressTypeNum
+} from '../utils/LndUtils';
+
+export default class EmbeddedLND extends LND {
+    openChannelListener: any;
+
+    getTransactionsPage = async (data?: TransactionPageRequest | null) => {
+        const response = await getTransactions(data);
+        return { transactions: response.transactions || [] };
+    };
+    getChannels = async () => await listChannels();
+    getPendingChannels = async () => await pendingChannels();
+    getClosedChannels = async () => await closedChannels();
+    getChannelInfo = async (chanId: string) => await getChanInfo(chanId);
+    getBlockchainBalance = async (data: any) => await walletBalance(data);
+    getLightningBalance = async () => await channelBalance();
+    sendCoins = async (data: any) =>
+        await sendCoins(
+            data.addr,
+            data.amount,
+            data.sat_per_vbyte,
+            data.spend_unconfirmed,
+            data.send_all,
+            data.outpoints,
+            data.label
+        );
+    sendCustomMessage = async (data: any) =>
+        await sendCustomMessage(data.peer, data.type, data.data);
+    subscribeCustomMessages = async () => await subscribeCustomMessages();
+    getMyNodeInfo = async () => await getInfo();
+    getNetworkInfo = async () => await getNetworkInfo();
+    getRecoveryInfo = async () => await getRecoveryInfo();
+    getInvoices = async () => await listInvoices();
+    createInvoice = async (data: any) =>
+        await addInvoice({
+            amount: data.value ? Number(data.value) : undefined,
+            amount_msat: data.value_msat ? Number(data.value_msat) : undefined,
+            memo: data.memo,
+            expiry: data.expiry_seconds,
+            is_amp: data.is_amp,
+            is_blinded: data.is_blinded,
+            is_private: data.private,
+            preimage: data.preimage,
+            route_hints: data.route_hints
+        });
+    getPayments = async (params?: {
+        maxPayments?: number;
+        reversed?: boolean;
+        creationDateStart?: number;
+    }) => await listPayments(params);
+    getNewAddress = async (data: any) =>
+        await newAddress(
+            toLnrpcAddressTypeNum(data?.type) as any,
+            data?.account
+        );
+    getNewChangeAddress = async (data: any) =>
+        // NextAddr takes walletrpc.AddressType numbering, which differs
+        // from lnrpc numbering; protobufjs would encode a name string as 0
+        await newChangeAddress(
+            toWalletrpcAddressTypeNum(data.type) as any,
+            data.account
+        );
+    openChannelSync = async (data: OpenChannelRequest) =>
+        await openChannelSync(
+            data.node_pubkey_string,
+            Number(data.local_funding_amount),
+            data.privateChannel || false,
+            data.sat_per_vbyte ? Number(data.sat_per_vbyte) : undefined,
+            data.scidAlias,
+            data.min_confs,
+            data.spend_unconfirmed,
+            data.simpleTaprootChannel,
+            data.fundMax,
+            data.utxos,
+            data.close_address
+        );
+    openChannelStream = async (data: OpenChannelRequest) => {
+        const requestId = newStreamRequestId();
+        return await new Promise((resolve, reject) => {
+            LndMobileEventEmitter.addListener('OpenChannel', (e: any) => {
+                if (!isEventForRequest(e, requestId)) return;
+                try {
+                    const error = checkLndStreamErrorResponse('OpenChannel', e);
+                    if (error === 'EOF') {
+                        return;
+                    } else if (error) {
+                        console.error('Got error from OpenChannel', [error]);
+                        reject(error);
+                        return;
+                    }
+
+                    const result = decodeOpenStatusUpdate(e.data);
+                    if (result?.psbt_fund) {
+                        resolve({ result });
+                    }
+                } catch (error) {
+                    console.error(error);
+                }
+            });
+
+            openChannel(
+                data.node_pubkey_string,
+                Number(data.local_funding_amount),
+                data.privateChannel || false,
+                data.sat_per_vbyte && !data.funding_shim
+                    ? Number(data.sat_per_vbyte)
+                    : undefined,
+                data.scidAlias,
+                data.min_confs,
+                data.spend_unconfirmed,
+                data.simpleTaprootChannel,
+                data.fundMax,
+                data.utxos,
+                data.funding_shim,
+                requestId
+            );
+        });
+    };
+
+    listPeers = async (): Promise<any[]> => {
+        try {
+            const response = await listPeers();
+            const formattedPeers = (response?.peers || []).map((peer: any) => {
+                const formattedPeer = {
+                    pub_key: peer.pub_key || '',
+                    address: peer.address || '',
+                    bytes_sent: peer.bytes_sent?.toString() || '0',
+                    bytes_recv: peer.bytes_recv?.toString() || '0',
+                    ping_time: peer.ping_time?.toString() || '0',
+                    sync_type: peer.sync_type || '',
+                    sat_sent: peer.sat_sent?.toString() || '0',
+                    sat_recv: peer.sat_recv?.toString() || '0',
+                    inbound: peer.inbound || false,
+                    flap_count: peer.flap_count || '0'
+                };
+                return formattedPeer;
+            });
+            return formattedPeers;
+        } catch (error) {
+            console.error('Error fetching peers:', error);
+            throw error;
+        }
+    };
+
+    disconnectPeer = async (pubkey: string): Promise<boolean | null> => {
+        try {
+            await disconnectPeer(pubkey);
+            return true;
+        } catch (error) {
+            console.error(`Error while disconnecting peer ${pubkey}:`, error);
+            return null;
+        }
+    };
+
+    connectPeer = async (data: any) =>
+        await connectPeer(data.addr.pubkey, data.addr.host, data.perm);
+    decodePaymentRequest = async (urlParams?: string[]) =>
+        await decodePayReq((urlParams && urlParams[0]) || '');
+    payLightningInvoice = async (data: any) => {
+        const sendPaymentReq = {
+            payment_request: data.payment_request,
+            payment_hash: data.payment_hash,
+            amt: data?.amt,
+            max_parts: data?.max_parts,
+            max_shard_amt: data?.max_shard_amt,
+            fee_limit_sat: data?.fee_limit_sat || 0,
+            outgoing_chan_ids: data?.outgoing_chan_ids,
+            last_hop_pubkey: data?.last_hop_pubkey,
+            message: data?.message
+                ? Base64Utils.hexToBase64(Base64Utils.utf8ToHex(data?.message))
+                : undefined,
+            amp: data?.amp,
+            timeout_seconds: data?.timeout_seconds || 60,
+            allow_self_payment: true,
+            multi_path: data?.multi_path,
+            max_shard_size_msat: data?.max_shard_size_msat,
+            dest: data.dest
+        };
+
+        // in-process call: a rejection comes from lnd, never from transport
+        return await sendPaymentV2Sync(sendPaymentReq).catch((error) => {
+            throw markNodeResponded(error, error?.grpcCode);
+        });
+    };
+    sendKeysend = async (data: any) =>
+        await sendKeysendPaymentV2({
+            dest: data.pubkey,
+            amt: data.amt,
+            dest_custom_records: data.dest_custom_records,
+            payment_hash: data.payment_hash,
+            fee_limit_sat: data.fee_limit_sat,
+            max_shard_size_msat: data.max_shard_size_msat,
+            max_parts: data.max_parts,
+            cltv_limit: data.cltv_limit,
+            amp: data.amp,
+            timeout_seconds: data.timeout_seconds
+        }).catch((error) => {
+            throw markNodeResponded(error, error?.grpcCode);
+        });
+    // override LND's REST implementation with an on-device lookup
+    lookupPayment = async (data: {
+        payment_hash: string;
+        creation_date_start?: number;
+    }) =>
+        await findPaymentByHash(
+            (request) => listPayments(request),
+            data.payment_hash,
+            data.creation_date_start
+        );
+    // The native call returns once the request is handed to LND, before LND
+    // has processed it. The outcome arrives on the CloseChannel stream: an
+    // error, or close_pending once the closing transaction is published.
+    closeChannel = async (urlParams?: Array<string>) => {
+        const fundingTxId = (urlParams && urlParams[0]) || '';
+        const outputIndex =
+            urlParams && urlParams[1] ? Number(urlParams[1]) : 0;
+        const force = urlParams && urlParams[2] ? true : false;
+        const sat_per_vbyte =
+            urlParams && urlParams[3] && !urlParams[2]
+                ? Number(urlParams[3])
+                : undefined;
+        const delivery_address =
+            urlParams && urlParams[4] ? urlParams[4] : undefined;
+
+        // ChannelsStore stops waiting after 6 s and ignores any later result,
+        // so stop listening then as well. Every close stream reports under
+        // the same CloseChannel event; the request id tells this close's
+        // updates apart from the others'.
+        const CHANNEL_CLOSE_TIMEOUT_MS = 6000;
+        const requestId = newStreamRequestId();
+        return await new Promise((resolve, reject) => {
+            const finish = () => {
+                clearTimeout(timeout);
+                listener.remove();
+            };
+            // Timeout: resolve optimistically since LND accepted the request
+            const timeout = setTimeout(() => {
+                finish();
+                resolve({});
+            }, CHANNEL_CLOSE_TIMEOUT_MS);
+            const listener = LndMobileEventEmitter.addListener(
+                'CloseChannel',
+                (e: any) => {
+                    if (!isEventForRequest(e, requestId)) return;
+                    try {
+                        const error = checkLndStreamErrorResponse(
+                            'CloseChannel',
+                            e
+                        );
+                        if (error === 'EOF') {
+                            return;
+                        } else if (error) {
+                            finish();
+                            reject(error);
+                            return;
+                        }
+
+                        // a close reports close_pending first; chan_close only
+                        // follows once the close confirms
+                        const update = decodeCloseStatusUpdate(e.data);
+                        if (update?.close_pending) {
+                            finish();
+                            resolve(update);
+                        }
+                    } catch (error) {
+                        console.error(error);
+                    }
+                }
+            );
+
+            closeChannel(
+                fundingTxId,
+                outputIndex,
+                force,
+                sat_per_vbyte,
+                delivery_address,
+                requestId
+            ).catch((error: any) => {
+                finish();
+                reject(error);
+            });
+        });
+    };
+    abandonChannel = async (
+        urlParams?: Array<string | boolean | undefined>
+    ) => {
+        const fundingTxId =
+            urlParams && typeof urlParams[0] === 'string' ? urlParams[0] : '';
+        const outputIndex =
+            urlParams && typeof urlParams[1] === 'string'
+                ? Number(urlParams[1])
+                : 0;
+        const pendingFundingShimOnly =
+            urlParams && urlParams[2] ? Boolean(urlParams[2]) : undefined;
+        const iKnowWhatIAmDoing =
+            urlParams && urlParams[3] ? Boolean(urlParams[3]) : undefined;
+
+        return await abandonChannel(
+            fundingTxId,
+            outputIndex,
+            pendingFundingShimOnly,
+            iKnowWhatIAmDoing
+        );
+    };
+
+    getNodeInfo = async (urlParams?: Array<string>) =>
+        await getNodeInfo((urlParams && urlParams[0]) || '');
+    // UTF-8, like the other backends. stringToUint8Array keeps only the low
+    // byte of each char, so a non-ASCII look-alike of the LNURL-auth phrase
+    // would pass isReservedSigningMessage and still be signed as the phrase.
+    signMessage = async (msg: any) => {
+        return await signMessageNodePubkey(Base64Utils.utf8ToBytes(msg));
+    };
+    verifyMessage = async (data: any) => {
+        const { signature, msg } = data;
+        return await verifyMessageNodePubkey(
+            signature,
+            Base64Utils.utf8ToBytes(msg)
+        );
+    };
+
+    // getFees = () => N/A;
+    // setFees = () => N/A;
+    updateChannelPolicy = async (data: any) => await updateChannelPolicy(data);
+
+    signMessageWithAddr = async (message: string, address: string) => {
+        return await signMsgWithAddr(
+            Base64Utils.stringToUint8Array(message),
+            address
+        );
+    };
+    verifyMessageWithAddr = async (
+        message: string,
+        signature: string,
+        address: string
+    ) => {
+        return await verifyMsgWithAddr(
+            Base64Utils.stringToUint8Array(message),
+            signature,
+            address
+        );
+    };
+
+    getRoutes = async (urlParams?: Array<any>) =>
+        urlParams && (await queryRoutes(urlParams[0], urlParams[1]));
+    // getForwardingHistory = () => N/A
+    // // Coin Control
+    fundPsbt = async (data: any) => await fundPsbt(data);
+    signPsbt = async (data: any) => await signPsbt(data);
+    finalizePsbt = async (data: any) => await finalizePsbt(data);
+    publishTransaction = async (data: any) => {
+        if (data.tx_hex) data.tx_hex = Base64Utils.hexToBase64(data.tx_hex);
+        return await publishTransaction(data);
+    };
+    fundingStateStep = async (data: any) => {
+        // Verify
+        if (
+            data.psbt_finalize?.funded_psbt &&
+            Base64Utils.isHex(data.psbt_finalize?.funded_psbt)
+        )
+            data.psbt_finalize.funded_psbt = Base64Utils.hexToBase64(
+                data.psbt_finalize.funded_psbt
+            );
+        // Finalize
+        if (
+            data.psbt_finalize?.final_raw_tx &&
+            Base64Utils.isHex(data.psbt_finalize?.final_raw_tx)
+        )
+            data.psbt_finalize.final_raw_tx = Base64Utils.hexToBase64(
+                data.psbt_finalize.final_raw_tx
+            );
+        if (
+            data.psbt_finalize?.signed_psbt &&
+            Base64Utils.isHex(data.psbt_finalize?.signed_psbt)
+        )
+            data.psbt_finalize.signed_psbt = Base64Utils.hexToBase64(
+                data.psbt_finalize.signed_psbt
+            );
+        return await fundingStateStep(data);
+    };
+
+    getUTXOs = async (data: any) => await listUnspent(data);
+    bumpFee = async (data: any) => await bumpFee(data);
+    bumpForceCloseFee = async (data: any) => await bumpForceCloseFee(data);
+    lookupInvoice = async (data: any) => await lookupInvoice(data.r_hash);
+
+    listAccounts = async () => await listAccounts();
+    listAddresses = async () => await listAddresses();
+    importAccount = async (data: any) => await importAccount(data);
+    rescan = async (data: any) => await rescan(data);
+
+    // Watchtower
+    addWatchtower = async (data: { pubkey: string; address: string }) =>
+        await WatchtowerClientAddTower(data.pubkey, data.address);
+
+    removeWatchtower = async (pubkey: string) =>
+        await WatchtowerClientRemoveTower(pubkey);
+
+    listWatchtowers = async (params?: {
+        include_sessions?: boolean;
+        exclude_exhausted_sessions?: boolean;
+    }) => {
+        return await WatchtowerClientListTowers(params?.include_sessions);
+    };
+
+    getWatchtowerInfo = async (
+        pubkey: string,
+        params?: {
+            include_sessions?: boolean;
+            exclude_exhausted_sessions?: boolean;
+        }
+    ) => await WatchtowerClientGetTowerInfo(pubkey, params?.include_sessions);
+
+    getWatchtowerStats = async () => await WatchtowerClientGetStats();
+
+    getWatchtowerPolicy = async (policy_type?: number) =>
+        await WatchtowerClientGetPolicy(policy_type);
+
+    deactivateWatchtower = async (pubkey: string) =>
+        await WatchtowerClientDeactivateTower(pubkey);
+
+    terminateWatchtowerSession = async (sessionId: string) =>
+        await WatchtowerClientTerminateSession(sessionId);
+
+    // rHash arrives hex encoded from the Receive view
+    watchInvoicePaid = (
+        { rHash }: { rHash: string },
+        onPaid: (payload: {
+            amountSat: number;
+            tx?: string;
+            preimage?: string;
+        }) => void
+    ): (() => void) => {
+        const listener = LndMobileEventEmitter.addListener(
+            'SubscribeInvoices',
+            (e: any) => {
+                try {
+                    const error = checkLndStreamErrorResponse(
+                        'SubscribeInvoices',
+                        e
+                    );
+                    if (error === 'EOF') {
+                        listener.remove();
+                        return;
+                    } else if (error) {
+                        console.error('Got error from SubscribeInvoices', [
+                            error
+                        ]);
+                        listener.remove();
+                        return;
+                    }
+
+                    const invoice = lndMobile.wallet.decodeInvoiceResult(
+                        e.data
+                    );
+
+                    if (
+                        invoice.settled &&
+                        // @ts-ignore:next-line
+                        Base64Utils.bytesToHex(invoice.r_hash) === rHash
+                    ) {
+                        listener.remove();
+                        onPaid({
+                            amountSat: Number(invoice.amt_paid_sat),
+                            tx: invoice.payment_request,
+                            preimage: Base64Utils.bytesToHex(
+                                // @ts-ignore:next-line
+                                invoice.r_preimage
+                            )
+                        });
+                    }
+                } catch (error) {
+                    console.error(error);
+                    listener.remove();
+                }
+            }
+        );
+
+        lndMobile.wallet
+            .subscribeInvoices()
+            .catch((error) =>
+                console.error('subscribeInvoices error', [error])
+            );
+
+        return () => listener.remove();
+    };
+    watchOnchainReceived = (
+        {
+            address,
+            expectedAmountSat,
+            numConfPreference
+        }: {
+            address: string;
+            expectedAmountSat?: string | number;
+            numConfPreference: number;
+            blockHeight?: number;
+        },
+        onReceived: (payload: { amountSat: number; txid: string }) => void
+    ): (() => void) => {
+        const listener = LndMobileEventEmitter.addListener(
+            'SubscribeTransactions',
+            (e: any) => {
+                try {
+                    const error = checkLndStreamErrorResponse(
+                        'SubscribeTransactions',
+                        e
+                    );
+                    if (error === 'EOF') {
+                        listener.remove();
+                        return;
+                    } else if (error) {
+                        console.error('Got error from SubscribeTransactions', [
+                            error
+                        ]);
+                        listener.remove();
+                        return;
+                    }
+
+                    const transaction = decodeSubscribeTransactionsResult(
+                        e.data
+                    );
+                    if (
+                        transaction.dest_addresses.includes(address) &&
+                        transaction.num_confirmations > numConfPreference &&
+                        Number(transaction.amount) >=
+                            Number(expectedAmountSat ?? 0)
+                    ) {
+                        listener.remove();
+                        onReceived({
+                            amountSat: Number(transaction.amount),
+                            txid: transaction.tx_hash
+                        });
+                    }
+                } catch (error) {
+                    console.error(error);
+                    listener.remove();
+                }
+            }
+        );
+
+        lndMobile.onchain
+            .subscribeTransactions()
+            .catch((error) =>
+                console.error('subscribeTransactions error', [error])
+            );
+
+        return () => listener.remove();
+    };
+    // initChannelAcceptor = async (callback: any) =>
+    //     await channelAcceptor(callback);
+    supportsWatchtowerClient = () => true;
+    supportsPeers = () => true;
+    supportsMessageSigning = () => true;
+    supportsMessageVerification = () => true;
+    requiresVerifyPubkey = () => false;
+    supportsAddressMessageSigning = () => true;
+    supportsLnurlAuth = () => true;
+    supportsOnchainBalance = () => true;
+    supportsOnchainSends = () => true;
+    supportsOnchainReceiving = () => true;
+    supportsUnconfirmedTransactionOrigin = () => true;
+    supportsLightningSends = () => true;
+    supportsKeysend = () => true;
+    supportsChannelManagement = () => true;
+    supportsCircularRebalancing = () => true;
+    supportsForceClose = () => true;
+    supportsPendingChannels = () => true;
+    supportsClosedChannels = () => true;
+    supportsMPP = () => this.supports('v0.10.0');
+    supportsAMP = () => this.supports('v0.13.0');
+    supportsCoinControl = () => this.supports('v0.12.0');
+    supportsChannelCoinControl = () => this.supports('v0.17.0');
+    supportsHopPicking = () => this.supports('v0.11.0');
+    supportsAccounts = () => true;
+    supportsAccountImportRescan = () => true;
+    supportsRouting = () => false;
+    supportsNodeInfo = () => true;
+    supportsWithdrawalRequests = () => false;
+    singleFeesEarnedTotal = () => false;
+    supportsAddressTypeSelection = () => true;
+    supportsNestedSegWit = () => true;
+    supportsTaproot = () => this.supports('v0.15.0');
+    supportsBumpFee = () => true;
+    supportsFlowLSP = () => true;
+    supportsNetworkInfo = () => true;
+    supportsSimpleTaprootChannels = () => this.supports('v0.17.0');
+    supportsCustomPreimages = () => true;
+    supportsSweep = () => true;
+    supportsOnchainSendMax = () => this.supports('v0.18.3');
+    // the native openChannelSync does not forward a memo
+    supportsChannelMemo = () => false;
+    supportsOnchainBatching = () => true;
+    supportsChannelBatching = () => true;
+    supportsChannelFundMax = () => true;
+    supportsLSPScustomMessage = () => true;
+    supportsLSPS1rest = () => false;
+    supportsOffers = () => false;
+    supportsListingOffers = () => false;
+    supportsBolt12Address = () => false;
+    supportsBolt11BlindedRoutes = () => this.supports('v0.18.3');
+    supportsAddressesWithDerivationPaths = () => this.supports('v0.18.0');
+    supportsCustomFeeLimit = () => true;
+    isLNDBased = () => true;
+    supportsForwardingHistory = () => false;
+    supportInboundFees = () => this.supports('v0.18.0');
+    supportsCashuWallet = () => true;
+    supportsSettingInvoiceExpiration = () => true;
+    supportsNostrWalletConnectService = () => true;
+}

@@ -1,0 +1,302 @@
+import * as React from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+
+import Amount from './Amount';
+import TextInput from './TextInput';
+
+import { Row } from './layout/Row';
+
+import SettingsStore from '../stores/SettingsStore';
+import InvoicesStore from '../stores/InvoicesStore';
+
+import BackendUtils from '../utils/BackendUtils';
+import FeeUtils from '../utils/FeeUtils';
+import { getFeeLimitSatsFromPercent } from '../utils/AmountUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+
+interface FeeLimitProps {
+    onFeeLimitSatChange: (satAmount: string) => void;
+    onMaxFeePercentChange?: (maxFeePercent: string) => void;
+    onFeeOptionChange?: (feeOption: string) => void;
+    satAmount?: string | number;
+    SettingsStore: SettingsStore;
+    InvoicesStore?: InvoicesStore;
+    feeOption?: string;
+    displayFeeRecommendation?: boolean;
+    // render but do not display so our calculations
+    // are always done on PaymentRequest view
+    hide?: boolean;
+}
+
+interface FeeLimitState {
+    feeLimitSat: string;
+    maxFeePercent: string;
+    feeOption: string;
+    percentAmount: string;
+    satAmount: string;
+}
+
+@inject('SettingsStore', 'InvoicesStore')
+@observer
+export default class FeeLimit extends React.Component<
+    FeeLimitProps,
+    FeeLimitState
+> {
+    constructor(props: any) {
+        super(props);
+
+        this.state = {
+            feeOption: 'fixed',
+            feeLimitSat: '100',
+            maxFeePercent: '5.0',
+            percentAmount: '0',
+            satAmount: '0'
+        };
+    }
+
+    async componentDidMount(): Promise<void> {
+        const { SettingsStore, feeOption, satAmount, onFeeLimitSatChange } =
+            this.props;
+        const { getSettings } = SettingsStore;
+        const settings = await getSettings();
+
+        const feeLimitSat = settings?.payments?.defaultFeeFixed || '100';
+
+        this.setState(
+            {
+                satAmount: satAmount !== '' ? JSON.stringify(satAmount) : '0',
+                feeLimitSat,
+                maxFeePercent: settings?.payments?.defaultFeePercentage || '5.0'
+            },
+            () => {
+                const percentAmount = this.calculatePercentAmount(satAmount);
+
+                this.setState({
+                    percentAmount
+                });
+
+                if (feeOption) {
+                    this.setState(
+                        {
+                            feeOption
+                        },
+                        () => {
+                            onFeeLimitSatChange(
+                                BackendUtils.supportsCustomFeeLimit() &&
+                                    this.state.feeOption === 'percent'
+                                    ? percentAmount
+                                    : feeLimitSat
+                            );
+                        }
+                    );
+                } else {
+                    onFeeLimitSatChange(
+                        BackendUtils.supportsCustomFeeLimit() &&
+                            this.state.feeOption === 'percent'
+                            ? percentAmount
+                            : feeLimitSat
+                    );
+                }
+            }
+        );
+    }
+
+    componentDidUpdate(prevProps: any): void {
+        const { satAmount, onFeeLimitSatChange } = this.props;
+        const { feeLimitSat, feeOption } = this.state;
+
+        if (satAmount !== prevProps.satAmount) {
+            const percentAmount = this.calculatePercentAmount(satAmount);
+            const percentUpdated = percentAmount !== this.state.percentAmount;
+
+            const satAmountUpdated = satAmount !== this.state.satAmount;
+
+            if (percentUpdated) {
+                this.setState({
+                    percentAmount
+                });
+            }
+
+            if (satAmountUpdated) {
+                this.setState({
+                    satAmount:
+                        satAmount !== '' ? JSON.stringify(satAmount) : '0'
+                });
+            }
+
+            if (percentUpdated || satAmountUpdated) {
+                onFeeLimitSatChange(
+                    BackendUtils.supportsCustomFeeLimit() &&
+                        feeOption === 'percent'
+                        ? percentAmount
+                        : feeLimitSat
+                );
+            }
+        }
+    }
+
+    calculatePercentAmount = (satAmount?: string | number) => {
+        const percentAmount = getFeeLimitSatsFromPercent(
+            this.state.maxFeePercent,
+            satAmount
+        );
+        // An empty or unusable percent falls back to the default fee limit,
+        // so the amount shown is the cap that is sent on every payment path
+        if (percentAmount || !(Number(satAmount) > 0)) return percentAmount;
+        return FeeUtils.calculateDefaultRoutingFee(Number(satAmount));
+    };
+
+    feeRecommendation = () => {
+        const { feeLimitSat } = this.state;
+        const { InvoicesStore } = this.props;
+        const { feeEstimate } = InvoicesStore!;
+
+        if (
+            feeEstimate &&
+            feeLimitSat &&
+            Number(feeEstimate) > Number(feeLimitSat)
+        ) {
+            return (
+                <Text
+                    style={{
+                        color: themeColor('error')
+                    }}
+                >
+                    {localeString(
+                        'views.PaymentRequest.feeEstimateExceedsLimit'
+                    )}
+                </Text>
+            );
+        }
+        return null;
+    };
+
+    render() {
+        const {
+            onFeeLimitSatChange,
+            onMaxFeePercentChange,
+            onFeeOptionChange,
+            displayFeeRecommendation,
+            satAmount,
+            hide
+        } = this.props;
+        const { feeOption, feeLimitSat, maxFeePercent, percentAmount } =
+            this.state;
+
+        const supportsCustomFeeLimit: boolean =
+            BackendUtils.supportsCustomFeeLimit();
+
+        if (hide) return;
+
+        return (
+            <React.Fragment>
+                {supportsCustomFeeLimit && (
+                    <>
+                        <Row justify="space-between">
+                            <Text
+                                style={{
+                                    ...styles.label,
+                                    color: themeColor('text')
+                                }}
+                            >
+                                {localeString('views.PaymentRequest.feeLimit')}
+                            </Text>
+                            <Text
+                                style={{
+                                    ...styles.label,
+                                    color: themeColor('text'),
+                                    opacity: feeOption == 'percent' ? 1 : 0.25
+                                }}
+                            >
+                                <Amount sats={percentAmount || '0'} />
+                            </Text>
+                        </Row>
+                        {displayFeeRecommendation && this.feeRecommendation()}
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                gap: 8
+                            }}
+                        >
+                            <TextInput
+                                style={{
+                                    flex: 1,
+                                    opacity: feeOption == 'fixed' ? 1 : 0.25
+                                }}
+                                keyboardType="numeric"
+                                value={feeLimitSat}
+                                suffix={localeString('general.sats')}
+                                onChangeText={(text: string) => {
+                                    this.setState({
+                                        feeLimitSat: text
+                                    });
+                                    onFeeLimitSatChange(text);
+                                }}
+                                onPressIn={() => {
+                                    this.setState({
+                                        feeOption: 'fixed'
+                                    });
+                                    onFeeLimitSatChange(feeLimitSat);
+                                    if (onFeeOptionChange)
+                                        onFeeOptionChange('fixed');
+                                }}
+                            />
+                            <TextInput
+                                style={{
+                                    flex: 1,
+                                    opacity: feeOption == 'percent' ? 1 : 0.25
+                                }}
+                                keyboardType="numeric"
+                                value={maxFeePercent}
+                                suffix="%"
+                                onChangeText={(text: string) => {
+                                    this.setState(
+                                        {
+                                            maxFeePercent: text
+                                        },
+                                        () => {
+                                            const percentAmount =
+                                                this.calculatePercentAmount(
+                                                    satAmount
+                                                );
+
+                                            this.setState({
+                                                percentAmount
+                                            });
+                                            onFeeLimitSatChange(percentAmount);
+
+                                            if (onMaxFeePercentChange)
+                                                onMaxFeePercentChange(text);
+                                        }
+                                    );
+                                }}
+                                onPressIn={() => {
+                                    this.setState({
+                                        feeOption: 'percent'
+                                    });
+                                    onFeeLimitSatChange(percentAmount);
+                                    if (onFeeOptionChange)
+                                        onFeeOptionChange('percent');
+                                }}
+                            />
+                        </View>
+                    </>
+                )}
+            </React.Fragment>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    label: {
+        fontFamily: 'PPNeueMontreal-Book',
+        paddingTop: 5
+    }
+});
+
+export { FeeLimit };

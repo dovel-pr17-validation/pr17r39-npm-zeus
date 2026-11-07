@@ -1,0 +1,1248 @@
+import { Alert, Platform } from 'react-native';
+import { findlnurl, decodelnurl } from 'js-lnurl/lib/helpers';
+
+import { nodeInfoStore, invoicesStore, settingsStore } from '../stores/Stores';
+
+import AddressUtils from './AddressUtils';
+import BackendUtils from './BackendUtils';
+import Bolt11Utils from './Bolt11Utils';
+import CashuUtils from './CashuUtils';
+import ConnectionFormatUtils from './ConnectionFormatUtils';
+import ContactUtils from './ContactUtils';
+import {
+    getLnurlpUrl,
+    isLightningAddressEndpointAllowed
+} from './LnurlPayUtils';
+import { fetchLnurlUrl, isUnsafeLnurlError } from './LnurlFetchUtils';
+import { getLnurlParams as getlnurlParams } from './LnurlResolveUtils';
+import { localeString } from './LocaleUtils';
+import NodeUriUtils from './NodeUriUtils';
+import NostrUtils from './NostrUtils';
+import { doTorRequest, RequestMethod } from './TorUtils';
+
+import CashuToken from '../models/CashuToken';
+import Invoice from '../models/Invoice';
+
+// Nostr
+import { DEFAULT_NOSTR_RELAYS } from '../stores/SettingsStore';
+import { SimplePool } from 'nostr-tools';
+import wifUtils from './WIFUtils';
+
+const isClipboardValue = (data: string) =>
+    handleAnything(data, undefined, true);
+
+// Cashu melts require a fixed-amount invoice, so a no-amount bolt11 can
+// never be paid via ecash. Used to skip offering that choice at all.
+const isAmountlessInvoice = (bolt11: string): boolean => {
+    try {
+        const invoice = new Invoice(Bolt11Utils.decode(bolt11));
+        return !invoice.getRequestAmount;
+    } catch {
+        return false;
+    }
+};
+
+// The numeric range checks below only apply to literal dotted-quad IPv4
+// addresses. The WHATWG parser canonicalizes every real IPv4 host to that
+// form (127.1 and 0x7f.0.0.1 both become 127.0.0.1), so anything else dotted
+// is a DNS name; 127.evil.com is a legal subdomain and must not classify as
+// loopback.
+const isIPv4Literal = (host: string): boolean => {
+    const octets = host.split('.');
+    return (
+        octets.length === 4 &&
+        octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) < 256)
+    );
+};
+
+// Loopback hosts resolve to the device itself; a cleartext fetch to one never
+// leaves the phone, so it needs neither an unencrypted-transport warning nor
+// Tor routing.
+const isLoopbackHost = (host: string): boolean =>
+    host === 'localhost' ||
+    host === '::1' ||
+    (isIPv4Literal(host) && host.startsWith('127.'));
+
+// Private / non-routable hosts (loopback, RFC 1918, link-local, IPv6 ULA,
+// mDNS .local). The Tor SOCKS proxy cannot reach these, so a BTCPay server on
+// one must be contacted directly rather than routed over Tor.
+const isPrivateHost = (host: string): boolean =>
+    isLoopbackHost(host) ||
+    host === '0.0.0.0' ||
+    (isIPv4Literal(host) &&
+        (/^10\./.test(host) ||
+            /^192\.168\./.test(host) ||
+            /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+            /^169\.254\./.test(host))) ||
+    /^f[cd][0-9a-f]{2}:/.test(host) || // IPv6 unique-local fc00::/7
+    /^fe[89ab][0-9a-f]:/.test(host) || // IPv6 link-local fe80::/10
+    host.endsWith('.local');
+
+// Classifies the URL embedded in a scanned BTCPay pairing QR before ZEUS
+// contacts it, using the WHATWG URL parser (react-native-url-polyfill) so the
+// host ZEUS displays is exactly the host it will fetch. `valid` is true only
+// for a well-formed, credential-free http(s) URL with a host; `url` is the
+// canonicalized URL to fetch; `isCleartext` flags an http:// host that is
+// neither a Tor onion service nor loopback, i.e. one carried over the network
+// unencrypted.
+const classifyBtcPayConfigUrl = (
+    urlString?: string
+): {
+    valid: boolean;
+    url: string;
+    host: string;
+    isOnion: boolean;
+    isLoopback: boolean;
+    isPrivate: boolean;
+    isCleartext: boolean;
+} => {
+    const invalid = {
+        valid: false,
+        url: '',
+        host: '',
+        isOnion: false,
+        isLoopback: false,
+        isPrivate: false,
+        isCleartext: false
+    };
+    if (!urlString) return invalid;
+
+    let parsed: URL;
+    try {
+        parsed = new URL(urlString.trim());
+    } catch {
+        return invalid;
+    }
+
+    const protocol = parsed.protocol.toLowerCase();
+    const isHttp = protocol === 'http:';
+    const isHttps = protocol === 'https:';
+    if (!isHttp && !isHttps) return invalid;
+
+    // Embedded credentials let the host ZEUS displays diverge from the host it
+    // actually contacts (https://btcpay.trusted.com@evil.example), so refuse
+    // them outright instead of trying to render a "safe" host string.
+    if (parsed.username || parsed.password) return invalid;
+
+    // IPv6 hostnames come back bracketed ([::1]); strip so range checks match.
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (!host) return invalid;
+
+    const isOnion = host.endsWith('.onion');
+    const isLoopback = isLoopbackHost(host);
+    const isPrivate = isPrivateHost(host);
+
+    return {
+        valid: true,
+        // The canonicalized, credential-free URL is what gets fetched, so one
+        // parser decides both what the user sees and what ZEUS contacts.
+        url: parsed.href,
+        host,
+        isOnion,
+        isLoopback,
+        isPrivate,
+        isCleartext: isHttp && !isOnion && !isLoopback
+    };
+};
+
+// Promise-wrapped confirmation so the scan-time BTCPay fetch can be gated on
+// explicit user consent (the QR content controls the endpoint). Resolves true
+// when the user proceeds, false when they cancel.
+const confirmBtcPayFetch = (
+    host: string,
+    { isCleartext, isLan }: { isCleartext: boolean; isLan: boolean }
+): Promise<boolean> =>
+    new Promise((resolve) => {
+        const base = localeString(
+            'stores.SettingsStore.btcPayFetchConfirmMessage'
+        ).replace('{host}', host);
+        const notes: string[] = [];
+        if (isCleartext) {
+            notes.push(
+                localeString('stores.SettingsStore.btcPayFetchCleartextWarning')
+            );
+        }
+        if (isLan) {
+            notes.push(
+                localeString('stores.SettingsStore.btcPayFetchLocalNetworkNote')
+            );
+        }
+        const message =
+            notes.length > 0 ? `${base}\n\n${notes.join('\n\n')}` : base;
+
+        const proceedButton = {
+            text: localeString('general.proceed'),
+            style: 'destructive' as const,
+            onPress: () => resolve(true)
+        };
+        const cancelButton = {
+            text: localeString('general.cancel'),
+            style: 'cancel' as const,
+            onPress: () => resolve(false)
+        };
+
+        Alert.alert(
+            localeString('general.warning'),
+            message,
+            // iOS honors button style; Android orders by index (cancel left).
+            Platform.OS === 'ios'
+                ? [proceedButton, cancelButton]
+                : [cancelButton, proceedButton],
+            { cancelable: false, onDismiss: () => resolve(false) }
+        );
+    });
+
+const attemptNip05Lookup = async (identifier: string) => {
+    try {
+        const lookup: any = await NostrUtils.queryNip05Profile(identifier);
+        const pubkey = lookup.pubkey;
+        return await nostrProfileLookup(pubkey);
+    } catch (e) {
+        throw new Error(localeString('utils.handleAnything.addressError'));
+    }
+};
+
+const nostrProfileLookup = async (data: string) => {
+    let profile: any;
+
+    const pubkey = data;
+    const pool = new SimplePool();
+    let profileEvents: any[] = [];
+    try {
+        profileEvents = await pool.querySync(DEFAULT_NOSTR_RELAYS, {
+            authors: [pubkey],
+            kinds: [0]
+        });
+    } catch (e) {
+        console.log('nostr profile lookup error', e);
+    } finally {
+        pool.close(DEFAULT_NOSTR_RELAYS);
+    }
+
+    profileEvents.forEach((item: any) => {
+        try {
+            const content = JSON.parse(item.content);
+            if (!profile || item.created_at > profile.timestamp) {
+                profile = {
+                    content,
+                    timestamp: item.created_at
+                };
+            }
+        } catch (error: any) {
+            throw new Error(
+                `Error parsing JSON for item with ID ${item.id}: ${error.message}`
+            );
+        }
+    });
+
+    return [
+        'ContactDetails',
+        {
+            nostrContact: await ContactUtils.transformContactData(
+                profile.content
+            ),
+            isNostrContact: true
+        }
+    ];
+};
+
+const merchantConfigs = [
+    {
+        identifierRegex: /(?<identifier>.*za\.co\.electrum\.picknpay.*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        identifierRegex: /(?<identifier>.*za\.co\.ecentric.*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        // The zap.pe tail is a single character class: a nested quantifier
+        // such as `(.*\n?)*` backtracks exponentially on a `\r` in the tail.
+        identifierRegex:
+            /(?<identifier>^((.*zapper\.com.*)|(.*\.wigroup\..*)|(.{2}\/.{4}\/.{20})|(.*payat\.io.*)|(.*(paynow\.netcash|paynow\.sagepay)\.co\.za.*)|(SK-\d{1,}-\d{23})|(\d{20})|(.*\d+\.zap\.pe[^\r\u2028\u2029]*)|(.*transactionjunction\.co\.za.*)|(CRSTPC-\d+-\d+-\d+-\d+-\d+))$)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        identifierRegex: /(?<identifier>.*yoyogroup\.co.*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        identifierRegex: /(?<identifier>.*snapscan.*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        identifierRegex: /(?<identifier>.*cryptoqr\.net.*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        identifierRegex: /(?<identifier>.*za\.co\.electrum(?!\.picknpay).*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    },
+    {
+        // A bare Scan to Pay code is exactly ten digits. Ten digits inside
+        // other text (e.g. a SeedQR) must not be sent to the gateway.
+        identifierRegex:
+            /(?<identifier>^\d{10}$|.*(?:scantopay\.io|za\.co\.mp|payat\.io|UMPQR|\.oltio\.co\.za|easypay).*)/iu,
+        domains: {
+            mainnet: 'cryptoqr.net',
+            signet: 'staging.cryptoqr.net',
+            regtest: 'staging.cryptoqr.net'
+        }
+    }
+];
+
+function getNetworkString(): 'mainnet' | 'signet' | 'regtest' {
+    const { nodeInfo } = nodeInfoStore;
+    if (!nodeInfo) return 'mainnet';
+    if (nodeInfo.isTestNet || nodeInfo.isSigNet) return 'signet';
+    if (nodeInfo.isRegTest) return 'regtest';
+    return 'mainnet';
+}
+
+export function strictUriEncode(
+    uriComponent: string | number | boolean
+): string {
+    return encodeURIComponent(uriComponent).replace(
+        /[!'()*]/g,
+        (value) => `%${value.charCodeAt(0).toString(16).toUpperCase()}`
+    );
+}
+
+// The merchant identifier regexes use alternation with `.*` patterns that
+// catastrophically backtrack on long inputs and blow Hermes' regex stack.
+// Real merchant QR payloads are bounded, so skip the test for anything longer.
+const MERCHANT_QR_MAX_LEN = 500;
+
+/**
+ * Checks if the input matches a known merchant QR code pattern.
+ */
+function isMerchantQR(input: string): boolean {
+    if (!input || input.length > MERCHANT_QR_MAX_LEN) return false;
+    return merchantConfigs.some((merchant) =>
+        merchant.identifierRegex.test(input)
+    );
+}
+
+function convertMerchantQRToLightningAddress(
+    qrContent: string,
+    network: 'mainnet' | 'signet' | 'regtest'
+): string | null {
+    if (!qrContent || qrContent.length > MERCHANT_QR_MAX_LEN) return null;
+
+    for (const merchant of merchantConfigs) {
+        const match = qrContent.match(merchant.identifierRegex);
+        if (match?.groups?.identifier) {
+            const domain =
+                merchant.domains[network] || merchant.domains['mainnet'];
+            return `${strictUriEncode(match.groups.identifier)}@${domain}`;
+        }
+    }
+    return null;
+}
+
+const handleAnything = async (
+    data: string,
+    setAmount?: string,
+    isClipboardValue?: boolean
+): Promise<any> => {
+    data = data.trim();
+    const network = getNetworkString();
+    let { value, satAmount, lightning, offer, clinkNoffer }: any =
+        AddressUtils.processBIP21Uri(data);
+    const hasAt: boolean = value.includes('@');
+    const hasMultiple: boolean =
+        (value && lightning) ||
+        (value && offer) ||
+        (value && clinkNoffer) ||
+        (lightning && offer) ||
+        (lightning && clinkNoffer) ||
+        (offer && clinkNoffer);
+
+    // ecash mode
+    const ecash =
+        BackendUtils.supportsCashuWallet() &&
+        settingsStore?.settings?.ecash?.enableCashu;
+
+    // Handle nested URI schemes: LIGHTNING:lnurlp://...
+    // Convert lnurlp:// to https:// (or http:// for .onion) for processing
+    if (value) {
+        const urlMatch = value.match(/^lnurl(p|w|c|auth):\/\/(.+)$/i);
+        if (urlMatch) {
+            const urlPath = urlMatch[2];
+            const protocol = urlPath.toLowerCase().includes('.onion')
+                ? 'http'
+                : 'https';
+            value = `${protocol}://${urlPath}`;
+        }
+    }
+
+    let lnurl;
+    // if the value is from clipboard and looks like a url we don't want to decode it
+    if (!isClipboardValue || !data.match(/^https?:\/\//i)) {
+        try {
+            lnurl = decodelnurl(data);
+        } catch (e) {}
+    }
+
+    if (!hasAt && hasMultiple) {
+        if (isClipboardValue) return true;
+        // ChoosePaymentMethod offers on-chain for any value it receives, so
+        // leave out an address that is not valid on this node's network
+        return [
+            'ChoosePaymentMethod',
+            {
+                value:
+                    value && !AddressUtils.isValidBitcoinAddressForNode(value)
+                        ? undefined
+                        : value,
+                satAmount,
+                lightning,
+                offer,
+                clinkNoffer
+            }
+        ];
+    } else if (clinkNoffer) {
+        if (isClipboardValue) return true;
+        if (!AddressUtils.isValidNoffer(clinkNoffer)) {
+            throw new Error(localeString('utils.handleAnything.invalidNoffer'));
+        }
+        return ['ClinkPay', { noffer: clinkNoffer }];
+    } else if (offer) {
+        if (isClipboardValue) return true;
+        return [
+            'Send',
+            {
+                destination: offer,
+                bolt12: offer,
+                transactionType: 'BOLT 12',
+                isValid: true
+            }
+        ];
+    } else if (!hasAt && AddressUtils.isValidBitcoinAddressForNode(value)) {
+        if (isClipboardValue) return true;
+        return [
+            'Send',
+            {
+                destination: value,
+                satAmount,
+                transactionType: 'On-chain',
+                isValid: true
+            }
+        ];
+    } else if (!hasAt && AddressUtils.isValidLightningPubKey(value)) {
+        if (isClipboardValue) return true;
+        return [
+            'Send',
+            {
+                destination: value,
+                transactionType: 'Keysend',
+                isValid: true
+            }
+        ];
+    } else if (
+        !hasAt &&
+        AddressUtils.isValidLightningPaymentRequest(value || lightning)
+    ) {
+        if (isClipboardValue) return true;
+        if (ecash && !isAmountlessInvoice(value || lightning)) {
+            return [
+                'ChoosePaymentMethod',
+                {
+                    lightning: value || lightning,
+                    locked: true
+                }
+            ];
+        } else {
+            await invoicesStore.getPayReq(value || lightning);
+            return ['PaymentRequest', {}];
+        }
+    } else if (
+        !hasAt &&
+        AddressUtils.isValidLightningOffer(value || lightning)
+    ) {
+        if (isClipboardValue) return true;
+        return [
+            'Send',
+            {
+                destination: value || lightning,
+                bolt12: value || lightning,
+                transactionType: 'BOLT 12',
+                isValid: true
+            }
+        ];
+    } else if (!hasAt && AddressUtils.isValidNoffer(value)) {
+        if (isClipboardValue) return true;
+        return ['ClinkPay', { noffer: value }];
+    } else if (!hasAt && AddressUtils.isPsbt(value)) {
+        // A PSBT's base64 text can contain any substring (its output scripts
+        // and previous transactions come from other parties), so check it
+        // before the branches that search the text (clnrest+, lndconnect,
+        // findlnurl).
+        return ['PSBT', { psbt: value }];
+    } else if (value.includes('clnrest://') || value.includes('clnrest+')) {
+        if (isClipboardValue) return true;
+        const { host, port, rune, implementation, enableTor } =
+            ConnectionFormatUtils.processCLNRestConnectUrl(value);
+
+        if (host && port && rune) {
+            return [
+                'WalletConfiguration',
+                {
+                    node: {
+                        host,
+                        port,
+                        rune,
+                        implementation,
+                        enableTor
+                    },
+                    newEntry: true,
+                    isValid: true
+                }
+            ];
+        } else {
+            Alert.alert(
+                localeString('general.error'),
+                localeString('views.LNDConnectConfigQRScanner.error'),
+                [{ text: localeString('general.ok'), onPress: () => void 0 }],
+                { cancelable: false }
+            );
+        }
+    } else if (value.startsWith('nostr+walletconnect://')) {
+        if (isClipboardValue) return true;
+        return [
+            'WalletConfiguration',
+            {
+                node: {
+                    nostrWalletConnectUrl: value,
+                    implementation: 'nostr-wallet-connect'
+                },
+                newEntry: true,
+                isValid: true
+            }
+        ];
+    } else if (
+        value.includes('https://terminal.lightning.engineering#/connect/pair/')
+    ) {
+        if (isClipboardValue) return true;
+        const { pairingPhrase, mailboxServer, customMailboxServer } =
+            ConnectionFormatUtils.processLncUrl(value);
+
+        if (pairingPhrase && mailboxServer) {
+            return [
+                'WalletConfiguration',
+                {
+                    node: {
+                        pairingPhrase,
+                        mailboxServer,
+                        customMailboxServer,
+                        implementation: 'lightning-node-connect'
+                    },
+                    newEntry: true,
+                    isValid: true
+                }
+            ];
+        } else {
+            Alert.alert(
+                localeString('general.error'),
+                localeString('views.LncQRScanner.error'),
+                [{ text: localeString('general.ok'), onPress: () => void 0 }],
+                { cancelable: false }
+            );
+        }
+    } else if (value.includes('lndconnect')) {
+        if (isClipboardValue) return true;
+        const node = ConnectionFormatUtils.processLndConnectUrl(value);
+        return [
+            'WalletConfiguration',
+            {
+                node,
+                enableTor: node.host && node.host.includes('.onion'),
+                newEntry: true,
+                isValid: true
+            }
+        ];
+    } else if (AddressUtils.isValidLNDHubAddress(value)) {
+        if (isClipboardValue) return true;
+        try {
+            const { username, password, host } =
+                AddressUtils.processLNDHubAddress(value);
+
+            const existingAccount = !!username;
+
+            const node = {
+                implementation: 'lndhub',
+                username,
+                password,
+                certVerification: true,
+                existingAccount,
+                ...(host && {
+                    lndhubUrl: host,
+                    enableTor: host.includes('.onion')
+                })
+            };
+            return [
+                'WalletConfiguration',
+                {
+                    node,
+                    newEntry: true,
+                    isValid: true
+                }
+            ];
+        } catch (error) {
+            throw new Error(localeString('utils.handleAnything.notValid'));
+        }
+    } else if (hasAt && NodeUriUtils.isValidNodeUri(value)) {
+        // A node URI is only actionable as a channel open
+        if (!BackendUtils.supportsChannelManagement()) {
+            if (isClipboardValue) return false;
+            throw new Error(
+                localeString('utils.handleAnything.channelsNotSupported')
+            );
+        }
+        if (isClipboardValue) return true;
+        const { pubkey, host } = NodeUriUtils.processNodeUri(value);
+        return [
+            'OpenChannel',
+            {
+                node_pubkey_string: pubkey,
+                host
+            }
+        ];
+    } else if (hasAt && AddressUtils.isValidLightningAddress(value)) {
+        if (isClipboardValue) return true;
+
+        const [username, domain] = value.split('@');
+        // LUD-16: domain MUST be lowercased
+        const normalizedDomain = domain.toLowerCase();
+        const isOnion = normalizedDomain.endsWith('.onion');
+
+        const { url } = getLnurlpUrl(value);
+        // Refuse before the BOLT 12 lookup below, which would otherwise send
+        // the address, IP literal included, to the DoH resolver first
+        if (!isLightningAddressEndpointAllowed(url).ok) {
+            throw new Error(localeString('utils.lnurl.unsafeLightningAddress'));
+        }
+
+        let bolt12: string | undefined;
+        let b12Value: string | undefined,
+            b12SatAmount: string | undefined,
+            b12Lightning: string | undefined,
+            b12Offer: string | undefined;
+
+        // try BOLT 12 address first, if supported. Skipped for .onion: it is
+        // a special-use name (RFC 7686) with no DNS records, so the lookup
+        // can never succeed and would only send the onion address to the
+        // DoH resolver over clearnet.
+        if (!isOnion) {
+            const dnsUrl = 'https://cloudflare-dns.com/dns-query';
+            const name = `${username}.user._bitcoin-payment.${domain}`;
+
+            try {
+                // The local part may contain URL syntax such as '&', '=',
+                // '?' and '#'. Unencoded, 'a&name=evil.example&z@good.com'
+                // would add a second name parameter, and the resolver would
+                // look up evil.example instead.
+                const res = await fetch(
+                    `${dnsUrl}?name=${encodeURIComponent(name)}&type=TXT`,
+                    {
+                        headers: {
+                            accept: 'application/dns-json'
+                        }
+                    }
+                );
+                const json = await res.json();
+
+                // The resolver echoes the name it looked up. Only use the
+                // answer if that is the name we asked for.
+                const question = json?.Question?.[0]?.name;
+                const questionMatches =
+                    typeof question === 'string' &&
+                    question.replace(/\.$/, '').toLowerCase() ===
+                        name.toLowerCase();
+
+                // BIP 353 requires the payment instructions to be secured by
+                // DNSSEC. Cloudflare performs the validation and reports the
+                // outcome via the AD (Authenticated Data) bit; Status 0 is
+                // NOERROR. If the answer is not proven-signed we ignore it,
+                // otherwise a forged, poisoned, or hijacked DNS response could
+                // silently redirect the payment to an attacker's offer.
+                // TODO: BIP 353 also states clients MUST NOT trust a remote
+                // resolver to validate DNSSEC on their behalf. Full conformance
+                // requires validating the DNSSEC proof chain client-side.
+                const dnssecValidated = json?.Status === 0 && json?.AD === true;
+
+                // Concatenate each TXT record's character-strings in RDATA
+                // order, never across records. BIP 353 requires TXT records at
+                // the label which don't begin with 'bitcoin:' to be ignored,
+                // and treats multiple 'bitcoin:' records as invalid.
+                const bitcoinTxts: string[] = (
+                    Array.isArray(json?.Answer) ? json.Answer : []
+                )
+                    .filter(
+                        (a: any) =>
+                            a?.type === 16 && typeof a?.data === 'string'
+                    )
+                    .map((a: any) => a.data.replace(/("|\\|\s+)/g, ''))
+                    .filter((data: string) =>
+                        data.toLowerCase().startsWith('bitcoin:')
+                    );
+
+                if (
+                    questionMatches &&
+                    dnssecValidated &&
+                    bitcoinTxts.length === 1
+                ) {
+                    bolt12 = bitcoinTxts[0].replace(/^bitcoin:b12=/i, '');
+
+                    const {
+                        value: _v,
+                        satAmount: _s,
+                        lightning: _l,
+                        offer: _o
+                    }: any = AddressUtils.processBIP21Uri(bolt12);
+                    b12Value = _v;
+                    b12SatAmount = _s;
+                    b12Lightning = _l;
+                    b12Offer = _o;
+                }
+            } catch (e: any) {}
+        }
+
+        // try BOLT 11 address
+        const error = localeString(
+            'utils.handleAnything.lightningAddressError'
+        );
+
+        // handle Tor LN addresses
+        if (settingsStore.enableTor && isOnion) {
+            return doTorRequest(url, RequestMethod.GET).then(
+                (response: any) => {
+                    if (!response.callback) {
+                        throw new Error(error);
+                    }
+
+                    return [
+                        'LnurlPay',
+                        {
+                            lnurlParams: response,
+                            satAmount: setAmount,
+                            ecash,
+                            lightningAddress: value
+                        }
+                    ];
+                }
+            );
+        } else {
+            return fetchLnurlUrl(url)
+                .then((response: any) => {
+                    const status = response.info().status;
+                    if (status == 200) {
+                        const lnurlpData = response.json();
+                        if (!lnurlpData.callback) {
+                            throw new Error(error);
+                        }
+
+                        if (b12Offer) {
+                            return [
+                                'ChoosePaymentMethod',
+                                {
+                                    value: b12Value,
+                                    satAmount: b12SatAmount,
+                                    lightning: b12Lightning,
+                                    offer: b12Offer,
+                                    lightningAddress: value,
+                                    locked: true
+                                }
+                            ];
+                        }
+
+                        return [
+                            'LnurlPay',
+                            {
+                                lnurlParams: lnurlpData,
+                                satAmount: setAmount,
+                                ecash,
+                                lightningAddress: value
+                            }
+                        ];
+                    } else {
+                        throw new Error(error);
+                    }
+                })
+                .catch(async (e: any) => {
+                    const hasMultipleB12 = b12Value || b12Lightning;
+
+                    // A redirect refused by the lnurl host policy is reported
+                    // here instead of falling through to the NIP-05 lookup on
+                    // the same host. Other failures (non-200, too many
+                    // redirects) still fall through, and that lookup follows
+                    // redirects without checking them (#5570). A BIP 353
+                    // offer came from DNS and is still usable.
+                    if (isUnsafeLnurlError(e) && !b12Offer) throw e;
+
+                    if (b12Offer) {
+                        if (hasMultipleB12) {
+                            return [
+                                'ChoosePaymentMethod',
+                                {
+                                    value: b12Value,
+                                    satAmount: b12SatAmount,
+                                    lightning: b12Lightning,
+                                    offer: b12Offer,
+                                    locked: true
+                                }
+                            ];
+                        }
+                        return [
+                            'Send',
+                            {
+                                destination: b12Offer,
+                                bolt12: b12Offer,
+                                transactionType: 'BOLT 12',
+                                isValid: true
+                            }
+                        ];
+                    }
+                    return await attemptNip05Lookup(value);
+                });
+        }
+    } else if (value.includes('config=') && value.includes('lnd.config')) {
+        // BTCPay pairing QR
+        if (isClipboardValue) return true;
+
+        // The QR content controls the endpoint ZEUS is about to contact, so
+        // validate it locally and require explicit consent BEFORE any network
+        // request (prevents a scan-time IP/timing beacon to an attacker URL).
+        const configRoute = value.split('config=')[1];
+        const {
+            valid,
+            url,
+            host,
+            isOnion,
+            isLoopback,
+            isPrivate,
+            isCleartext
+        } = classifyBtcPayConfigUrl(configRoute);
+        if (!valid) {
+            Alert.alert(
+                localeString('general.error'),
+                localeString('stores.SettingsStore.btcPayInvalidConfigUrl'),
+                [
+                    {
+                        text: localeString('general.ok'),
+                        onPress: () => void 0
+                    }
+                ],
+                { cancelable: false }
+            );
+            return false;
+        }
+
+        const confirmed = await confirmBtcPayFetch(host, {
+            isCleartext,
+            isLan: isPrivate && !isLoopback
+        });
+        if (!confirmed) return false;
+
+        return settingsStore
+            .fetchBTCPayConfig(url, isOnion, isPrivate)
+            .then((node: any) => {
+                if (settingsStore.btcPayError) {
+                    Alert.alert(
+                        localeString('general.error'),
+                        settingsStore.btcPayError,
+                        [
+                            {
+                                text: localeString('general.ok'),
+                                onPress: () => void 0
+                            }
+                        ],
+                        { cancelable: false }
+                    );
+                }
+
+                return [
+                    'WalletConfiguration',
+                    {
+                        node,
+                        enableTor: node.host && node.host.includes('.onion'),
+                        newEntry: true,
+                        isValid: true
+                    }
+                ];
+            })
+            .catch(() => {
+                Alert.alert(
+                    localeString('general.error'),
+                    localeString('views.BTCPayConfigQRScanner.error'),
+                    [
+                        {
+                            text: localeString('general.ok'),
+                            onPress: () => void 0
+                        }
+                    ],
+                    { cancelable: false }
+                );
+            });
+    } else if (
+        /^https:\/\//i.test(value) &&
+        /cashu[AB][0-9A-Za-z+/_=-]{10,}/.test(value)
+    ) {
+        // Handle web-wrapped cashu tokens (zeusln.com/e/, wallet.cashu.me/?token=,
+        // wallet.nutstash.app/#, etc.). Must run before lnurl: findlnurl can match
+        // bech32-like substrings inside cashu tokens and misroute the input. The
+        // base64 shape gate avoids consuming URLs that incidentally contain the
+        // literal "cashuA"/"cashuB" substring (e.g. "?ref=cashuAfrica").
+        const cashuToken = CashuUtils.extractTokenString(value);
+        if (CashuUtils.isValidCashuToken(cashuToken)) {
+            if (isClipboardValue) return true;
+            const cdkToken = await CashuUtils.decodeCashuTokenAsync(cashuToken);
+            const decoded = new CashuToken({
+                memo: cdkToken.memo || '',
+                mint: cdkToken.mint_url,
+                unit: cdkToken.unit || 'sat',
+                value: cdkToken.value,
+                encodedToken: cdkToken.encoded,
+                proofs: cdkToken.proofs || []
+            });
+            return [
+                'CashuToken',
+                {
+                    token: cashuToken,
+                    decoded
+                }
+            ];
+        }
+        if (isClipboardValue) return false;
+        throw new Error(localeString('utils.handleAnything.notValid'));
+    } else if (
+        !!findlnurl(value) ||
+        !!lnurl ||
+        (value && /\/lnurl|lnurlp|lnurlw|lnurlc|lnurlauth/i.test(value))
+    ) {
+        // The input is already recognized as LNURL-shaped locally (bech32
+        // decode, findlnurl, or an lnurl* URL path). That is enough to show
+        // the paste badge, so never fetch during a clipboard probe: defer
+        // getlnurlParams (a live HTTP GET of an attacker-controllable target)
+        // to when the user actually acts on the value.
+        if (isClipboardValue) return true;
+        const raw: string = findlnurl(value) || lnurl || value || '';
+        return getlnurlParams(raw)
+            .then((params: any) => {
+                if (
+                    params.status === 'ERROR' &&
+                    params.domain.endsWith('.onion')
+                ) {
+                    // TODO handle fetching of params with internal Tor
+                    throw new Error(`${params.domain} says: ${params.reason}`);
+                }
+
+                switch (params.tag) {
+                    case 'withdrawRequest':
+                        if (ecash) {
+                            return [
+                                'ChoosePaymentMethod',
+                                {
+                                    lnurlParams: params,
+                                    lightning: raw
+                                }
+                            ];
+                        }
+                        return [
+                            'Receive',
+                            {
+                                lnurlParams: params
+                            }
+                        ];
+                    case 'payRequest':
+                        params.lnurlText = raw;
+                        return [
+                            'LnurlPay',
+                            {
+                                lnurlParams: params,
+                                satAmount: setAmount,
+                                ecash
+                            }
+                        ];
+                    case 'channelRequest':
+                        // The server opens the channel, so this only needs
+                        // connectPeer and our own pubkey
+                        if (BackendUtils.supportsPeers()) {
+                            return [
+                                'LnurlChannel',
+                                {
+                                    lnurlParams: params
+                                }
+                            ];
+                        }
+                        Alert.alert(
+                            localeString('general.error'),
+                            localeString(
+                                'utils.handleAnything.channelsNotSupported'
+                            ),
+                            [
+                                {
+                                    text: localeString('general.ok'),
+                                    onPress: () => void 0
+                                }
+                            ],
+                            { cancelable: false }
+                        );
+                        break;
+                    case 'login':
+                        if (BackendUtils.supportsLnurlAuth()) {
+                            return [
+                                'LnurlAuth',
+                                {
+                                    lnurlParams: params
+                                }
+                            ];
+                        } else {
+                            Alert.alert(
+                                localeString('general.error'),
+                                localeString(
+                                    'utils.handleAnything.lnurlAuthNotSupported'
+                                ),
+                                [
+                                    {
+                                        text: localeString('general.ok'),
+                                        onPress: () => void 0
+                                    }
+                                ],
+                                { cancelable: false }
+                            );
+                        }
+                        break;
+                    default:
+                        Alert.alert(
+                            localeString('general.error'),
+                            params.status === 'ERROR'
+                                ? `${params.domain} says: ${params.reason}`
+                                : `${localeString(
+                                      'utils.handleAnything.unsupportedLnurlType'
+                                  )}: ${params.tag}`,
+                            [
+                                {
+                                    text: localeString('general.ok'),
+                                    onPress: () => void 0
+                                }
+                            ],
+                            { cancelable: false }
+                        );
+                }
+            })
+            .catch((e) => {
+                // a host policy refusal keeps its own message
+                if (isUnsafeLnurlError(e)) throw e;
+                throw new Error(
+                    localeString('utils.handleAnything.invalidLnurlParams')
+                );
+            });
+    } else if (AddressUtils.isValidNpub(data)) {
+        // A valid npub is fully classified locally; do not open Nostr relay
+        // connections (nostrProfileLookup) during a clipboard probe. Defer the
+        // lookup to when the user acts on the value.
+        if (isClipboardValue) return true;
+        try {
+            const pubkey = NostrUtils.npubToHex(data);
+            if (!pubkey) {
+                throw new Error('Invalid npub');
+            }
+            return await nostrProfileLookup(pubkey);
+        } catch (e) {
+            throw new Error(
+                localeString('utils.handleAnything.nostrProfileError')
+            );
+        }
+    } else if (data.startsWith('zeuscontact:')) {
+        const zeusContactData = data.replace('zeuscontact:', '');
+        const card = JSON.parse(zeusContactData);
+
+        if (card?.contactId) {
+            // Cards made before v0.11.0 could carry remote photo/banner
+            // URLs, which ContactDetails would load as soon as it opens
+            // and again on every display after saving.
+            const contact = ContactUtils.toCardContact(card);
+
+            return [
+                'ContactDetails',
+                {
+                    nostrContact: contact,
+                    isNostrContact: true
+                }
+            ];
+        }
+    } else if (AddressUtils.isValidTxHex(value)) {
+        return ['TxHex', { txHex: value }];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isKeystoreWalletExport(value)
+    ) {
+        const { MasterFingerprint, ExtPubKey, Label } =
+            AddressUtils.processKeystoreWalletExport(value);
+        return [
+            'ImportAccount',
+            {
+                name: Label,
+                extended_public_key: ExtPubKey,
+                master_key_fingerprint: MasterFingerprint
+            }
+        ];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isJsonWalletExport(value)
+    ) {
+        const { MasterFingerprint, ExtPubKey } = JSON.parse(value);
+        return [
+            'ImportAccount',
+            {
+                extended_public_key: ExtPubKey,
+                master_key_fingerprint: MasterFingerprint
+            }
+        ];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isStringWalletExport(value)
+    ) {
+        const { MasterFingerprint, ExtPubKey } =
+            AddressUtils.processStringWalletExport(value);
+        return [
+            'ImportAccount',
+            {
+                extended_public_key: ExtPubKey,
+                master_key_fingerprint: MasterFingerprint
+            }
+        ];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isWpkhDescriptor(value)
+    ) {
+        const { MasterFingerprint, ExtPubKey, AddressType } =
+            AddressUtils.processWpkhDescriptor(value);
+        return [
+            'ImportAccount',
+            {
+                extended_public_key: ExtPubKey,
+                master_key_fingerprint: MasterFingerprint,
+                address_type: AddressType
+            }
+        ];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isNestedWpkhDescriptor(value)
+    ) {
+        const { MasterFingerprint, ExtPubKey, AddressType } =
+            AddressUtils.processNestedWpkhDescriptor(value);
+        return [
+            'ImportAccount',
+            {
+                extended_public_key: ExtPubKey,
+                master_key_fingerprint: MasterFingerprint,
+                address_type: AddressType
+            }
+        ];
+    } else if (
+        BackendUtils.supportsAccounts() &&
+        AddressUtils.isValidXpub(value)
+    ) {
+        return [
+            'ImportAccount',
+            {
+                extended_public_key: value
+            }
+        ];
+    } else if (await CashuUtils.isValidCashuTokenAsync(value)) {
+        const cdkToken = await CashuUtils.decodeCashuTokenAsync(value);
+        const decoded = new CashuToken({
+            memo: cdkToken.memo || '',
+            mint: cdkToken.mint_url,
+            unit: cdkToken.unit || 'sat',
+            value: cdkToken.value,
+            encodedToken: cdkToken.encoded,
+            proofs: cdkToken.proofs || []
+        });
+        return [
+            'CashuToken',
+            {
+                token: value,
+                decoded
+            }
+        ];
+    } else if (
+        BackendUtils.supportsWithdrawalRequests() &&
+        AddressUtils.isValidWithdrawalRequest(value)
+    ) {
+        return [
+            'WithdrawalRequestInfo',
+            {
+                bolt12: value
+            }
+        ];
+    } else if (isMerchantQR(data)) {
+        // Handle merchant QR codes by converting to lightning address
+        // and recursively processing through handleAnything to reuse
+        // all lightning address logic (Tor, BOLT 12, etc.)
+        const merchantLnAddr = convertMerchantQRToLightningAddress(
+            data,
+            network
+        );
+        if (merchantLnAddr) {
+            return handleAnything(merchantLnAddr, setAmount, isClipboardValue);
+        }
+        // If conversion failed, fall through to error
+        if (isClipboardValue) return false;
+        throw new Error(localeString('utils.handleAnything.notValid'));
+    } else {
+        const { isValid, error } = wifUtils.validateWIF(value);
+        if (isValid) {
+            return [
+                'WIFSweeper',
+                {
+                    wif: value
+                }
+            ];
+        }
+        if (isClipboardValue) return false;
+        // A decodable key for another network: say so instead of "not valid"
+        if (error === localeString('views.Wif.wrongNetwork')) {
+            throw new Error(error);
+        }
+        throw new Error(localeString('utils.handleAnything.notValid'));
+    }
+};
+
+export {
+    isClipboardValue,
+    convertMerchantQRToLightningAddress,
+    isMerchantQR,
+    classifyBtcPayConfigUrl
+};
+export default handleAnything;

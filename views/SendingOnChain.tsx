@@ -1,0 +1,392 @@
+import * as React from 'react';
+import {
+    BackHandler,
+    Dimensions,
+    NativeEventSubscription,
+    StyleSheet,
+    Text,
+    View
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { getRouteStack } from '../NavigationService';
+
+import Button from '../components/Button';
+import CopyBox from '../components/CopyBox';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Screen from '../components/Screen';
+import SuccessAnimation from '../components/SuccessAnimation';
+import { Row } from '../components/layout/Row';
+
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import UrlUtils from '../utils/UrlUtils';
+
+import Storage from '../storage';
+
+import NodeInfoStore from '../stores/NodeInfoStore';
+import TransactionsStore from '../stores/TransactionsStore';
+
+import ErrorIcon from '../assets/images/SVG/ErrorIcon.svg';
+import Wordmark from '../assets/images/SVG/wordmark-black.svg';
+
+interface SendingOnChainProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    NodeInfoStore: NodeInfoStore;
+    TransactionsStore: TransactionsStore;
+}
+
+@inject('NodeInfoStore', 'TransactionsStore')
+@observer
+export default class SendingOnChain extends React.Component<
+    SendingOnChainProps,
+    {}
+> {
+    private backPressSubscription: NativeEventSubscription;
+
+    private focusListener: (() => void) | undefined;
+
+    state = {
+        storedNotes: ''
+    };
+    async componentDidMount() {
+        const { TransactionsStore, navigation } = this.props;
+
+        this.backPressSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            this.handleBackPress
+        );
+
+        this.focusListener = navigation.addListener('focus', () => {
+            const { txid: storedTxid } = TransactionsStore;
+            if (!storedTxid) return;
+            const noteKey = `note-${storedTxid}`;
+            Storage.getItem(noteKey)
+                .then((storedNotes) => {
+                    this.setState({ storedNotes: storedNotes || '' });
+                })
+                .catch((error) => {
+                    console.error('Error retrieving notes:', error);
+                });
+        });
+    }
+
+    componentWillUnmount() {
+        if (this.focusListener) {
+            this.focusListener();
+        }
+        this.backPressSubscription?.remove();
+    }
+
+    private handleBackPress = (): boolean => {
+        const { TransactionsStore, navigation } = this.props;
+        // going back to Send after an unknown outcome, or while the send
+        // and any timeout lookup are still running, would invite the same
+        // resend that Try Again is hidden for
+        if (
+            TransactionsStore.publishSuccess ||
+            TransactionsStore.sendOutcomeUnknown ||
+            TransactionsStore.loading
+        ) {
+            navigation.popTo('Wallet');
+            return true;
+        }
+        return false;
+    };
+
+    render() {
+        const { NodeInfoStore, TransactionsStore, navigation } = this.props;
+        const {
+            loading,
+            crafting,
+            publishSuccess,
+            error,
+            error_msg,
+            sendOutcomeUnknown,
+            txid,
+            funded_psbt
+        } = TransactionsStore;
+        const { testnet } = NodeInfoStore;
+        const { storedNotes } = this.state;
+        const windowSize = Dimensions.get('window');
+
+        const stack = getRouteStack();
+        const isSwap = stack.filter((route) => route.name === 'SwapDetails')[0];
+
+        if (funded_psbt)
+            navigation.navigate('PSBT', {
+                psbt: funded_psbt
+            });
+
+        return (
+            <Screen>
+                {loading && (
+                    <View
+                        style={{
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            height: '100%'
+                        }}
+                    >
+                        <LoadingIndicator size={windowSize.height / 24} />
+                        <Text
+                            style={{
+                                ...styles.text,
+                                color: themeColor('text'),
+                                paddingTop: 30,
+                                // paddingBottom for centering
+                                paddingBottom: windowSize.height / 10,
+                                fontSize:
+                                    windowSize.width * windowSize.scale * 0.014
+                            }}
+                        >
+                            {crafting
+                                ? localeString('views.SendingOnChain.crafting')
+                                : localeString(
+                                      'views.SendingOnChain.broadcasting'
+                                  )}
+                        </Text>
+                    </View>
+                )}
+                {!loading && (
+                    <View style={{ flex: 1 }}>
+                        <View
+                            style={{
+                                ...styles.content,
+                                paddingTop: windowSize.height * 0.05
+                            }}
+                        >
+                            {publishSuccess && (
+                                <>
+                                    <Wordmark
+                                        height={windowSize.width * 0.25}
+                                        width={windowSize.width}
+                                        fill={themeColor('highlight')}
+                                    />
+                                    <View style={{ alignItems: 'center' }}>
+                                        <SuccessAnimation />
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor('text'),
+                                                paddingTop:
+                                                    windowSize.height * 0.03,
+                                                fontSize:
+                                                    windowSize.width *
+                                                    windowSize.scale *
+                                                    0.017,
+                                                alignSelf: 'center'
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.SendingOnChain.success'
+                                            )}
+                                        </Text>
+                                    </View>
+                                </>
+                            )}
+                            {(error || error_msg) && (
+                                <View style={{ alignItems: 'center' }}>
+                                    <ErrorIcon
+                                        width={windowSize.height * 0.13}
+                                        height={windowSize.height * 0.13}
+                                    />
+                                    <Text
+                                        style={{
+                                            color: themeColor('warning'),
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            fontSize: 32,
+                                            margin: 15,
+                                            marginTop: windowSize.height * 0.07
+                                        }}
+                                    >
+                                        {localeString('general.error')}
+                                    </Text>
+                                    {error_msg && (
+                                        <Text
+                                            style={{
+                                                color: themeColor('text'),
+                                                fontFamily:
+                                                    'PPNeueMontreal-Book',
+                                                fontSize:
+                                                    windowSize.width *
+                                                    windowSize.scale *
+                                                    0.014,
+                                                textAlign: 'center',
+                                                marginTop:
+                                                    windowSize.height * 0.025
+                                            }}
+                                        >
+                                            {error_msg}
+                                        </Text>
+                                    )}
+                                </View>
+                            )}
+                            {txid && (
+                                <View style={{ width: '90%' }}>
+                                    <CopyBox
+                                        heading={localeString(
+                                            'views.SendingOnChain.txid'
+                                        )}
+                                        headingCopied={`${localeString(
+                                            'views.SendingOnChain.txid'
+                                        )} ${localeString(
+                                            'components.ExternalLinkModal.copied'
+                                        )}`}
+                                        URL={txid}
+                                        theme="dark"
+                                    />
+                                </View>
+                            )}
+                        </View>
+
+                        <View style={styles.buttons}>
+                            {txid && (
+                                <>
+                                    <Button
+                                        title={
+                                            storedNotes
+                                                ? localeString(
+                                                      'views.SendingLightning.UpdateNote'
+                                                  )
+                                                : localeString(
+                                                      'views.SendingLightning.AddANote'
+                                                  )
+                                        }
+                                        onPress={() =>
+                                            navigation.navigate('AddNotes', {
+                                                noteKey: `note-${txid}`
+                                            })
+                                        }
+                                        secondary
+                                        buttonStyle={{ height: 40 }}
+                                    />
+                                    <Button
+                                        title={localeString(
+                                            'views.SendingOnChain.goToBlockExplorer'
+                                        )}
+                                        onPress={() =>
+                                            UrlUtils.goToBlockExplorerTXID(
+                                                txid,
+                                                testnet
+                                            )
+                                        }
+                                        containerStyle={{ width: '100%' }}
+                                        secondary
+                                        icon={{
+                                            name: 'exit-to-app',
+                                            size: 25
+                                        }}
+                                        buttonStyle={{ height: 40 }}
+                                    />
+                                </>
+                            )}
+
+                            {error && !sendOutcomeUnknown && (
+                                <Button
+                                    title={localeString(
+                                        'views.SendingLightning.tryAgain'
+                                    )}
+                                    icon={{
+                                        name: 'rotate-ccw',
+                                        type: 'feather',
+                                        size: 25
+                                    }}
+                                    onPress={() => navigation.goBack()}
+                                    containerStyle={{ width: '100%' }}
+                                    buttonStyle={{ height: 40 }}
+                                />
+                            )}
+
+                            {(publishSuccess || error) && (
+                                <Row
+                                    align="flex-end"
+                                    style={{
+                                        alignSelf: 'center'
+                                    }}
+                                >
+                                    <Button
+                                        title={localeString(
+                                            'views.SendingLightning.goToWallet'
+                                        )}
+                                        icon={
+                                            isSwap
+                                                ? undefined
+                                                : {
+                                                      name: 'list',
+                                                      size: 25,
+                                                      color: themeColor(
+                                                          'background'
+                                                      )
+                                                  }
+                                        }
+                                        titleStyle={{
+                                            color: themeColor('background')
+                                        }}
+                                        containerStyle={{
+                                            maxWidth: isSwap ? '45%' : '100%',
+                                            paddingRight: isSwap ? 5 : 0
+                                        }}
+                                        onPress={() =>
+                                            navigation.popTo('Wallet')
+                                        }
+                                        buttonStyle={{
+                                            height: 40,
+                                            width: '100%'
+                                        }}
+                                    />
+                                    {isSwap && (
+                                        <Button
+                                            title={localeString(
+                                                'views.Sending.goToSwap'
+                                            )}
+                                            titleStyle={{
+                                                color: themeColor('background')
+                                            }}
+                                            containerStyle={{
+                                                maxWidth: '45%',
+                                                paddingLeft: isSwap ? 5 : 0
+                                            }}
+                                            onPress={() =>
+                                                navigation.popTo(
+                                                    'SwapDetails',
+                                                    { ...isSwap.params }
+                                                )
+                                            }
+                                            buttonStyle={{
+                                                height: 40,
+                                                width: '100%'
+                                            }}
+                                            tertiary
+                                        />
+                                    )}
+                                </Row>
+                            )}
+                        </View>
+                    </View>
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    container: {
+        flex: 1
+    },
+    content: {
+        flex: 1,
+        alignItems: 'center',
+        justifyContent: 'space-evenly',
+        height: '100%'
+    },
+    buttons: {
+        justifyContent: 'flex-end',
+        width: '100%',
+        gap: 15,
+        bottom: 15
+    }
+});

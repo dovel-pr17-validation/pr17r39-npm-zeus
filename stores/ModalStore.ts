@@ -1,0 +1,248 @@
+import { action, observable } from 'mobx';
+
+import Storage from '../storage';
+import {
+    RATING_DISMISSED_KEY,
+    PAYMENT_COUNT_KEY,
+    RATING_REPROMPT_INTERVAL
+} from '../utils/RatingUtils';
+
+export default class ModalStore {
+    @observable public showExternalLinkModal: boolean = false;
+    @observable public showAndroidNfcModal: boolean = false;
+    @observable public androidNfcModalIsNfcEnabled: boolean = false;
+    @observable public showInfoModal: boolean = false;
+    @observable public showAlertModal: boolean = false;
+    @observable public showShareModal: boolean = false;
+    @observable public showNewChannelModal: boolean = false;
+    @observable public showRatingModal: boolean = false;
+    @observable public showRestoreChannelModal: boolean = false;
+    @observable public modalUrl: string;
+    @observable public modalIsEmail: boolean = false;
+    @observable public clipboardValue: string;
+    @observable public infoModalTitle: string | undefined;
+    @observable public infoModalText: string | Array<string> | undefined;
+    @observable public infoModalLink: string | undefined;
+    @observable public infoModalAdditionalButtons?: Array<{
+        title: string;
+        callback?: () => void;
+    }>;
+    @observable public infoModalBackgroundColor?: string;
+    public infoModalOnDismiss?: () => void;
+    @observable public infoModalShowCloseButton?: boolean;
+    @observable public infoModalShowHelpButton?: boolean;
+    @observable public alertModalText: string | Array<string> | undefined;
+    @observable public alertModalLink: string | undefined;
+    @observable public alertModalNav: string | undefined;
+    @observable public onShareQR?: () => void;
+    @observable public onShareText?: () => void;
+    @observable public onShareGiftLink?: () => void;
+    @observable public onPress: () => void;
+
+    @observable public onCheckOlympus?: () => void;
+    @observable public onImportFile?: () => void;
+    @observable public onContinueWithoutBackup?: () => void;
+    @observable public onCancelBackupModal?: () => void;
+
+    /* External Link Modal */
+    @action
+    public toggleExternalLinkModal = (status: boolean) => {
+        this.showExternalLinkModal = status;
+    };
+
+    @action
+    public toggleInfoModal = ({
+        title,
+        text,
+        link,
+        buttons,
+        backgroundColor,
+        onDismiss,
+        showCloseButton,
+        showHelpButton
+    }: {
+        title?: string;
+        text?: string | Array<string>;
+        link?: string;
+        buttons?: Array<{ title: string; callback?: () => void }>;
+        backgroundColor?: string;
+        onDismiss?: () => void;
+        showCloseButton?: boolean;
+        showHelpButton?: boolean;
+    }) => {
+        this.showInfoModal = title || text ? true : false; // Show if title or text exists
+        this.infoModalTitle = title;
+        this.infoModalText = text;
+        this.infoModalLink = link;
+        this.infoModalAdditionalButtons = buttons;
+        this.infoModalBackgroundColor = backgroundColor;
+        this.infoModalOnDismiss = onDismiss;
+        this.infoModalShowCloseButton = showCloseButton;
+        this.infoModalShowHelpButton = showHelpButton;
+    };
+
+    @action
+    public toggleAlertModal = (status: boolean) => {
+        this.showAlertModal = status;
+    };
+
+    @action
+    public toggleShareModal = ({
+        onShareQR,
+        onShareText,
+        onShareGiftLink
+    }: {
+        onShareQR?: () => void;
+        onShareText?: () => void;
+        onShareGiftLink?: () => void;
+    }) => {
+        this.showShareModal = onShareQR && onShareText ? true : false;
+        this.onShareQR = onShareQR;
+        this.onShareText = onShareText;
+        this.onShareGiftLink = onShareGiftLink;
+    };
+
+    @action
+    public toggleNewChannelModal = () => {
+        this.showNewChannelModal = !this.showNewChannelModal;
+    };
+
+    @action
+    public toggleRatingModal = (status: boolean) => {
+        this.showRatingModal = status;
+    };
+
+    @action
+    public checkAndTriggerRatingModal = async () => {
+        try {
+            const dismissed = await Storage.getItem(RATING_DISMISSED_KEY);
+            if (dismissed === 'true') return;
+
+            const paymentCount = await Storage.getItem(PAYMENT_COUNT_KEY);
+            const count = (parseInt(paymentCount || '0', 10) || 0) + 1;
+            await Storage.setItem(PAYMENT_COUNT_KEY, count.toString());
+
+            if (count === 1 || count % RATING_REPROMPT_INTERVAL === 0) {
+                this.toggleRatingModal(true);
+            }
+        } catch (e) {
+            console.log(e);
+        }
+    };
+
+    @action
+    public dismissRatingPermanently = async () => {
+        try {
+            await Storage.setItem(RATING_DISMISSED_KEY, 'true');
+        } catch (e) {
+            console.log(e);
+        }
+        this.toggleRatingModal(false);
+    };
+
+    @action
+    public shareQR = () => {
+        if (this.onShareQR) this.onShareQR();
+    };
+    public shareText = () => {
+        if (this.onShareText) this.onShareText();
+    };
+    public shareGiftLink = () => {
+        if (this.onShareGiftLink) this.onShareGiftLink();
+    };
+
+    @action
+    public setUrl = (text: string) => {
+        this.modalUrl = text;
+    };
+
+    @action
+    public setIsEmail = (value: boolean) => {
+        this.modalIsEmail = value;
+    };
+
+    @action
+    public setAction = (action: any) => {
+        this.onPress = action;
+    };
+
+    @action
+    public setClipboardValue = (value: string) => {
+        this.clipboardValue = value;
+    };
+
+    /* Android NFC Modal */
+    @action
+    public toggleAndroidNfcModal = (
+        status: boolean,
+        nfcEnabled: boolean = true
+    ) => {
+        this.showAndroidNfcModal = status;
+        if (status) {
+            this.androidNfcModalIsNfcEnabled = nfcEnabled;
+        }
+    };
+
+    /* Channel Backup Modal */
+    @action
+    public toggleRestoreChannelModal = (params?: {
+        show: boolean;
+        onCheckOlympus?: () => void;
+        onImportFile?: () => void;
+        onContinueWithoutBackup?: () => void;
+        onCancel?: () => void;
+    }) => {
+        if (!params || !params.show) {
+            this.showRestoreChannelModal = false;
+            this.onCheckOlympus = undefined;
+            this.onImportFile = undefined;
+            this.onContinueWithoutBackup = undefined;
+            this.onCancelBackupModal = undefined;
+        } else {
+            this.showRestoreChannelModal = true;
+            this.onCheckOlympus = params.onCheckOlympus;
+            this.onImportFile = params.onImportFile;
+            this.onContinueWithoutBackup = params.onContinueWithoutBackup;
+            this.onCancelBackupModal = params.onCancel;
+        }
+    };
+
+    @action
+    public closeVisibleModalDialog = () => {
+        if (this.showExternalLinkModal) {
+            this.showExternalLinkModal = false;
+            return true;
+        }
+        if (this.showAndroidNfcModal) {
+            this.showAndroidNfcModal = false;
+            return true;
+        }
+        if (this.showInfoModal) {
+            this.showInfoModal = false;
+            this.infoModalTitle = undefined;
+            this.infoModalText = undefined;
+            this.infoModalLink = undefined;
+            this.infoModalAdditionalButtons = undefined;
+            this.infoModalBackgroundColor = undefined;
+            this.infoModalOnDismiss = undefined;
+            this.infoModalShowCloseButton = undefined;
+            this.infoModalShowHelpButton = undefined;
+            return true;
+        }
+        if (this.showShareModal) {
+            this.showShareModal = false;
+            this.onShareQR = undefined;
+            this.onShareText = undefined;
+            this.onShareGiftLink = undefined;
+            return true;
+        }
+        if (this.showNewChannelModal) {
+            this.showNewChannelModal = false;
+        }
+        if (this.showRatingModal) {
+            this.showRatingModal = false;
+            return true;
+        }
+        return false;
+    };
+}

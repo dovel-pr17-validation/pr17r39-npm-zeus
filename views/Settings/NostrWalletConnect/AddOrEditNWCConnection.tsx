@@ -1,0 +1,1548 @@
+import React from 'react';
+import {
+    BackHandler,
+    View,
+    StyleSheet,
+    ScrollView,
+    Text,
+    TouchableOpacity
+} from 'react-native';
+import { ButtonGroup, Icon } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+import isEqual from 'lodash/isEqual';
+import Slider from '@react-native-community/slider';
+import { Nip47Method } from '@getalby/sdk';
+
+import Screen from '../../../components/Screen';
+import Accordion from '../../../components/Accordion';
+import Header from '../../../components/Header';
+import { Body } from '../../../components/text/Body';
+import Button from '../../../components/Button';
+import TextInput from '../../../components/TextInput';
+import LoadingIndicator from '../../../components/LoadingIndicator';
+import Switch from '../../../components/Switch';
+import DropdownSetting from '../../../components/DropdownSetting';
+import { ErrorMessage } from '../../../components/SuccessErrorMessage';
+
+import { themeColor } from '../../../utils/ThemeUtils';
+import { localeString } from '../../../utils/LocaleUtils';
+import NostrConnectUtils, {
+    PermissionOption,
+    IndividualPermissionOption
+} from '../../../utils/NostrConnectUtils';
+import { numberWithCommas } from '../../../utils/UnitsUtils';
+import BackendUtils from '../../../utils/BackendUtils';
+
+import NostrWalletConnectStore, {
+    DEFAULT_NOSTR_RELAYS
+} from '../../../stores/NostrWalletConnectStore';
+import ModalStore from '../../../stores/ModalStore';
+
+import NWCConnection, {
+    PermissionType,
+    TimeUnit
+} from '../../../models/NWCConnection';
+
+interface AddOrEditNWCConnectionProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<
+        'AddOrEditNWCConnection',
+        { connectionId?: string; isEdit?: boolean }
+    >;
+    NostrWalletConnectStore: NostrWalletConnectStore;
+    ModalStore: ModalStore;
+}
+
+interface AddOrEditNWCConnectionState {
+    connectionName: string;
+    selectedRelayUrl: string;
+    customRelayUrl: string;
+    selectedPermissions: Nip47Method[];
+    selectedBudgetRenewalIndex: number;
+    expiresAt: Date | undefined;
+    error: string;
+    loading: boolean;
+    originalConnection: NWCConnection | null;
+    hasChanges: boolean;
+    selectedPermissionType: PermissionType | null;
+    selectedExpiryPresetIndex: number;
+    showCustomExpiryInput: boolean;
+    customExpiryValue: number | null;
+    customExpiryUnit: TimeUnit;
+    budgetValue: number;
+    maxBudgetLimit: number;
+    maxBudgetSource: 'lightning' | 'cashu';
+}
+
+@inject('NostrWalletConnectStore', 'ModalStore')
+@observer
+export default class AddOrEditNWCConnection extends React.Component<
+    AddOrEditNWCConnectionProps,
+    AddOrEditNWCConnectionState
+> {
+    constructor(props: AddOrEditNWCConnectionProps) {
+        super(props);
+        this.state = {
+            connectionName: '',
+            selectedRelayUrl: DEFAULT_NOSTR_RELAYS[0],
+            customRelayUrl: '',
+            selectedPermissions: NostrConnectUtils.getFullAccessPermissions(),
+            selectedBudgetRenewalIndex: 0,
+            expiresAt: NostrConnectUtils.getExpiryDateFromPreset(0),
+            error: '',
+            loading: false,
+            originalConnection: null,
+            hasChanges: false,
+            selectedPermissionType: PermissionType.FullAccess,
+            selectedExpiryPresetIndex: 0,
+            showCustomExpiryInput: false,
+            customExpiryValue: null,
+            customExpiryUnit: NostrConnectUtils.TIME_UNITS[1],
+            budgetValue: 0,
+            maxBudgetLimit: 0,
+            maxBudgetSource: 'lightning'
+        };
+    }
+
+    private unsubscribeFocus?: () => void;
+    private scrollViewRef = React.createRef<ScrollView>();
+    private releaseNavGuard?: () => void;
+
+    // Hiding the header Back button (see render()) doesn't stop the
+    // hardware back button or the iOS swipe-back gesture from leaving
+    // mid-save, which is the entry path for the overlapping-mutation races
+    // in NostrWalletConnectStore (two saves in flight on one connection id).
+    // Mirrors utils/DataClearUtils.ts's blockNavigationDuringWipe, but
+    // releases once the save settles instead of holding until app restart.
+    private blockNavigation = (): (() => void) => {
+        const { navigation } = this.props;
+        navigation.setOptions({ gestureEnabled: false });
+        const backSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            () => true
+        );
+        const removeBeforeRemove = navigation.addListener(
+            'beforeRemove',
+            (e: any) => e.preventDefault()
+        );
+        return () => {
+            navigation.setOptions({ gestureEnabled: true });
+            backSubscription.remove();
+            removeBeforeRemove();
+        };
+    };
+
+    loadData = async () => {
+        const { route, NostrWalletConnectStore } = this.props;
+        const connectionId = route.params?.connectionId;
+        await NostrWalletConnectStore.loadMaxBudget();
+        if (connectionId) {
+            await this.loadConnectionForEdit(connectionId);
+        } else {
+            await this.updateMaxBudgetLimit();
+        }
+    };
+
+    componentDidMount() {
+        const { navigation } = this.props;
+        this.unsubscribeFocus = navigation.addListener('focus', () => {
+            void this.loadData();
+        });
+    }
+
+    updateMaxBudgetLimit = async () => {
+        const { NostrWalletConnectStore } = this.props;
+        const maxLimit = NostrWalletConnectStore.maxBudgetLimit;
+        const existingBudgetValue = this.state.budgetValue || 0;
+        this.setState({
+            maxBudgetLimit: Math.max(0, maxLimit),
+            maxBudgetSource: NostrWalletConnectStore.maxBudgetSource,
+            budgetValue: existingBudgetValue
+        });
+    };
+
+    componentWillUnmount() {
+        if (this.unsubscribeFocus) {
+            this.unsubscribeFocus();
+        }
+        if (this.releaseNavGuard) {
+            this.releaseNavGuard();
+        }
+    }
+
+    loadConnectionForEdit = async (connectionId: string) => {
+        const { NostrWalletConnectStore } = this.props;
+        await NostrWalletConnectStore.loadConnections();
+        const { connection } = NostrWalletConnectStore.getConnection({
+            connectionId
+        });
+        if (connection) {
+            const budgetRenewalIndex = NostrConnectUtils.getBudgetRenewalIndex(
+                connection.budgetRenewal
+            );
+            const permissionType = NostrConnectUtils.determinePermissionType(
+                connection.permissions
+            );
+
+            const budgetValue = connection.maxAmountSats
+                ? parseInt(connection.maxAmountSats.toString(), 10)
+                : 0;
+
+            const selectedExpiryPresetIndex =
+                NostrConnectUtils.getExpiryPresetIndex(
+                    connection.expiresAt!,
+                    connection.createdAt
+                );
+            const showCustomExpiryInput = selectedExpiryPresetIndex === 4;
+            let customExpiryValue = connection.customExpiryValue || null;
+            let customExpiryUnit =
+                connection.customExpiryUnit || NostrConnectUtils.TIME_UNITS[1];
+            const isCustomRelay = !DEFAULT_NOSTR_RELAYS.find(
+                (relay) => relay === connection.relayUrl
+            );
+            const maxBudgetLimit = NostrWalletConnectStore.maxBudgetLimit;
+            this.setState({
+                connectionName: connection.name,
+                selectedRelayUrl: isCustomRelay
+                    ? localeString('general.custom')
+                    : connection.relayUrl || DEFAULT_NOSTR_RELAYS[0],
+                customRelayUrl: connection.relayUrl || '',
+                selectedPermissions: connection.permissions,
+                selectedBudgetRenewalIndex: budgetRenewalIndex,
+                expiresAt: connection.expiresAt!,
+                originalConnection: connection,
+                hasChanges: false,
+                selectedPermissionType: permissionType,
+                selectedExpiryPresetIndex,
+                showCustomExpiryInput,
+                customExpiryValue,
+                customExpiryUnit,
+                budgetValue,
+                maxBudgetLimit: Math.max(0, maxBudgetLimit),
+                maxBudgetSource: NostrWalletConnectStore.maxBudgetSource
+            });
+        }
+    };
+
+    checkForChanges = () => {
+        const { originalConnection } = this.state;
+        if (!originalConnection) return false;
+        const currentState: any = {
+            name: this.state.connectionName.trim(),
+            relayUrl:
+                this.state.selectedRelayUrl === localeString('general.custom')
+                    ? this.state.customRelayUrl
+                    : this.state.selectedRelayUrl,
+            permissions: [...this.state.selectedPermissions].sort(),
+            maxAmountSats:
+                this.state.budgetValue > 0 ? this.state.budgetValue : undefined,
+            budgetRenewal:
+                NostrConnectUtils.getBudgetRenewalOptions()[
+                    this.state.selectedBudgetRenewalIndex
+                ]?.key || 'never',
+            expiresAt: this.state.expiresAt
+                ? this.state.expiresAt.getTime()
+                : undefined
+        };
+        if (this.state.showCustomExpiryInput) {
+            currentState.customExpiryValue =
+                this.state.customExpiryValue || undefined;
+            currentState.customExpiryUnit = this.state.customExpiryUnit;
+        }
+        const originalState: any = {
+            name: originalConnection.name,
+            relayUrl: originalConnection.relayUrl || DEFAULT_NOSTR_RELAYS[0],
+            permissions: [...originalConnection.permissions].sort(),
+            maxAmountSats: originalConnection.maxAmountSats,
+            budgetRenewal: originalConnection.budgetRenewal || 'never',
+            expiresAt: originalConnection.expiresAt
+                ? new Date(originalConnection.expiresAt).getTime()
+                : undefined
+        };
+        if (
+            originalConnection.customExpiryValue ||
+            originalConnection.customExpiryUnit
+        ) {
+            originalState.customExpiryValue =
+                originalConnection.customExpiryValue || undefined;
+            originalState.customExpiryUnit =
+                originalConnection.customExpiryUnit;
+        }
+        return !isEqual(currentState, originalState);
+    };
+
+    isRelayChanged = () => {
+        const { originalConnection } = this.state;
+        if (!originalConnection) return false;
+
+        if (this.state.selectedRelayUrl === localeString('general.custom')) {
+            return this.state.customRelayUrl !== originalConnection.relayUrl;
+        } else {
+            return this.state.selectedRelayUrl !== originalConnection.relayUrl;
+        }
+    };
+
+    isValidRelayUrl = (url: string) => {
+        const pattern =
+            /^(wss?:\/\/)([a-zA-Z0-9-]+\.)+[a-zA-Z0-9-]+(:\d+)?(\/.*)?$/;
+        return pattern.test(url);
+    };
+
+    updateStateWithChangeTracking = (newState: any) => {
+        this.setState(newState, () => {
+            if (this.state.originalConnection) {
+                const hasChanges = this.checkForChanges();
+                this.setState({ hasChanges });
+            }
+        });
+    };
+
+    isFormValid = () => {
+        const {
+            connectionName,
+            selectedPermissions,
+            showCustomExpiryInput,
+            customExpiryValue,
+            budgetValue,
+            maxBudgetLimit,
+            customRelayUrl,
+            selectedRelayUrl
+        } = this.state;
+
+        const basicValidation =
+            connectionName.trim().length > 0 && selectedPermissions.length > 0;
+
+        if (selectedRelayUrl === localeString('general.custom')) {
+            if (
+                customRelayUrl.trim().length <= 0 ||
+                !this.isValidRelayUrl(customRelayUrl)
+            ) {
+                return false;
+            }
+        }
+        if (!basicValidation) return false;
+
+        if (showCustomExpiryInput) {
+            if (
+                !customExpiryValue ||
+                typeof customExpiryValue !== 'number' ||
+                customExpiryValue < 1 ||
+                customExpiryValue > 999
+            ) {
+                return false;
+            }
+        }
+
+        if (NostrConnectUtils.hasPaymentPermissions(selectedPermissions)) {
+            if (budgetValue === 0 && maxBudgetLimit >= 0) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    selectPermissionType = (permissionType: PermissionType) => {
+        if (this.state.selectedPermissionType === permissionType) {
+            const permissions = NostrConnectUtils.withPreservedSignMessage(
+                [],
+                this.state.selectedPermissions
+            );
+            this.updateStateWithChangeTracking({
+                selectedPermissionType: permissions.length
+                    ? NostrConnectUtils.determinePermissionType(permissions)
+                    : null,
+                selectedPermissions: permissions,
+                budgetValue: 0
+            });
+            return;
+        }
+
+        const { permissions } = NostrConnectUtils.getPermissionsForType(
+            permissionType,
+            this.state.selectedPermissions
+        );
+
+        const shouldResetBudget =
+            permissionType === PermissionType.ReadOnly ||
+            !NostrConnectUtils.hasPaymentPermissions(permissions);
+
+        this.updateStateWithChangeTracking({
+            selectedPermissionType: permissionType,
+            selectedPermissions: permissions,
+            ...(shouldResetBudget && { budgetValue: 0 })
+        });
+    };
+
+    togglePermission = (permission: Nip47Method) => {
+        const { selectedPermissions } = this.state;
+        const isAdding = !selectedPermissions.includes(permission);
+
+        const newPermissions = isAdding
+            ? [...selectedPermissions, permission]
+            : selectedPermissions.filter((p) => p !== permission);
+
+        const newPermissionType =
+            NostrConnectUtils.determinePermissionType(newPermissions);
+
+        // Reset budget when pay_invoice is not among permissions (e.g. read-only preset)
+        const shouldResetBudget =
+            newPermissionType === PermissionType.ReadOnly ||
+            !NostrConnectUtils.hasPaymentPermissions(newPermissions);
+
+        this.updateStateWithChangeTracking({
+            selectedPermissions: newPermissions,
+            selectedPermissionType: newPermissionType,
+            ...(shouldResetBudget && { budgetValue: 0 })
+        });
+    };
+
+    confirmEnableSignMessage = () => {
+        const { ModalStore } = this.props;
+        ModalStore.toggleInfoModal({
+            title: localeString('views.Settings.signMessage.button'),
+            text: localeString(
+                'views.Settings.NostrWalletConnect.permissions.signMessageWarning'
+            ),
+            buttons: [
+                {
+                    title: localeString('general.confirm'),
+                    callback: () => this.togglePermission('sign_message')
+                }
+            ]
+        });
+    };
+
+    showBudgetInfo = () => {
+        const { ModalStore } = this.props;
+        ModalStore.toggleInfoModal({
+            title: localeString('views.Settings.NostrWalletConnect.budget'),
+            text: [
+                localeString(
+                    'views.Settings.NostrWalletConnect.budgetInfo.reason'
+                ),
+                localeString(
+                    'views.Settings.NostrWalletConnect.budgetInfo.limit'
+                )
+            ]
+        });
+    };
+
+    getBudgetStep = (maxLimit: number): number => {
+        if (maxLimit <= 0) return 1;
+        if (maxLimit <= 1000) return 1;
+        const dynamicStep = Math.max(1, Math.floor(maxLimit / 1000));
+        const orderOfMagnitude = Math.floor(Math.log10(dynamicStep));
+        const roundedStep = Math.pow(10, orderOfMagnitude);
+        return roundedStep;
+    };
+
+    handleBudgetValueChange = (value: number) => {
+        const clampedValue = Math.max(
+            0,
+            Math.min(Math.round(value), this.state.maxBudgetLimit || 0)
+        );
+
+        this.setState(
+            {
+                budgetValue: clampedValue,
+                error: ''
+            },
+            () => {
+                if (this.state.originalConnection) {
+                    const hasChanges = this.checkForChanges();
+                    this.setState({ hasChanges });
+                }
+            }
+        );
+    };
+
+    selectExpiryPreset = (presetIndex: number) => {
+        const expiryDate = NostrConnectUtils.getExpiryDateFromPreset(
+            presetIndex,
+            this.state.customExpiryValue || undefined,
+            this.state.customExpiryUnit
+        );
+        const showCustomExpiryInput = presetIndex === 4;
+
+        this.updateStateWithChangeTracking({
+            selectedExpiryPresetIndex: presetIndex,
+            expiresAt: expiryDate,
+            showCustomExpiryInput,
+            customExpiryValue: showCustomExpiryInput
+                ? this.state.customExpiryValue
+                : 0
+        });
+    };
+
+    handleCustomExpiryValueChange = (text: string) => {
+        const numericText = text.replace(/[^0-9]/g, '');
+
+        if (!numericText) {
+            this.updateStateWithChangeTracking({
+                customExpiryValue: 0,
+                error: ''
+            });
+            return;
+        }
+
+        const numValue = parseInt(numericText, 10);
+
+        if (numValue > 999 || numValue === 0) {
+            const errorMsg =
+                numValue > 999
+                    ? localeString('cashu.durationTooLong')
+                    : localeString('cashu.invalidDurationNumber');
+            this.setState({ error: errorMsg });
+            return;
+        }
+
+        const newExpiryDate = NostrConnectUtils.getExpiryDateFromPreset(
+            this.state.selectedExpiryPresetIndex,
+            numValue,
+            this.state.customExpiryUnit
+        );
+
+        this.updateStateWithChangeTracking({
+            customExpiryValue: numValue,
+            expiresAt: newExpiryDate,
+            error: ''
+        });
+    };
+
+    handleCustomBudgetValueChange = (text: string) => {
+        const numericText = text.replace(/[^0-9]/g, '');
+
+        if (!numericText) {
+            this.updateStateWithChangeTracking({
+                budgetValue: 0,
+                error: ''
+            });
+            return;
+        }
+
+        const value = parseInt(numericText, 10);
+
+        if (value < 0) {
+            this.updateStateWithChangeTracking({
+                budgetValue: 0,
+                error: ''
+            });
+            return;
+        }
+        const clampedValue = Math.min(value, this.state.maxBudgetLimit);
+        this.updateStateWithChangeTracking({
+            budgetValue: clampedValue,
+            error: ''
+        });
+    };
+
+    buildConnectionParams = async (isEdit: boolean, connectionId?: string) => {
+        const {
+            connectionName,
+            selectedRelayUrl,
+            selectedPermissions,
+            selectedBudgetRenewalIndex,
+            budgetValue,
+            expiresAt,
+            customExpiryValue,
+            customExpiryUnit,
+            showCustomExpiryInput,
+            maxBudgetLimit,
+            customRelayUrl
+        } = this.state;
+
+        const budgetRenewalOptions =
+            NostrConnectUtils.getBudgetRenewalOptions();
+        const budgetRenewal =
+            budgetRenewalOptions[selectedBudgetRenewalIndex]?.key || 'never';
+        const isCustomRelay =
+            selectedRelayUrl === localeString('general.custom');
+        if (isCustomRelay) {
+            const { status, error } = await NostrConnectUtils.pingRelay(
+                customRelayUrl
+            );
+            if (!status) {
+                throw new Error(error!);
+            }
+        }
+        const params: any = {
+            ...(connectionId && { id: connectionId }),
+            name: connectionName.trim(),
+            relayUrl: isCustomRelay ? customRelayUrl : selectedRelayUrl,
+            permissions: selectedPermissions,
+            budgetRenewal
+        };
+
+        // Budget is required when pay_invoice is among the permissions
+        if (NostrConnectUtils.hasPaymentPermissions(selectedPermissions)) {
+            if (budgetValue === 0 && maxBudgetLimit > 0) {
+                throw new Error(
+                    localeString(
+                        'views.Settings.NostrWalletConnect.validation.budgetRequired'
+                    )
+                );
+            }
+        }
+
+        if (budgetValue > 0) {
+            if (isEdit && connectionId) {
+                params.maxAmountSats = budgetValue;
+            } else {
+                params.budgetAmount = budgetValue;
+            }
+        } else if (isEdit && connectionId) {
+            params.maxAmountSats = undefined;
+        }
+
+        params.expiresAt = expiresAt;
+        if (showCustomExpiryInput) {
+            params.customExpiryValue = customExpiryValue;
+            params.customExpiryUnit = customExpiryUnit;
+        } else if (isEdit && connectionId) {
+            params.customExpiryValue = undefined;
+            params.customExpiryUnit = undefined;
+        }
+
+        return params;
+    };
+
+    createOrUpdateConnection = async () => {
+        // this.state.loading is stale until the next render, so a second
+        // tap landing before that re-render disables the button would
+        // otherwise re-enter this method and overwrite releaseNavGuard,
+        // orphaning the first guard's cleanup (leaked global
+        // hardwareBackPress/beforeRemove listeners). This field is set
+        // synchronously below, so it closes the race the state flag can't.
+        if (this.releaseNavGuard) return;
+
+        const { NostrWalletConnectStore, route, navigation } = this.props;
+        const { connectionId, isEdit } = route.params ?? {};
+
+        this.setState({ loading: true, error: '' });
+        this.releaseNavGuard = this.blockNavigation();
+
+        try {
+            const params = await this.buildConnectionParams(
+                !!isEdit,
+                connectionId
+            );
+            if (!params) return;
+
+            if (isEdit && connectionId) {
+                const updated = await NostrWalletConnectStore.updateConnection(
+                    connectionId,
+                    params
+                );
+                if (updated.success) {
+                    // Relay change rotates the client secret; show the new
+                    // pairing URL so the app can re-connect.
+                    if (updated.nostrUrl) {
+                        navigation.navigate('NWCConnectionQR', {
+                            connectionId,
+                            nostrUrl: updated.nostrUrl
+                        });
+                    } else {
+                        setTimeout(() => navigation.goBack(), 100);
+                    }
+                } else {
+                    this.setState({
+                        error:
+                            NostrWalletConnectStore.errorMessage ||
+                            localeString(
+                                'stores.NostrWalletConnectStore.error.failedToUpdateConnection'
+                            ),
+                        loading: false
+                    });
+                }
+            } else {
+                const nostrUrl = await NostrWalletConnectStore.createConnection(
+                    params
+                );
+                if (nostrUrl) {
+                    const createdConnection =
+                        NostrWalletConnectStore.connections[0];
+                    navigation.navigate('NWCConnectionQR', {
+                        connectionId: createdConnection.id,
+                        nostrUrl
+                    });
+                }
+            }
+        } catch (error) {
+            this.setState({ error: (error as Error).message, loading: false });
+        } finally {
+            this.setState({ loading: false });
+            if (this.releaseNavGuard) {
+                this.releaseNavGuard();
+                this.releaseNavGuard = undefined;
+            }
+        }
+    };
+
+    clearErrors = () => {
+        this.setState({ error: '' });
+    };
+
+    renderPermissionTypeItem = (permissionType: PermissionOption) => {
+        const { selectedPermissionType } = this.state;
+        const isCustom = permissionType.key === PermissionType.Custom;
+
+        if (isCustom) {
+            return (
+                <Accordion
+                    headerLayout="form"
+                    key="nwc-custom-permissions"
+                    id="nwc-custom-permissions"
+                    title={permissionType.title}
+                    containerStyle={{ marginTop: 20 }}
+                    scrollRef={this.scrollViewRef}
+                    renderFormTitle={() => (
+                        <>
+                            <Text
+                                style={{
+                                    color: themeColor('text'),
+                                    fontSize: 17,
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    fontWeight: '400'
+                                }}
+                            >
+                                {permissionType.title}
+                            </Text>
+                            <Text
+                                style={{
+                                    color: themeColor('secondaryText'),
+                                    fontSize: 14,
+                                    marginTop: 4,
+                                    fontFamily: 'PPNeueMontreal-Book'
+                                }}
+                            >
+                                {permissionType.description}
+                            </Text>
+                        </>
+                    )}
+                    headerStyle={{ marginBottom: 0 }}
+                >
+                    <View style={{ marginTop: 8 }}>
+                        <View
+                            style={[
+                                styles.sectionTitleContainer,
+                                { marginHorizontal: 0 }
+                            ]}
+                        >
+                            <Body bold>
+                                {localeString(
+                                    'views.Settings.NostrWalletConnect.authorizeAppTo'
+                                )}
+                            </Body>
+                        </View>
+                        <View>
+                            {NostrConnectUtils.getWalletPermissionOptions().map(
+                                this.renderPermissionItem
+                            )}
+                        </View>
+                    </View>
+                </Accordion>
+            );
+        }
+
+        const isSelected = selectedPermissionType === permissionType.key;
+
+        return (
+            <View
+                key={permissionType.key}
+                style={{ flexDirection: 'row', marginTop: 20 }}
+            >
+                <View style={{ flex: 1, justifyContent: 'center' }}>
+                    <Text
+                        style={{
+                            color: themeColor('text'),
+                            fontSize: 17,
+                            fontFamily: 'PPNeueMontreal-Book',
+                            fontWeight: '400'
+                        }}
+                    >
+                        {permissionType.title}
+                    </Text>
+                    <Text
+                        style={{
+                            color: themeColor('secondaryText'),
+                            fontSize: 14,
+                            marginTop: 4,
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {permissionType.description}
+                    </Text>
+                </View>
+                <View
+                    style={{
+                        alignSelf: 'center'
+                    }}
+                >
+                    <Switch
+                        value={isSelected}
+                        onValueChange={() =>
+                            this.selectPermissionType(permissionType.key)
+                        }
+                    />
+                </View>
+            </View>
+        );
+    };
+
+    renderPermissionItem = (permission: IndividualPermissionOption) => {
+        const { selectedPermissions } = this.state;
+        const isSelected = selectedPermissions.includes(permission.key);
+
+        return (
+            <View
+                key={permission.key}
+                style={{ flexDirection: 'row', marginTop: 20 }}
+            >
+                <View style={{ flex: 1, justifyContent: 'center' }}>
+                    <Text
+                        style={{
+                            color: themeColor('text'),
+                            fontSize: 17,
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {permission.title}
+                    </Text>
+                    <Text
+                        style={{
+                            color: themeColor('secondaryText'),
+                            fontSize: 14,
+                            marginTop: 4,
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {permission.description}
+                    </Text>
+                </View>
+                <View
+                    style={{
+                        alignSelf: 'center'
+                    }}
+                >
+                    <Switch
+                        value={isSelected}
+                        onValueChange={() => {
+                            if (
+                                permission.key === 'sign_message' &&
+                                !isSelected
+                            ) {
+                                this.confirmEnableSignMessage();
+                                return;
+                            }
+                            this.togglePermission(permission.key);
+                        }}
+                    />
+                </View>
+            </View>
+        );
+    };
+
+    getButtonTitle = (): string => {
+        const { route } = this.props;
+        if (route.params?.isEdit) {
+            return localeString(
+                'views.Settings.NostrWalletConnect.updateConnection'
+            );
+        }
+
+        return localeString(
+            'views.Settings.NostrWalletConnect.createConnection'
+        );
+    };
+
+    isButtonDisabled = (): boolean => {
+        const { route } = this.props;
+        const { loading, hasChanges } = this.state;
+
+        if (loading || !this.isFormValid()) return true;
+        if (route.params?.isEdit && !hasChanges) return true;
+
+        return false;
+    };
+
+    render() {
+        const { navigation, route, NostrWalletConnectStore } = this.props;
+        const {
+            connectionName,
+            selectedBudgetRenewalIndex,
+            selectedExpiryPresetIndex,
+            error,
+            loading,
+            maxBudgetLimit,
+            maxBudgetSource,
+            showCustomExpiryInput,
+            customExpiryValue,
+            customExpiryUnit,
+            budgetValue,
+            selectedPermissions,
+            customRelayUrl
+        } = this.state;
+        const budgetRenewalButtons: any =
+            NostrConnectUtils.getBudgetRenewalOptions().map(
+                (option, index) => ({
+                    element: () => (
+                        <Text
+                            style={{
+                                fontFamily: 'PPNeueMontreal-Book',
+                                fontSize: 13,
+                                color:
+                                    selectedBudgetRenewalIndex === index
+                                        ? themeColor('background')
+                                        : themeColor('text')
+                            }}
+                        >
+                            {option.title}
+                        </Text>
+                    )
+                })
+            );
+        const expiryPresetButtons: any =
+            NostrConnectUtils.getExpiryPresetButtons().map((button, index) => ({
+                element: () => (
+                    <Text
+                        style={{
+                            fontFamily: 'PPNeueMontreal-Book',
+                            fontSize: 13,
+                            color:
+                                selectedExpiryPresetIndex === index
+                                    ? themeColor('background')
+                                    : themeColor('text')
+                        }}
+                    >
+                        {button}
+                    </Text>
+                )
+            }));
+        return (
+            <Screen>
+                <Header
+                    leftComponent={loading ? undefined : 'Back'}
+                    centerComponent={{
+                        text: route.params?.isEdit
+                            ? localeString(
+                                  'views.Settings.NostrWalletConnect.editConnection'
+                              )
+                            : localeString(
+                                  'views.Settings.NostrWalletConnect.addConnection'
+                              ),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        loading ? (
+                            <View style={{ marginRight: 10 }}>
+                                <LoadingIndicator size={30} />
+                            </View>
+                        ) : undefined
+                    }
+                    navigation={navigation}
+                />
+
+                <View style={styles.mainContainer}>
+                    <ScrollView
+                        ref={this.scrollViewRef}
+                        style={styles.scrollContainer}
+                        contentContainerStyle={styles.scrollContent}
+                        showsVerticalScrollIndicator={false}
+                    >
+                        {error && (
+                            <ErrorMessage
+                                message={error}
+                                dismissable
+                                onPress={this.clearErrors}
+                            />
+                        )}
+                        {route.params?.isEdit && this.isRelayChanged() && (
+                            <View
+                                style={{
+                                    backgroundColor: themeColor('secondary'),
+                                    borderColor: themeColor('secondary'),
+                                    borderWidth: 1,
+                                    padding: 10,
+                                    marginBottom: 10,
+                                    borderRadius: 8,
+                                    marginHorizontal: 10,
+                                    marginTop: 10
+                                }}
+                            >
+                                <Text
+                                    style={{
+                                        color: themeColor('highlight')
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.NostrWalletConnect.relayChangeWarning'
+                                    )}
+                                </Text>
+                            </View>
+                        )}
+
+                        {/* Connection Name */}
+                        <View style={styles.section}>
+                            <View style={styles.sectionTitleContainer}>
+                                <Text
+                                    style={{
+                                        color: themeColor('secondaryText'),
+                                        fontFamily: 'PPNeueMontreal-Book'
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.NostrWalletConnect.connectionName'
+                                    )}
+                                </Text>
+                            </View>
+                            <TextInput
+                                placeholder={localeString(
+                                    'views.Settings.NostrWalletConnect.enterConnectionName'
+                                )}
+                                value={connectionName}
+                                onChangeText={(text: string) =>
+                                    this.updateStateWithChangeTracking({
+                                        connectionName: text
+                                    })
+                                }
+                                style={styles.textInput}
+                            />
+                        </View>
+
+                        {/* Relay URL */}
+                        <View style={styles.section}>
+                            <View style={{ marginHorizontal: 10 }}>
+                                <DropdownSetting
+                                    title={localeString(
+                                        'views.Settings.NostrWalletConnect.chooseRelay'
+                                    )}
+                                    selectedValue={this.state.selectedRelayUrl}
+                                    disabled={loading}
+                                    onValueChange={(value: string) => {
+                                        this.updateStateWithChangeTracking({
+                                            selectedRelayUrl: value
+                                        });
+                                    }}
+                                    values={[
+                                        ...DEFAULT_NOSTR_RELAYS.map(
+                                            (relay) => ({
+                                                key: relay,
+                                                value: relay
+                                            })
+                                        ),
+                                        {
+                                            key: localeString('general.custom'),
+                                            value: localeString(
+                                                'general.custom'
+                                            )
+                                        }
+                                    ]}
+                                />
+                            </View>
+                            {this.state.selectedRelayUrl ===
+                                localeString('general.custom') && (
+                                <View>
+                                    <TextInput
+                                        placeholder={localeString(
+                                            'views.Settings.NostrWalletConnect.customNostrUrlPlaceholder'
+                                        )}
+                                        value={customRelayUrl}
+                                        onChangeText={(text: string) =>
+                                            this.updateStateWithChangeTracking({
+                                                customRelayUrl: text
+                                            })
+                                        }
+                                        autoCapitalize="none"
+                                        autoCorrect={false}
+                                        keyboardType="url"
+                                        style={styles.textInput}
+                                        textColor={
+                                            customRelayUrl.trim().length > 0 &&
+                                            !this.isValidRelayUrl(
+                                                customRelayUrl
+                                            )
+                                                ? themeColor('error')
+                                                : themeColor('text')
+                                        }
+                                    />
+                                </View>
+                            )}
+                        </View>
+
+                        {/* Permission Types */}
+                        <View style={styles.section}>
+                            <View style={styles.sectionTitleContainer}>
+                                <Text
+                                    style={{
+                                        color: themeColor('secondaryText'),
+                                        fontFamily: 'PPNeueMontreal-Book'
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.NostrWalletConnect.chooseWalletPermissions'
+                                    )}
+                                </Text>
+                            </View>
+                            <View style={{ marginHorizontal: 15 }}>
+                                {NostrConnectUtils.getPermissionTypes().map(
+                                    this.renderPermissionTypeItem
+                                )}
+                                {(BackendUtils.supportsMessageSigning() ||
+                                    selectedPermissions.includes(
+                                        'sign_message'
+                                    )) &&
+                                    this.renderPermissionItem(
+                                        NostrConnectUtils.getSignMessagePermission()
+                                    )}
+                            </View>
+                        </View>
+
+                        {NostrConnectUtils.hasPaymentPermissions(
+                            this.state.selectedPermissions
+                        ) && (
+                            <View style={{ marginTop: 10 }}>
+                                <View style={styles.sectionTitleContainer}>
+                                    <Body bold>
+                                        {localeString('views.BumpFee.budget')}
+                                    </Body>
+                                    <Icon
+                                        name="info"
+                                        onPress={this.showBudgetInfo}
+                                        color={themeColor('text')}
+                                        underlayColor="transparent"
+                                        size={22}
+                                        accessibilityLabel={localeString(
+                                            'views.Settings.NostrWalletConnect.budgetInfo.accessibilityLabel'
+                                        )}
+                                    />
+                                </View>
+                                <View
+                                    style={styles.sectionDescriptionContainer}
+                                >
+                                    <Body small color="secondaryText">
+                                        {localeString(
+                                            'views.Settings.NostrWalletConnect.budgetDescription'
+                                        )}
+                                    </Body>
+                                </View>
+
+                                {/* Budget Input and Slider */}
+                                <View
+                                    style={{
+                                        marginHorizontal: 5,
+                                        marginTop: 5,
+                                        marginBottom: 5
+                                    }}
+                                >
+                                    {maxBudgetLimit > 0 ? (
+                                        <>
+                                            {/* Custom Budget Input */}
+                                            <TextInput
+                                                placeholder={localeString(
+                                                    'views.Settings.NostrWalletConnect.budgetPlaceholder'
+                                                )}
+                                                value={
+                                                    budgetValue > 0
+                                                        ? numberWithCommas(
+                                                              budgetValue.toString()
+                                                          )
+                                                        : ''
+                                                }
+                                                onChangeText={
+                                                    this
+                                                        .handleCustomBudgetValueChange
+                                                }
+                                                keyboardType="numeric"
+                                                style={styles.textInput}
+                                            />
+                                            {/* Slider */}
+                                            <View
+                                                style={{
+                                                    marginLeft: 10,
+                                                    marginRight: 10
+                                                }}
+                                            >
+                                                <Slider
+                                                    style={{
+                                                        width: '100%',
+                                                        height: 30,
+                                                        marginTop: 10
+                                                    }}
+                                                    minimumValue={0}
+                                                    maximumValue={
+                                                        maxBudgetLimit
+                                                    }
+                                                    value={budgetValue}
+                                                    step={this.getBudgetStep(
+                                                        maxBudgetLimit
+                                                    )}
+                                                    onValueChange={
+                                                        this
+                                                            .handleBudgetValueChange
+                                                    }
+                                                    minimumTrackTintColor={themeColor(
+                                                        'highlight'
+                                                    )}
+                                                    maximumTrackTintColor={themeColor(
+                                                        'secondary'
+                                                    )}
+                                                />
+                                                <View
+                                                    style={{
+                                                        flexDirection: 'row',
+                                                        justifyContent:
+                                                            'space-between',
+                                                        marginTop: 8
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            ),
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book',
+                                                            fontSize: 12
+                                                        }}
+                                                    >
+                                                        {'0'}{' '}
+                                                        {localeString(
+                                                            'general.sats'
+                                                        )}
+                                                    </Text>
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            ),
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book',
+                                                            fontSize: 12
+                                                        }}
+                                                    >
+                                                        {numberWithCommas(
+                                                            maxBudgetLimit.toString()
+                                                        )}{' '}
+                                                        {localeString(
+                                                            'general.sats'
+                                                        )}
+                                                    </Text>
+                                                </View>
+                                            </View>
+                                        </>
+                                    ) : (
+                                        <View
+                                            style={{
+                                                padding: 20,
+                                                alignItems: 'center',
+                                                backgroundColor:
+                                                    themeColor('secondary'),
+                                                borderRadius: 8
+                                            }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    ),
+                                                    fontFamily:
+                                                        'PPNeueMontreal-Book',
+                                                    fontSize: 14
+                                                }}
+                                            >
+                                                {maxBudgetSource === 'cashu'
+                                                    ? localeString(
+                                                          'views.Settings.NostrWalletConnect.noCashuBalanceAvailable'
+                                                      )
+                                                    : localeString(
+                                                          'views.Settings.NostrWalletConnect.noBalanceAvailable'
+                                                      )}
+                                            </Text>
+                                            {NostrWalletConnectStore.canOfferCashuSwitch && (
+                                                <TouchableOpacity
+                                                    onPress={() =>
+                                                        navigation.navigate(
+                                                            'NWCSettings'
+                                                        )
+                                                    }
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'highlight'
+                                                            ),
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book',
+                                                            fontSize: 16,
+                                                            marginTop: 10
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.Settings.NostrWalletConnect.enableCashuInSettings'
+                                                        )}
+                                                    </Text>
+                                                </TouchableOpacity>
+                                            )}
+                                        </View>
+                                    )}
+                                </View>
+                            </View>
+                        )}
+
+                        {/* Advanced Settings */}
+                        <View style={styles.section}>
+                            <Accordion
+                                headerLayout="form"
+                                id="nwc-advanced-settings"
+                                title={localeString('general.advancedSettings')}
+                                scrollRef={this.scrollViewRef}
+                                renderFormTitle={() => (
+                                    <Text
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontSize: 17,
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            fontWeight: '400'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'general.advancedSettings'
+                                        )}
+                                    </Text>
+                                )}
+                                headerStyle={{
+                                    paddingHorizontal: 15,
+                                    paddingVertical: 10,
+                                    marginBottom: 0
+                                }}
+                            >
+                                {/* Budget Renewal */}
+                                {NostrConnectUtils.hasPaymentPermissions(
+                                    selectedPermissions
+                                ) && (
+                                    <View
+                                        style={[
+                                            styles.renewalContainer,
+                                            { marginTop: 10 }
+                                        ]}
+                                    >
+                                        <View
+                                            style={styles.sectionTitleContainer}
+                                        >
+                                            <Body bold>
+                                                {localeString(
+                                                    'views.Settings.NostrWalletConnect.budgetRenewal'
+                                                )}
+                                            </Body>
+                                        </View>
+                                        <ButtonGroup
+                                            onPress={(
+                                                selectedIndex: number
+                                            ) => {
+                                                this.updateStateWithChangeTracking(
+                                                    {
+                                                        selectedBudgetRenewalIndex:
+                                                            selectedIndex
+                                                    }
+                                                );
+                                            }}
+                                            selectedIndex={
+                                                selectedBudgetRenewalIndex
+                                            }
+                                            buttons={budgetRenewalButtons}
+                                            selectedButtonStyle={{
+                                                backgroundColor:
+                                                    themeColor('highlight'),
+                                                borderRadius: 8
+                                            }}
+                                            containerStyle={{
+                                                backgroundColor:
+                                                    themeColor('secondary'),
+                                                borderRadius: 8,
+                                                borderColor:
+                                                    themeColor('secondary'),
+                                                marginHorizontal: 10,
+                                                marginTop: 10,
+                                                height: 40
+                                            }}
+                                            innerBorderStyle={{
+                                                color: themeColor('secondary')
+                                            }}
+                                        />
+                                    </View>
+                                )}
+
+                                {/* Connection Expiration (for all permission types) */}
+                                <View style={styles.section}>
+                                    <View style={styles.sectionTitleContainer}>
+                                        <Body bold>
+                                            {localeString(
+                                                'views.Settings.NostrWalletConnect.connectionExpiration'
+                                            )}
+                                        </Body>
+                                    </View>
+                                    <View
+                                        style={
+                                            styles.sectionDescriptionContainer
+                                        }
+                                    >
+                                        <Body small color="secondaryText">
+                                            {localeString(
+                                                'views.Settings.NostrWalletConnect.connectionExpirationDescription'
+                                            )}
+                                        </Body>
+                                    </View>
+
+                                    <ButtonGroup
+                                        onPress={(selectedIndex: number) => {
+                                            this.selectExpiryPreset(
+                                                selectedIndex
+                                            );
+                                        }}
+                                        selectedIndex={
+                                            selectedExpiryPresetIndex
+                                        }
+                                        buttons={expiryPresetButtons}
+                                        selectedButtonStyle={{
+                                            backgroundColor:
+                                                themeColor('highlight'),
+                                            borderRadius: 8
+                                        }}
+                                        containerStyle={{
+                                            backgroundColor:
+                                                themeColor('secondary'),
+                                            borderRadius: 8,
+                                            borderColor:
+                                                themeColor('secondary'),
+                                            marginHorizontal: 10,
+                                            marginTop: 10,
+                                            height: 40
+                                        }}
+                                        innerBorderStyle={{
+                                            color: themeColor('secondary')
+                                        }}
+                                    />
+
+                                    {/* Custom Expiry Input */}
+                                    {showCustomExpiryInput && (
+                                        <View
+                                            style={{
+                                                marginHorizontal: 10,
+                                                marginTop: 10
+                                            }}
+                                        >
+                                            <View
+                                                style={{
+                                                    flexDirection: 'row',
+                                                    gap: 8
+                                                }}
+                                            >
+                                                <TextInput
+                                                    placeholder={'1-999'}
+                                                    value={customExpiryValue?.toString()}
+                                                    onChangeText={
+                                                        this
+                                                            .handleCustomExpiryValueChange
+                                                    }
+                                                    keyboardType="numeric"
+                                                    style={{ flex: 1 }}
+                                                />
+                                                <View style={{ flex: 1 }}>
+                                                    <DropdownSetting
+                                                        selectedValue={
+                                                            customExpiryUnit
+                                                        }
+                                                        values={NostrConnectUtils.TIME_UNITS.map(
+                                                            (unit) => ({
+                                                                key: unit,
+                                                                value: unit
+                                                            })
+                                                        )}
+                                                        onValueChange={(
+                                                            value: string
+                                                        ) => {
+                                                            const newExpiryDate =
+                                                                NostrConnectUtils.getExpiryDateFromPreset(
+                                                                    selectedExpiryPresetIndex,
+                                                                    customExpiryValue ||
+                                                                        undefined,
+                                                                    value as TimeUnit
+                                                                );
+
+                                                            this.updateStateWithChangeTracking(
+                                                                {
+                                                                    customExpiryUnit:
+                                                                        value as TimeUnit,
+                                                                    expiresAt:
+                                                                        newExpiryDate
+                                                                }
+                                                            );
+                                                        }}
+                                                    />
+                                                </View>
+                                            </View>
+                                        </View>
+                                    )}
+                                </View>
+                            </Accordion>
+                        </View>
+                    </ScrollView>
+
+                    <View style={styles.bottomButtonContainer}>
+                        <Button
+                            title={this.getButtonTitle()}
+                            onPress={this.createOrUpdateConnection}
+                            secondary={this.isButtonDisabled()}
+                            disabled={this.isButtonDisabled()}
+                            noUppercase
+                        />
+                    </View>
+                </View>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    mainContainer: {
+        flex: 1
+    },
+    scrollContainer: {
+        flex: 1
+    },
+    scrollContent: {
+        paddingBottom: 20
+    },
+    section: {
+        marginTop: 5,
+        marginBottom: 10
+    },
+    sectionTitleContainer: {
+        marginHorizontal: 15,
+        flexDirection: 'row',
+        justifyContent: 'flex-start',
+        gap: 5,
+        alignItems: 'center'
+    },
+    sectionDescriptionContainer: {
+        marginHorizontal: 15,
+        marginTop: 5
+    },
+    textInput: {
+        marginHorizontal: 10
+    },
+    renewalContainer: {
+        marginTop: 5
+    },
+    bottomButtonContainer: {
+        paddingHorizontal: 20,
+        paddingVertical: 15,
+        paddingBottom: 15
+    }
+});

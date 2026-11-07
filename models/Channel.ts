@@ -1,0 +1,302 @@
+import BigNumber from 'bignumber.js';
+import { observable, computed } from 'mobx';
+
+import BaseModel from './BaseModel';
+import { lnrpc } from '../proto/lightning';
+import { formatNonZeroScid, formatScid } from '../utils/ScidUtils';
+
+interface HTLC {
+    hash_lock: string;
+    expiration_height: number;
+    incoming: boolean;
+    amount: string;
+}
+
+export default class Channel extends BaseModel {
+    commit_weight: string;
+    local_balance: string;
+    commit_fee: string;
+    csv_delay: number;
+    channel_point: string;
+    chan_id: string;
+    fee_per_kw: string;
+    total_satoshis_received: string;
+    pending_htlcs: Array<HTLC>;
+    pendingOpen: any;
+    pendingClose: any;
+    forceClose: any;
+    closing: any;
+    blocks_til_maturity: any;
+    chain_hash: string;
+    closing_tx_hash: string;
+    closing_txid: string;
+    settled_balance: any;
+    time_locked_balance: any;
+    num_updates: string;
+    close_address?: string;
+    @observable
+    active: boolean;
+    remote_balance: string;
+    unsettled_balance: string;
+    total_satoshis_sent: string;
+    remote_pubkey: string;
+    capacity: string;
+    private: boolean;
+    initiator?: boolean;
+    peer_scid_alias?: string;
+    zero_conf_confirmed_scid?: number;
+    alias_scids?: Array<number>; // array uint64
+    local_chan_reserve_sat?: string;
+    remote_chan_reserve_sat?: string;
+    zero_conf?: boolean;
+    commitment_type?: string;
+    open_initiator?: string | number;
+    close_initiator?: string | number;
+    // c-lightning
+    @observable
+    state: string;
+    close_height: number;
+    // CLN v23.05 msat deprecations
+    msatoshi_total: string;
+    msatoshi_to_us: string;
+    total_msat: string;
+    to_us_msat: string;
+    // CLN v23.05 msat new
+    total: string;
+    to_us: string;
+    short_channel_id: string; // CLN
+    close_cause: string;
+
+    channel_id?: string;
+    alias?: string;
+    // pending
+    remote_node_pub?: string;
+    // LND/LNC: confirmation progress computed from height delta
+    confirmations_until_active?: number;
+    confirmation_height?: number;
+    // LDK: provides direct counts instead of height-based fields
+    confirmations?: number;
+    confirmations_required?: number;
+
+    // enrichments
+    displayName?: string;
+
+    public getConfirmations(currentBlockHeight?: number): {
+        current: number;
+        total: number;
+    } | null {
+        if (!this.pendingOpen) return null;
+        // LDK path: direct counts available, no block-height arithmetic needed
+        // Skip when confirmations_required is 0 (zero-conf) or missing
+        if (
+            this.confirmations != null &&
+            this.confirmations_required != null &&
+            this.confirmations_required > 0
+        ) {
+            return {
+                // The channel stays pending until it is ready, so the count
+                // can go past the required depth
+                current: Math.min(
+                    this.confirmations,
+                    this.confirmations_required
+                ),
+                total: this.confirmations_required
+            };
+        }
+        // LND/LNC path: derive current count from confirmation_height delta
+        if (this.confirmations_until_active == null) return null;
+        const current =
+            this.confirmation_height && currentBlockHeight
+                ? currentBlockHeight - this.confirmation_height + 1
+                : 0;
+        return {
+            current,
+            total: current + this.confirmations_until_active
+        };
+    }
+
+    // LDK Node lists a channel as pending open until channel_ready messages
+    // have been exchanged. Once the funding transaction has the required
+    // confirmations, that usually means it waits for the peer's channel_ready
+    @computed
+    public get isWaitingForPeer(): boolean {
+        return (
+            !!this.pendingOpen &&
+            this.confirmations != null &&
+            this.confirmations_required != null &&
+            this.confirmations_required > 0 &&
+            this.confirmations >= this.confirmations_required
+        );
+    }
+
+    @computed
+    public get closeHeight(): number {
+        return this.close_height;
+    }
+
+    @computed
+    public get isOpen(): boolean {
+        return (
+            !this.closeHeight &&
+            !this.closing_txid &&
+            !this.pendingClose &&
+            !this.closing &&
+            !this.close_cause
+        );
+    }
+
+    @computed
+    public get isActive(): boolean {
+        return this.active || this.state === 'CHANNELD_NORMAL';
+    }
+
+    @computed
+    public get getOpenInitiator(): string {
+        return typeof this.open_initiator === 'number'
+            ? lnrpc.Initiator[this.open_initiator]
+            : this.open_initiator || '';
+    }
+
+    @computed
+    public get getCloseInitiator(): string {
+        return typeof this.close_initiator === 'number'
+            ? lnrpc.Initiator[this.close_initiator]
+            : this.close_initiator || '';
+    }
+
+    @computed
+    public get channelCapacity(): string {
+        return new BigNumber(this.localBalance)
+            .plus(this.remoteBalance)
+            .toString();
+    }
+
+    @computed
+    public get localBalance(): string {
+        return this.to_us
+            ? (Number(this.to_us) / 1000).toString()
+            : this.to_us_msat
+            ? (Number(this.to_us_msat) / 1000).toString()
+            : this.msatoshi_to_us
+            ? (Number(this.msatoshi_to_us) / 1000).toString()
+            : this.local_balance || '0';
+    }
+
+    @computed
+    public get sendingCapacity(): string {
+        const localBalance = new BigNumber(this.localBalance).minus(
+            this.localReserveBalance
+        );
+        if (localBalance.gt(0)) {
+            return localBalance.toString();
+        } else {
+            return '0';
+        }
+    }
+
+    @computed
+    public get remoteBalance(): string {
+        return this.total
+            ? ((Number(this.total) - Number(this.to_us)) / 1000).toString()
+            : this.total_msat
+            ? (
+                  (Number(this.total_msat) - Number(this.to_us_msat)) /
+                  1000
+              ).toString()
+            : this.msatoshi_total
+            ? (
+                  (Number(this.msatoshi_total) - Number(this.msatoshi_to_us)) /
+                  1000
+              ).toString()
+            : this.remote_balance || '0';
+    }
+
+    @computed
+    public get receivingCapacity(): string {
+        const remoteBalance = new BigNumber(this.remoteBalance).minus(
+            this.remoteReserveBalance
+        );
+        if (remoteBalance.gt(0)) {
+            return remoteBalance.toString();
+        } else {
+            return '0';
+        }
+    }
+
+    @computed
+    public get localReserveBalance(): string {
+        return this.local_chan_reserve_sat
+            ? Number(this.local_chan_reserve_sat).toString()
+            : '0';
+    }
+
+    @computed
+    public get remoteReserveBalance(): string {
+        return this.remote_chan_reserve_sat
+            ? Number(this.remote_chan_reserve_sat).toString()
+            : '0';
+    }
+
+    @computed
+    public get totalReserveBalance(): string {
+        return (
+            Number(this.localReserveBalance) + Number(this.remoteReserveBalance)
+        ).toString();
+    }
+
+    @computed
+    public get isBelowReserve(): boolean {
+        return (
+            new BigNumber(this.localBalance).lt(this.localReserveBalance) &&
+            new BigNumber(this.localBalance).gt(0)
+        );
+    }
+
+    /** Channel id
+     * @returns {string | undefined} id of the channel or undefined if channel is pending
+     */
+    @computed
+    public get channelId(): string | undefined {
+        return this.chan_id || this.channel_id;
+    }
+
+    @computed
+    public get shortChannelId(): string | undefined {
+        if (this.short_channel_id) return this.short_channel_id;
+        if (this.chan_id) return formatScid(this.chan_id);
+        return undefined;
+    }
+
+    @computed
+    public get aliasScids(): Array<string> {
+        const scids: Array<string> = [];
+        this.alias_scids?.forEach((scid) => {
+            const formatted = formatNonZeroScid(scid);
+            if (formatted) scids.push(formatted);
+        });
+        return scids;
+    }
+
+    @computed
+    public get peerScidAlias(): string | undefined {
+        return formatNonZeroScid(this.peer_scid_alias);
+    }
+
+    @computed get zeroConfConfirmedScid(): string | undefined {
+        return formatNonZeroScid(this.zero_conf_confirmed_scid);
+    }
+
+    @computed
+    public get remotePubkey(): string {
+        return this.remote_pubkey || this.remote_node_pub || '';
+    }
+
+    @computed
+    public get getCommitmentType(): string | undefined {
+        return this.commitment_type
+            ? Number.isNaN(Number(this.commitment_type))
+                ? this.commitment_type
+                : lnrpc.CommitmentType[Number(this.commitment_type)]
+            : undefined;
+    }
+}

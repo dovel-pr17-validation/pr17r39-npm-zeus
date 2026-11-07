@@ -1,0 +1,1467 @@
+import { action, observable, reaction, runInAction } from 'mobx';
+import BigNumber from 'bignumber.js';
+// leave as is, do not do tree-shaking
+import { chain } from 'lodash';
+import { randomBytes } from 'react-native-randombytes';
+
+import Channel from '../models/Channel';
+import ClosedChannel from '../models/ClosedChannel';
+import ChannelInfo, { RoutingPolicy } from '../models/ChannelInfo';
+import FundedPsbt from '../models/FundedPsbt';
+import Peer from '../models/Peer';
+
+import OpenChannelRequest from '../models/OpenChannelRequest';
+import CloseChannelRequest from '../models/CloseChannelRequest';
+
+import BalanceStore from './BalanceStore';
+import SettingsStore from './SettingsStore';
+
+import BackendUtils from '../utils/BackendUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { errorToUserFriendly } from '../utils/ErrorUtils';
+import { getCooperativeCloses, getForceCloses } from '../utils/BalanceUtils';
+import { findChannelByMemo, makeOpenMemo } from '../utils/ChannelOpenUtils';
+import { isRequestTimeout } from '../utils/RequestTimeoutUtils';
+
+interface ChannelInfoIndex {
+    [key: string]: ChannelInfo;
+}
+
+interface PendingHTLC {
+    incoming: boolean;
+    amount: number | string;
+    hash_lock: string;
+    expiration_height: number;
+    htlc_index?: number;
+    forwarding_channel?: number;
+    forwarding_htlc_index?: number;
+}
+
+export enum ChannelsType {
+    Open = 0,
+    Pending = 1,
+    Closed = 2
+}
+
+export enum ChannelsView {
+    Channels = 'channels',
+    Peers = 'peers'
+}
+
+interface aliases {
+    [index: string]: string;
+}
+
+const fixedAliases: aliases = {
+    '031b301307574bbe9b9ac7b79cbe1700e31e544513eae0b5d7497483083f99e581':
+        'Olympus by ZEUS'
+};
+ChannelsView;
+
+export default class ChannelsStore {
+    @observable public loading = false;
+    @observable public error = false;
+    @observable public errorPeerConnect = false;
+    @observable public errorMsgChannel: string | null;
+    @observable public errorMsgPeer: string | null;
+    @observable public errorListPeers: string | null;
+    @observable public errorDisconnectPeer: string | null;
+    @observable public nodes: any = {};
+    @observable public aliasesByChannelId: aliases = {};
+    @observable public aliasesByPubkey: aliases = { ...fixedAliases };
+    @observable public channels: Array<Channel> = [];
+    @observable public pendingChannels: Array<Channel> = [];
+    @observable public closedChannels: Array<Channel> = [];
+    @observable public output_index: number | null;
+    @observable public funding_txid_str: string | null;
+    @observable public openingChannel = false;
+    @observable public connectingToPeer = false;
+    @observable public errorOpenChannel = false;
+    @observable public peerSuccess = false;
+    @observable public channelSuccess = false;
+    // an open timed out and the channel was not found; it may still have
+    // been opened, so OpenChannel does not submit again
+    @observable public openOutcomeUnknown = false;
+    // id of the current open; resetOpenChannel() and the next open change
+    // it, so a late result (e.g. a timeout lookup) for an earlier open is
+    // dropped
+    private openChannelSeq = 0;
+    // openChannelSync requests that have not settled yet, including the
+    // lookup after a timeout. resetOpenChannel() leaves this alone: leaving
+    // the screen does not stop the node from opening the channel, so
+    // OpenChannel does not submit again until they settle
+    @observable public syncOpensInFlight = 0;
+    @observable public closeChannelErr: string | null;
+    @observable public closingChannel = false;
+    @observable channelRequest: any;
+    @observable public peers: Array<Peer> = [];
+    // redesign
+    @observable public largestChannelSats = 0;
+    @observable public totalOutbound = 0;
+    // Local balance sitting in channels that are currently inactive. These
+    // sats cannot be routed right now but are not lost: the peer may be
+    // momentarily disconnected. Tracked separately so callers can tell
+    // "no money" apart from "money you cannot reach at this instant".
+    @observable public totalOutboundOffline = 0;
+    // Whether a channel fetch has ever succeeded for this node. Callers use
+    // it to decide if the totals above are meaningful; it says nothing about
+    // whether there is any capacity.
+    @observable public hasChannelData = false;
+    @observable public totalInbound = 0;
+    @observable public totalOffline = 0;
+    @observable public chanInfo: ChannelInfoIndex = {};
+    @observable public channelsType = ChannelsType.Open;
+    @observable public channelsView: ChannelsView = ChannelsView.Channels;
+    // enriched
+    @observable public enrichedChannels: Array<Channel> = [];
+    @observable public enrichedPendingChannels: Array<Channel> = [];
+    @observable public enrichedClosedChannels: Array<Channel> = [];
+    // search and sort
+    @observable public search: string = '';
+    @observable public filteredChannels: Array<Channel> = [];
+    @observable public filteredPendingChannels: Array<Channel> = [];
+    @observable public filteredClosedChannels: Array<Channel> = [];
+    @observable public filteredPeers: Array<Peer> = [];
+    @observable public filterOptions: Array<string> = [];
+    @observable public sort = {
+        param: 'channelCapacity',
+        dir: 'DESC',
+        type: 'numeric'
+    };
+    @observable public showChannelsSearch: boolean = false;
+    @observable public showPeersSearch: boolean = false;
+    // aliasMap
+    @observable public aliasMap = observable.map({});
+    // external account funding
+    @observable public funded_psbt: string = '';
+    @observable public pending_chan_ids: Array<string>;
+    // pending HTLCs
+    @observable public pendingHTLCs: Array<PendingHTLC> = [];
+    @observable public haveAnnouncedChannels = false;
+
+    settingsStore: SettingsStore;
+    balanceStore: BalanceStore;
+
+    constructor(settingsStore: SettingsStore, balanceStore: BalanceStore) {
+        this.settingsStore = settingsStore;
+        this.balanceStore = balanceStore;
+
+        reaction(
+            () => this.channelRequest,
+            () => {
+                if (this.channelRequest) {
+                    const chanReq = new OpenChannelRequest(this.channelRequest);
+                    this.openChannel(chanReq);
+                }
+            }
+        );
+
+        reaction(
+            () => this.channels,
+            async () => {
+                if (this.channels) {
+                    this.enrichedChannels = await this.enrichChannels(
+                        this.channels,
+                        true
+                    );
+                    this.filterChannels();
+                }
+            }
+        );
+
+        reaction(
+            () => this.pendingChannels,
+            async () => {
+                if (this.pendingChannels) {
+                    this.enrichedPendingChannels = await this.enrichChannels(
+                        this.pendingChannels
+                    );
+                    this.filterPendingChannels();
+                }
+            }
+        );
+
+        reaction(
+            () => this.closedChannels,
+            async () => {
+                if (this.closedChannels) {
+                    this.enrichedClosedChannels = await this.enrichChannels(
+                        this.closedChannels
+                    );
+                    this.filterClosedChannels();
+                }
+            }
+        );
+    }
+
+    @action
+    public resetOpenChannel = (silent?: boolean) => {
+        this.openChannelSeq++;
+        this.loading = false;
+        this.error = false;
+        if (!silent) {
+            this.errorMsgPeer = null;
+            this.errorPeerConnect = false;
+            this.connectingToPeer = false;
+            this.peerSuccess = false;
+        }
+        this.errorMsgChannel = null;
+        this.output_index = null;
+        this.funding_txid_str = null;
+        this.openingChannel = false;
+        this.errorOpenChannel = false;
+        this.openOutcomeUnknown = false;
+        this.channelSuccess = false;
+        this.channelRequest = null;
+        this.funded_psbt = '';
+        this.pending_chan_ids = [];
+    };
+
+    public clearCloseChannelErr = () => {
+        this.closeChannelErr = null;
+    };
+
+    @action
+    public reset = () => {
+        this.resetOpenChannel();
+        this.hasChannelData = false;
+        this.haveAnnouncedChannels = false;
+        this.nodes = {};
+        this.channels = [];
+        this.pendingChannels = [];
+        this.closedChannels = [];
+        this.enrichedChannels = [];
+        this.enrichedPendingChannels = [];
+        this.enrichedClosedChannels = [];
+        this.filteredChannels = [];
+        this.filteredPendingChannels = [];
+        this.filteredClosedChannels = [];
+        this.filteredPeers = [];
+        this.largestChannelSats = 0;
+        this.totalOutbound = 0;
+        this.totalOutboundOffline = 0;
+        this.totalInbound = 0;
+        this.totalOffline = 0;
+        this.channelsType = ChannelsType.Open;
+        this.pendingHTLCs = [];
+        this.peers = [];
+    };
+
+    @action
+    public setSearch = (query: string) => {
+        this.search = query;
+        this.filterChannels();
+        this.filterPendingChannels();
+        this.filterClosedChannels();
+        this.filterPeers();
+    };
+
+    @action
+    public setSort = (value: any) => {
+        this.sort = value;
+        if (this.channelsView === ChannelsView.Channels) {
+            this.filterChannels();
+            this.filterPendingChannels();
+            this.filterClosedChannels();
+        } else {
+            this.filterPeers();
+        }
+    };
+
+    @action
+    public setFilterOptions = (options: string[]) => {
+        this.filterOptions = options;
+        this.filterChannels();
+        this.filterPendingChannels();
+        this.filterClosedChannels();
+    };
+
+    private filter = (
+        items: Array<Channel | Peer>,
+        type: 'channel' | 'peer'
+    ) => {
+        const query = this.search.toLocaleLowerCase();
+
+        let filtered = items;
+
+        if (type === 'channel') {
+            filtered = (items as Channel[])
+                .filter(
+                    (channel) =>
+                        channel.alias?.toLowerCase().includes(query) ||
+                        channel.remotePubkey?.toLowerCase().includes(query) ||
+                        channel.channelId
+                            ?.toString()
+                            ?.toLowerCase()
+                            .includes(query)
+                )
+                .filter(
+                    (channel) =>
+                        (!this.filterOptions?.includes('unannounced') &&
+                            !this.filterOptions?.includes('announced')) ||
+                        this.filterOptions?.includes(
+                            channel.private ? 'unannounced' : 'announced'
+                        )
+                )
+                .filter(
+                    (channel) =>
+                        (!this.filterOptions?.includes('online') &&
+                            !this.filterOptions?.includes('offline')) ||
+                        this.filterOptions?.includes(
+                            channel.active ? 'online' : 'offline'
+                        )
+                );
+        }
+
+        if (type === 'peer') {
+            filtered = (items as Peer[]).filter(
+                (peer) =>
+                    this.nodes[peer.pubkey]?.alias
+                        ?.toLowerCase()
+                        .includes(query) ||
+                    peer.alias?.toLowerCase().includes(query) ||
+                    peer.pubkey?.toLowerCase().includes(query)
+            );
+        }
+
+        const sorted = filtered.sort((a: any, b: any) => {
+            const param = this.sort?.param;
+            const dir = this.sort?.dir;
+            const sortType = this.sort?.type;
+            const isPeerType = type === 'peer';
+
+            if (!param || !dir || !sortType) return 0;
+
+            const getSortValue = (item: any) => {
+                if (isPeerType && param === 'alias') {
+                    return (
+                        this.nodes[item.pubkey]?.alias ||
+                        item.alias ||
+                        item.pubkey ||
+                        ''
+                    )
+                        .toString()
+                        .toLowerCase();
+                }
+
+                return item[param]?.toString().toLowerCase() || '';
+            };
+
+            const aVal = getSortValue(a);
+            const bVal = getSortValue(b);
+
+            if (sortType === 'numeric') {
+                const aNum = Number(aVal) || 0;
+                const bNum = Number(bVal) || 0;
+                return dir === 'DESC' ? bNum - aNum : aNum - bNum;
+            } else {
+                if (!aVal && !bVal) return 0;
+                if (!aVal) return dir === 'DESC' ? -1 : 1;
+                if (!bVal) return dir === 'DESC' ? 1 : -1;
+                return dir === 'DESC'
+                    ? bVal.localeCompare(aVal)
+                    : aVal.localeCompare(bVal);
+            }
+        });
+
+        return sorted;
+    };
+
+    private filterChannels = () => {
+        this.filteredChannels = this.filter(
+            this.enrichedChannels,
+            'channel'
+        ) as Channel[];
+    };
+
+    private filterPendingChannels = () => {
+        this.filteredPendingChannels = this.filter(
+            this.enrichedPendingChannels,
+            'channel'
+        ) as Channel[];
+    };
+
+    private filterClosedChannels = () => {
+        this.filteredClosedChannels = this.filter(
+            this.enrichedClosedChannels,
+            'channel'
+        ) as Channel[];
+    };
+
+    private filterPeers = () => {
+        this.filteredPeers = this.filter(this.peers, 'peer') as Peer[];
+    };
+
+    public getNodeInfo = (pubkey: string) => {
+        this.loading = true;
+
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Timeout')), 10000);
+        });
+
+        return Promise.race([
+            timeoutPromise,
+            BackendUtils.getNodeInfo([pubkey])
+        ])
+            .then((data: any) => {
+                runInAction(() => {
+                    this.loading = false;
+                    if (data?.node?.alias)
+                        this.aliasMap.set(pubkey, data.node.alias);
+                });
+                return data.node;
+            })
+            .catch(() => {
+                this.loading = false;
+                this.aliasMap.set(pubkey, localeString('general.unknown'));
+            });
+    };
+
+    private enrichChannels = async (
+        channels: Array<Channel>,
+        setPendingHtlcs?: boolean
+    ): Promise<Channel[]> => {
+        if (channels.length === 0) return [];
+
+        const channelsWithMissingAliases = channels?.filter(
+            (c) =>
+                c.channelId != null &&
+                this.aliasesByChannelId[c.channelId] == null
+        );
+        const channelsWithMissingNodeInfos = channels?.filter(
+            (c) => this.nodes[c.remotePubkey] == null
+        );
+        const publicKeysOfToBeLoadedNodeInfos = chain(
+            channelsWithMissingAliases.concat(channelsWithMissingNodeInfos)
+        )
+            .map((c) => c.remotePubkey)
+            .uniq()
+            .value();
+
+        this.loading = true;
+        await Promise.all(
+            publicKeysOfToBeLoadedNodeInfos.map(
+                async (remotePubKey: string) => {
+                    if (this.settingsStore.implementation !== 'cln-rest') {
+                        const nodeInfo = await this.getNodeInfo(remotePubKey);
+                        if (!nodeInfo) return;
+                        this.nodes[remotePubKey] = nodeInfo;
+                    }
+                }
+            )
+        );
+
+        runInAction(() => {
+            for (const channel of channelsWithMissingAliases) {
+                const nodeInfo = this.nodes[channel.remotePubkey];
+                const alias =
+                    nodeInfo?.alias || fixedAliases[channel.remotePubkey];
+                if (alias) {
+                    this.aliasesByChannelId[channel.channelId!] = alias;
+                    this.aliasesByPubkey[channel.remotePubkey] = alias;
+                }
+            }
+
+            if (setPendingHtlcs) this.pendingHTLCs = [];
+
+            let haveAnnouncedChannels = false;
+            for (const channel of channels) {
+                if (
+                    !haveAnnouncedChannels &&
+                    !channel.private &&
+                    channel.isActive
+                ) {
+                    haveAnnouncedChannels = true;
+                }
+                if (channel.alias == null) {
+                    channel.alias =
+                        this.nodes[channel.remotePubkey]?.alias ||
+                        this.aliasesByChannelId[channel.channelId!];
+                }
+                channel.displayName =
+                    channel.alias ||
+                    channel.remotePubkey ||
+                    channel.channelId ||
+                    localeString('models.Channel.unknownId');
+
+                if (BackendUtils.isLNDBased() && setPendingHtlcs) {
+                    channel.pending_htlcs?.forEach((htlc: any) => {
+                        htlc.channelDisplayName = channel.displayName;
+                    });
+
+                    this.pendingHTLCs.push(...channel.pending_htlcs);
+                }
+            }
+            this.haveAnnouncedChannels = haveAnnouncedChannels;
+
+            if (this.pendingHTLCs.length > 0) {
+                console.log('Pending HTLCs', this.pendingHTLCs);
+            }
+
+            this.loading = false;
+        });
+
+        if (
+            this.settingsStore.implementation === 'ldk-node' &&
+            setPendingHtlcs
+        ) {
+            try {
+                const data = await BackendUtils.getPayments();
+                const pendingPayments = (data?.payments || []).filter(
+                    (p: any) => p.status === 'IN_FLIGHT'
+                );
+                runInAction(() => {
+                    for (const p of pendingPayments) {
+                        this.pendingHTLCs.push({
+                            incoming: false,
+                            amount: p.value_sat || p.value || 0,
+                            hash_lock: p.payment_hash || '',
+                            expiration_height: 0
+                        });
+                    }
+                });
+            } catch (e) {
+                console.log('LDK Node: Failed to fetch pending payments', e);
+            }
+        }
+
+        return channels;
+    };
+
+    @action
+    private getChannelsError = () => {
+        this.hasChannelData = false;
+        this.channels = [];
+        this.largestChannelSats = 0;
+        this.totalOutbound = 0;
+        this.totalOutboundOffline = 0;
+        this.totalInbound = 0;
+        this.totalOffline = 0;
+        this.error = true;
+        this.loading = false;
+        this.closingChannel = false;
+    };
+
+    @action
+    public getChannels = () => {
+        this.loading = true;
+
+        const loadPromises = [
+            // The channel list and its totals are accumulated into locals and
+            // published in one go once the fetch succeeds. Zeroing them up
+            // front would make every refresh briefly report an empty wallet to
+            // observers (payment method selection, Receive's inbound checks,
+            // the channels header), and refreshes are frequent.
+            BackendUtils.getChannels().then((data: any) => {
+                const channels = data.channels.map(
+                    (channel: any) => new Channel(channel)
+                );
+                let largestChannelSats = new BigNumber(0);
+                let totalInbound = new BigNumber(0);
+                let totalOutbound = new BigNumber(0);
+                let totalOutboundOffline = new BigNumber(0);
+                let totalOffline = new BigNumber(0);
+                channels.forEach((channel: Channel) => {
+                    const channelRemoteBalance = new BigNumber(
+                        channel.receivingCapacity
+                    );
+                    const channelLocalBalance = new BigNumber(
+                        channel.sendingCapacity
+                    );
+                    const channelTotal =
+                        channelRemoteBalance.plus(channelLocalBalance);
+                    if (channelTotal.gt(largestChannelSats))
+                        largestChannelSats = channelTotal;
+                    if (!channel.isActive) {
+                        totalOffline = totalOffline.plus(channelTotal);
+                        totalOutboundOffline =
+                            totalOutboundOffline.plus(channelLocalBalance);
+                    } else {
+                        totalInbound = totalInbound.plus(channelRemoteBalance);
+                        totalOutbound = totalOutbound.plus(channelLocalBalance);
+                    }
+                });
+                runInAction(() => {
+                    this.largestChannelSats = largestChannelSats.toNumber();
+                    this.totalInbound = totalInbound.toNumber();
+                    this.totalOutbound = totalOutbound.toNumber();
+                    this.totalOutboundOffline = totalOutboundOffline.toNumber();
+                    this.totalOffline = totalOffline.toNumber();
+                    this.channels = channels;
+                    this.hasChannelData = true;
+                });
+            })
+        ];
+
+        if (BackendUtils.supportsClosedChannels()) {
+            loadPromises.push(
+                BackendUtils.getClosedChannels().then((data: any) => {
+                    const closedChannels = data.channels.map(
+                        (channel: any) => new ClosedChannel(channel)
+                    );
+                    this.closedChannels = closedChannels;
+                })
+            );
+        }
+
+        if (BackendUtils.supportsPendingChannels()) {
+            loadPromises.push(
+                BackendUtils.getPendingChannels().then((data: any) => {
+                    const pendingOpenChannels = data.pending_open_channels.map(
+                        (pending: any) => {
+                            pending.channel.pendingOpen = true;
+                            pending.channel.confirmations_until_active =
+                                pending.confirmations_until_active;
+                            pending.channel.confirmation_height =
+                                pending.confirmation_height;
+                            return new Channel(pending.channel);
+                        }
+                    );
+                    const pendingCloseChannels =
+                        data.pending_closing_channels.map((pending: any) => {
+                            pending.channel.pendingClose = true;
+                            pending.channel.closing_txid = pending.closing_txid;
+                            return new Channel(pending.channel);
+                        });
+                    const forceCloseChannels =
+                        data.pending_force_closing_channels.map(
+                            (pending: any) => {
+                                pending.channel.blocks_til_maturity =
+                                    pending.blocks_til_maturity;
+                                pending.channel.forceClose = true;
+                                pending.channel.closing_txid =
+                                    pending.closing_txid;
+                                return new Channel(pending.channel);
+                            }
+                        );
+                    const waitCloseChannels = data.waiting_close_channels.map(
+                        (pending: any) => {
+                            pending.channel.closing = true;
+                            return new Channel(pending.channel);
+                        }
+                    );
+                    this.pendingChannels = pendingOpenChannels
+                        .concat(pendingCloseChannels)
+                        .concat(forceCloseChannels)
+                        .concat(waitCloseChannels);
+                    // Push close-side limbo (cooperative close + force-close
+                    // timelocks + waiting-close confirmations) to BalanceStore
+                    // so BalancePane can render it next to pendingOpenBalance.
+                    this.balanceStore.setPendingCloseBalance(
+                        data.total_limbo_balance || 0,
+                        getCooperativeCloses(data.waiting_close_channels),
+                        getForceCloses(data.pending_force_closing_channels)
+                    );
+                })
+            );
+        }
+
+        return Promise.all(loadPromises)
+            .then(() => {
+                runInAction(() => {
+                    this.loading = false;
+                    this.error = false;
+                });
+                return;
+            })
+            .catch(() => this.getChannelsError());
+    };
+
+    // For embedded LND: polls getChannels until at least one channel is online
+    // This is useful because channels may take time to come online after node startup
+    @action
+    public getChannelsWithPolling = async (
+        pollingIntervalMs: number = 3000,
+        maxAttempts: number = 20
+    ): Promise<void> => {
+        let attempts = 0;
+
+        const pollChannels = async (): Promise<void> => {
+            attempts++;
+            await this.getChannels();
+
+            // If no open channels, no need to poll
+            if (this.channels.length === 0) {
+                return;
+            }
+
+            // Check if at least one channel is active (online)
+            const hasActiveChannel = this.channels.some(
+                (channel) => channel.isActive
+            );
+
+            if (hasActiveChannel) {
+                return;
+            }
+
+            // If we've exceeded max attempts, stop polling
+            if (attempts >= maxAttempts) {
+                console.log(
+                    'ChannelsStore: Max polling attempts reached, stopping poll'
+                );
+                return;
+            }
+
+            // Wait and try again
+            await new Promise((resolve) =>
+                setTimeout(resolve, pollingIntervalMs)
+            );
+            return pollChannels();
+        };
+
+        return pollChannels();
+    };
+
+    @action
+    public closeChannel = async (
+        channelPoint?: CloseChannelRequest,
+        channelId?: string,
+        satPerVbyte?: string,
+        forceClose?: boolean | string,
+        deliveryAddress?: string
+    ) => {
+        this.closeChannelErr = null;
+        this.closingChannel = true;
+
+        let urlParams: Array<any> = [];
+        const implementation = this.settingsStore.implementation;
+
+        if (implementation === 'cln-rest') {
+            // Core Lightning
+            urlParams = [channelId, forceClose];
+        } else if (channelPoint) {
+            // lnd
+            const { funding_txid_str, output_index } = channelPoint;
+
+            urlParams = [
+                funding_txid_str,
+                output_index,
+                forceClose,
+                satPerVbyte,
+                deliveryAddress
+            ];
+        }
+
+        if (implementation === 'lightning-node-connect') {
+            // the LNC backend settles on close_pending, on an error, or after
+            // its own timeout, so no forced resolution is needed here
+            return await BackendUtils.closeChannel(urlParams)
+                .then(() => {
+                    this.handleChannelClose();
+                    return true;
+                })
+                .catch((error: Error) => {
+                    this.handleChannelCloseError(error);
+                    return true;
+                });
+        } else {
+            let settled = false;
+            return await Promise.race([
+                new Promise((resolve) => {
+                    BackendUtils.closeChannel(urlParams)
+                        .then(() => {
+                            if (settled) return;
+                            settled = true;
+                            this.handleChannelClose();
+                            resolve(true);
+                        })
+                        .catch((error: Error) => {
+                            if (settled) return;
+                            settled = true;
+                            this.handleChannelCloseError(error);
+                            resolve(true);
+                        });
+                }),
+                // LND REST call tends to time out, so let's put a 6 second
+                // forced resolution, as true errors will typically throw
+                // before that time. The settled flag ensures the call's
+                // eventual result (e.g. the 30s REST timeout on the
+                // streaming close call) can't fire handlers after the
+                // forced resolution has already succeeded
+                new Promise(async (resolve) => {
+                    await new Promise((res) => setTimeout(res, 6000));
+                    if (!settled) {
+                        settled = true;
+                        this.handleChannelClose();
+                    }
+                    resolve(true);
+                })
+            ]);
+        }
+    };
+
+    @action
+    public handleChannelClose = () => {
+        this.closeChannelErr = null;
+        this.error = false;
+        this.closingChannel = false;
+        this.refreshAfterCloseAttempt();
+    };
+
+    @action
+    public handleChannelCloseError = (error: Error) => {
+        this.closeChannelErr = errorToUserFriendly(error);
+        this.closingChannel = false;
+        // The node can still close the channel after reporting an error,
+        // e.g. when it negotiates the closing fee with the peer itself.
+        // A failed close request says nothing about the channel list, so
+        // it isn't cleared here. If the node is unreachable, the refresh
+        // fails as well and clears it, like any failed channel fetch
+        this.refreshAfterCloseAttempt();
+    };
+
+    // A close moves the channel from the open to the pending channels and
+    // its funds from the lightning balance to the pending close balance.
+    // Reloading only the channels would show those funds under both until
+    // the next balance refresh.
+    private refreshAfterCloseAttempt = () => {
+        this.getChannels();
+        this.balanceStore.getCombinedBalance();
+    };
+
+    @action
+    public connectPeer = async (
+        request: OpenChannelRequest,
+        perm?: boolean,
+        connectPeerOnly?: boolean,
+        silent?: boolean
+    ) => {
+        this.resetOpenChannel(silent);
+        this.channelRequest = undefined;
+        if (!silent) this.connectingToPeer = true;
+
+        // additional channels only matter when opening, the connect-peer-only
+        // mode hides them from the form
+        const missingHost =
+            !request.host ||
+            (!connectPeerOnly &&
+                request.additionalChannels?.some((channel) => !channel.host));
+
+        if (missingHost) {
+            // there is no address to dial, so surface an error
+            // instead of sending the backend a malformed request
+            if (!silent) {
+                this.connectingToPeer = false;
+                this.errorMsgPeer = localeString(
+                    'views.OpenChannel.hostRequired'
+                );
+                this.errorPeerConnect = true;
+            }
+            return;
+        }
+
+        // connect to additional channel peers
+        if (request.additionalChannels) {
+            for (let i = 0; i < request.additionalChannels?.length; i++) {
+                const channel = request.additionalChannels[i];
+                await BackendUtils.connectPeer({
+                    addr: {
+                        pubkey: channel.node_pubkey_string,
+                        host: channel.host
+                    },
+                    perm
+                }).catch(() => {});
+            }
+        }
+
+        return await new Promise((resolve, reject) => {
+            BackendUtils.connectPeer({
+                addr: {
+                    pubkey: request.node_pubkey_string,
+                    host: request.host
+                },
+                perm
+            })
+                .then(async () => {
+                    runInAction(() => {
+                        if (!silent) {
+                            this.errorPeerConnect = false;
+                            this.connectingToPeer = false;
+                            this.errorMsgPeer = null;
+                            this.peerSuccess = true;
+                        }
+                        if (!connectPeerOnly) this.channelRequest = request;
+                    });
+                    resolve(true);
+                })
+                .catch((error: Error) => {
+                    runInAction(() => {
+                        if (!silent) {
+                            this.connectingToPeer = false;
+                            this.peerSuccess = false;
+                        }
+                        this.channelSuccess = false;
+                        // handle error
+                        if (
+                            error &&
+                            error.toString() &&
+                            error.toString().includes('already')
+                        ) {
+                            if (!connectPeerOnly) {
+                                this.channelRequest = request;
+                            } else {
+                                if (!silent) {
+                                    this.errorMsgPeer =
+                                        errorToUserFriendly(error);
+                                    this.errorPeerConnect = true;
+                                }
+                            }
+                            resolve(true);
+                        } else {
+                            if (!silent) {
+                                this.errorMsgPeer = errorToUserFriendly(error);
+                                this.errorPeerConnect = true;
+                            }
+                            reject(this.errorMsgPeer);
+                        }
+                    });
+                });
+        });
+    };
+
+    @action
+    public getPeers = async () => {
+        this.loading = true;
+        this.error = false;
+        this.errorListPeers = null;
+
+        try {
+            const response = await BackendUtils.listPeers();
+            runInAction(() => {
+                this.peers = response.map((peerData: any) => {
+                    return new Peer(peerData);
+                });
+                this.filterPeers();
+                this.loading = false;
+            });
+        } catch (error: any) {
+            runInAction(() => {
+                this.error = true;
+                this.errorListPeers =
+                    error.message ??
+                    localeString('views.ChannelsPane.peersFetchFailed');
+                this.loading = false;
+            });
+        }
+    };
+
+    @action
+    public disconnectPeer = async (pubkey: string) => {
+        this.loading = true;
+        this.error = false;
+        this.errorDisconnectPeer = null;
+
+        try {
+            const isPeer = this.peers.find(
+                (peer: Peer) => peer.pubkey === pubkey
+            );
+
+            if (!isPeer) {
+                throw new Error(
+                    localeString('views.ChannelsPane.peerNotFound')
+                );
+            }
+            const res = await BackendUtils.disconnectPeer(pubkey);
+
+            if (!res) {
+                throw new Error(
+                    localeString('views.ChannelsPane.peerNotConnected')
+                );
+            }
+
+            runInAction(() => {
+                this.peers = this.peers.filter(
+                    (peer: Peer) => peer.pubkey !== pubkey
+                );
+                this.filterPeers();
+                this.loading = false;
+            });
+
+            return true;
+        } catch (error: any) {
+            this.error = true;
+            this.errorDisconnectPeer =
+                error?.message?.message ||
+                error?.message ||
+                localeString('views.ChannelsPane.disconnectPeerFailed');
+            this.loading = false;
+
+            return false;
+        }
+    };
+
+    private handleChannelOpen = (request: any, outputs?: any) => {
+        const { account, sat_per_vbyte, utxos } = request;
+
+        const inputs: any = [];
+
+        if (utxos) {
+            utxos.forEach((input: any) => {
+                const [txid_str, output_index] = input.split(':');
+                inputs.push({
+                    txid_str,
+                    output_index: Number(output_index)
+                });
+            });
+        }
+
+        const fundPsbtRequest = {
+            raw: {
+                outputs,
+                inputs
+            },
+            sat_per_vbyte: Number(sat_per_vbyte),
+            spend_unconfirmed: true,
+            account
+        };
+
+        BackendUtils.fundPsbt(fundPsbtRequest)
+            .then(async (data: any) => {
+                let funded_psbt: string = new FundedPsbt(
+                    data.funded_psbt
+                ).getFormatted();
+
+                await BackendUtils.signPsbt({ funded_psbt })
+                    .then((data: any) => {
+                        if (data.signed_psbt) funded_psbt = data.signed_psbt;
+                        return;
+                    })
+                    .catch((e: any) => {
+                        console.log('signPsbt err', e);
+                        return;
+                    });
+
+                for (let i = 0; i < this.pending_chan_ids.length - 1; i++) {
+                    const pending_chan_id = this.pending_chan_ids[i];
+                    await BackendUtils.fundingStateStep({
+                        psbt_verify: {
+                            funded_psbt,
+                            pending_chan_id,
+                            skip_finalize: true
+                        }
+                    });
+                }
+
+                BackendUtils.fundingStateStep({
+                    psbt_verify: {
+                        funded_psbt,
+                        pending_chan_id:
+                            this.pending_chan_ids[
+                                this.pending_chan_ids.length - 1
+                            ]
+                    }
+                })
+                    .then((data: any) => {
+                        if (data.publish_error) {
+                            const errorMsg = errorToUserFriendly(
+                                data.publish_error
+                            );
+                            runInAction(() => {
+                                this.errorMsgChannel = errorMsg;
+                                this.output_index = null;
+                                this.funding_txid_str = null;
+                                this.errorOpenChannel = true;
+                                this.openingChannel = false;
+                                this.channelRequest = null;
+                                this.peerSuccess = false;
+                                this.channelSuccess = false;
+                            });
+                        } else {
+                            const formattedPsbt = new FundedPsbt(
+                                funded_psbt
+                            ).getFormatted();
+
+                            // Attempt finalize here
+                            BackendUtils.fundingStateStep({
+                                psbt_finalize: {
+                                    signed_psbt: formattedPsbt,
+                                    pending_chan_id:
+                                        this.pending_chan_ids[
+                                            this.pending_chan_ids.length - 1
+                                        ]
+                                }
+                            })
+                                .then((data: any) => {
+                                    runInAction(() => {
+                                        if (data.publish_error) {
+                                            this.funded_psbt = formattedPsbt;
+                                            this.output_index = null;
+                                            this.funding_txid_str = null;
+                                            this.errorOpenChannel = true;
+                                            this.openingChannel = false;
+                                            this.channelRequest = null;
+                                            this.peerSuccess = false;
+                                            this.channelSuccess = false;
+                                        } else {
+                                            // success case
+                                            this.errorOpenChannel = false;
+                                            this.openingChannel = false;
+                                            this.errorMsgChannel = null;
+                                            this.channelRequest = null;
+                                            this.channelSuccess = true;
+                                        }
+                                    });
+                                })
+                                .catch(() =>
+                                    runInAction(() => {
+                                        this.funded_psbt = formattedPsbt;
+                                        this.output_index = null;
+                                        this.funding_txid_str = null;
+                                        this.errorOpenChannel = true;
+                                        this.openingChannel = false;
+                                        this.channelRequest = null;
+                                        this.peerSuccess = false;
+                                        this.channelSuccess = false;
+                                    })
+                                );
+                        }
+                    })
+                    .catch((error: any) => {
+                        const errorMsg = errorToUserFriendly(error);
+                        runInAction(() => {
+                            this.errorMsgChannel = errorMsg;
+                            this.output_index = null;
+                            this.funding_txid_str = null;
+                            this.errorOpenChannel = true;
+                            this.openingChannel = false;
+                            this.channelRequest = null;
+                            this.peerSuccess = false;
+                            this.channelSuccess = false;
+                        });
+                    });
+            })
+            .catch((error: any) => {
+                const errorMsg = errorToUserFriendly(error);
+                runInAction(() => {
+                    this.errorMsgChannel = errorMsg;
+                    this.output_index = null;
+                    this.funding_txid_str = null;
+                    this.errorOpenChannel = true;
+                    this.openingChannel = false;
+                    this.channelRequest = null;
+                    this.peerSuccess = false;
+                    this.channelSuccess = false;
+                });
+            });
+    };
+
+    @action
+    private handleChannelOpenError = (error: Error) => {
+        this.errorMsgChannel = errorToUserFriendly(error);
+        this.output_index = null;
+        this.funding_txid_str = null;
+        this.errorOpenChannel = true;
+        this.openingChannel = false;
+        this.channelRequest = null;
+        this.peerSuccess = false;
+        this.channelSuccess = false;
+        this.connectingToPeer = false;
+    };
+
+    @action
+    private openChannel = (request: OpenChannelRequest) => {
+        const multipleChans =
+            request?.additionalChannels &&
+            request.additionalChannels?.length > 0;
+
+        // LDK Node needs the host for openChannel, other backends don't
+        if (this.settingsStore.implementation !== 'ldk-node') {
+            delete request.host;
+        }
+        // LDK Node doesn't support announced channels - always force private
+        if (this.settingsStore.implementation === 'ldk-node') {
+            request.privateChannel = true;
+        }
+        if (!multipleChans) delete request.additionalChannels;
+
+        this.peerSuccess = false;
+        this.channelSuccess = false;
+        this.openOutcomeUnknown = false;
+        this.openingChannel = true;
+
+        if (request?.account !== 'default' || multipleChans) {
+            const outputs: any = {};
+            if (multipleChans) {
+                let base_psbt = '';
+                request.funding_shim = {
+                    psbt_shim: {
+                        base_psbt,
+                        pending_chan_id: randomBytes(32).toString('base64'),
+                        no_publish: true
+                    }
+                };
+
+                BackendUtils.openChannelStream(request)
+                    .then(async (data: any) => {
+                        const { psbt_fund, pending_chan_id } = data.result;
+                        this.pending_chan_ids.push(pending_chan_id);
+                        outputs[psbt_fund.funding_address] =
+                            psbt_fund.funding_amount;
+
+                        base_psbt = psbt_fund.psbt;
+                        for (
+                            let i = 0;
+                            i < (request?.additionalChannels?.length || 0);
+                            i++
+                        ) {
+                            if (
+                                request.additionalChannels &&
+                                request.additionalChannels.length !== i + 1
+                            ) {
+                                request.funding_shim = {
+                                    psbt_shim: {
+                                        base_psbt,
+                                        pending_chan_id:
+                                            randomBytes(32).toString('base64'),
+                                        no_publish: true
+                                    }
+                                };
+                                request.node_pubkey_string =
+                                    request.additionalChannels[
+                                        i
+                                    ].node_pubkey_string;
+                                request.local_funding_amount =
+                                    request.additionalChannels[
+                                        i
+                                    ].satAmount.toString();
+
+                                // open one at a time, so the final channel
+                                // starts the funding flow only after every
+                                // earlier channel has its funding output
+                                try {
+                                    const data: any =
+                                        await BackendUtils.openChannelStream(
+                                            request
+                                        );
+                                    const { psbt_fund, pending_chan_id } =
+                                        data.result;
+                                    this.pending_chan_ids.push(pending_chan_id);
+                                    outputs[psbt_fund.funding_address] =
+                                        psbt_fund.funding_amount;
+                                    base_psbt = psbt_fund.psbt;
+                                } catch (error: any) {
+                                    // stop the batch here
+                                    this.handleChannelOpenError(error);
+                                    return;
+                                }
+                            } else if (request.additionalChannels) {
+                                // final chan
+                                request.funding_shim = {
+                                    psbt_shim: {
+                                        base_psbt,
+                                        pending_chan_id:
+                                            randomBytes(32).toString('base64'),
+                                        no_publish: false
+                                    }
+                                };
+                                request.node_pubkey_string =
+                                    request.additionalChannels[
+                                        i
+                                    ].node_pubkey_string;
+                                request.local_funding_amount =
+                                    request.additionalChannels[
+                                        i
+                                    ].satAmount.toString();
+
+                                BackendUtils.openChannelStream(request)
+                                    .then((data: any) => {
+                                        const { psbt_fund, pending_chan_id } =
+                                            data.result;
+                                        this.pending_chan_ids.push(
+                                            pending_chan_id
+                                        );
+                                        outputs[psbt_fund.funding_address] =
+                                            psbt_fund.funding_amount;
+                                        this.handleChannelOpen(
+                                            request,
+                                            outputs
+                                        );
+                                    })
+                                    .catch((error: Error) => {
+                                        this.handleChannelOpenError(error);
+                                    });
+                            }
+                        }
+                    })
+                    .catch((error: Error) => {
+                        this.handleChannelOpenError(error);
+                    });
+            } else {
+                request.funding_shim = {
+                    psbt_shim: {
+                        base_psbt: '',
+                        pending_chan_id: randomBytes(32).toString('base64')
+                    }
+                };
+                BackendUtils.openChannelStream(request)
+                    .then((data: any) => {
+                        const { psbt_fund, pending_chan_id } = data.result;
+                        this.pending_chan_ids.push(pending_chan_id);
+                        if (psbt_fund?.funding_address) {
+                            outputs[psbt_fund.funding_address] =
+                                psbt_fund.funding_amount;
+                        }
+                        this.handleChannelOpen(request, outputs);
+                    })
+                    .catch((error: Error) => {
+                        this.handleChannelOpenError(error);
+                    });
+            }
+        } else {
+            // lets a timed out open be found among the node's channels
+            const memo =
+                BackendUtils.isLNDBased() && BackendUtils.supportsChannelMemo()
+                    ? makeOpenMemo()
+                    : undefined;
+            if (memo) request.memo = memo;
+
+            const seq = ++this.openChannelSeq;
+            const isCurrent = () => seq === this.openChannelSeq;
+            this.syncOpensInFlight++;
+
+            const onOpened = (data: any) =>
+                runInAction(() => {
+                    if (!isCurrent()) return;
+                    this.output_index = data.output_index;
+                    this.funding_txid_str = data.funding_txid_str;
+                    this.errorOpenChannel = false;
+                    this.openingChannel = false;
+                    this.errorMsgChannel = null;
+                    this.channelRequest = null;
+                    this.channelSuccess = true;
+                    this.connectingToPeer = false;
+                });
+
+            BackendUtils.openChannelSync(request)
+                .then(onOpened)
+                .catch(async (error: Error) => {
+                    // a timed out open may still have gone through on any
+                    // backend (e.g. CLN past the 30s REST timeout); only
+                    // opens that carry a memo can be looked up
+                    if (isRequestTimeout(error)) {
+                        // the screen has moved on, so a lookup result
+                        // would be dropped anyway
+                        if (!isCurrent()) return;
+                        const opened = memo
+                            ? await findChannelByMemo(
+                                  () => BackendUtils.getPendingChannels(),
+                                  () => BackendUtils.getChannels(),
+                                  memo
+                              )
+                            : undefined;
+                        if (opened) {
+                            onOpened(opened);
+                            return;
+                        }
+                        runInAction(() => {
+                            if (!isCurrent()) return;
+                            this.errorMsgChannel = localeString(
+                                'stores.ChannelsStore.openOutcomeUnknown'
+                            );
+                            this.output_index = null;
+                            this.funding_txid_str = null;
+                            this.errorOpenChannel = true;
+                            this.openOutcomeUnknown = true;
+                            this.openingChannel = false;
+                            this.connectingToPeer = false;
+                            this.channelRequest = null;
+                            this.peerSuccess = false;
+                            this.channelSuccess = false;
+                        });
+                        return;
+                    }
+                    const errorMsg = errorToUserFriendly(error);
+                    runInAction(() => {
+                        if (!isCurrent()) return;
+                        this.errorMsgChannel = errorMsg;
+                        this.output_index = null;
+                        this.funding_txid_str = null;
+                        this.errorOpenChannel = true;
+                        this.openingChannel = false;
+                        this.connectingToPeer = false;
+                        this.channelRequest = null;
+                        this.peerSuccess = false;
+                        this.channelSuccess = false;
+                    });
+                })
+                .finally(() =>
+                    runInAction(() => {
+                        this.syncOpensInFlight--;
+                    })
+                );
+        }
+    };
+
+    @action
+    public loadChannelInfo = (chanId: string, deleteBeforeLoading = false) => {
+        this.loading = true;
+
+        if (deleteBeforeLoading) {
+            if (this.chanInfo[chanId]) delete this.chanInfo[chanId];
+        }
+
+        BackendUtils.getChannelInfo(chanId)
+            .then((data: any) => {
+                const rawChannels = data.channels || data;
+                const channels = BackendUtils.isLNDBased()
+                    ? rawChannels
+                    : rawChannels[0];
+                runInAction(() => {
+                    this.chanInfo[chanId] = new ChannelInfo(channels);
+                    this.loading = false;
+                });
+            })
+            .catch((error: any) => {
+                runInAction(() => {
+                    this.errorMsgPeer = error.toString();
+                    if (this.chanInfo[chanId]) delete this.chanInfo[chanId];
+                    this.loading = false;
+                });
+            });
+    };
+
+    // for CLNRest nodes, because the backend does not return the node policy.
+    // Other backends (e.g. LND) can also land here when one side of a
+    // channel has no policy in the graph yet, so bail out unless the
+    // CLNRest-shaped fields are actually present.
+    public getNodePolicy = (chanId: string): RoutingPolicy | undefined => {
+        const chanInfo = this.chanInfo[chanId];
+        if (
+            chanInfo?.delay == null ||
+            chanInfo.htlc_minimum_msat == null ||
+            chanInfo.base_fee_millisatoshi == null ||
+            chanInfo.fee_per_millionth == null ||
+            chanInfo.htlc_maximum_msat == null
+        ) {
+            return undefined;
+        }
+        return {
+            time_lock_delta: chanInfo.delay,
+            min_htlc: chanInfo.htlc_minimum_msat.toString(),
+            fee_base_msat: chanInfo.base_fee_millisatoshi.toString(),
+            fee_rate_milli_msat: chanInfo.fee_per_millionth.toString(),
+            disabled: false,
+            max_htlc_msat: chanInfo.htlc_maximum_msat.toString(),
+            last_update:
+                chanInfo.last_update != null
+                    ? Number(chanInfo.last_update)
+                    : undefined
+        };
+    };
+
+    public setChannelsType = (type: ChannelsType) => {
+        this.channelsType = type;
+    };
+
+    public setChannelsView = (view: ChannelsView) => {
+        this.channelsView = view;
+    };
+
+    public toggleSearch = (type: ChannelsView) => {
+        if (type === ChannelsView.Channels) {
+            this.showChannelsSearch = !this.showChannelsSearch;
+        } else {
+            this.showPeersSearch = !this.showPeersSearch;
+        }
+    };
+}

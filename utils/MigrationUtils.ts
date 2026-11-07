@@ -1,0 +1,1662 @@
+import { Platform } from 'react-native';
+import * as Keychain from 'react-native-keychain';
+
+import { sleep } from './SleepUtils';
+import { settingsStore } from '../stores/Stores';
+import {
+    Settings,
+    DEFAULT_SETTINGS,
+    DEFAULT_FIAT_RATES_SOURCE,
+    DEFAULT_FIAT,
+    DEFAULT_LSP_MAINNET,
+    DEFAULT_LSP_TESTNET,
+    DEFAULT_NOSTR_RELAYS,
+    localeMigrationMapping,
+    DEFAULT_NEUTRINO_PEERS_MAINNET,
+    DEFAULT_NEUTRINO_PEERS_TESTNET,
+    DEFAULT_LSPS1_HOST_MAINNET,
+    DEFAULT_LSPS1_HOST_TESTNET,
+    DEFAULT_LSPS1_PUBKEY_MAINNET,
+    DEFAULT_LSPS1_PUBKEY_TESTNET,
+    DEFAULT_LSPS1_REST_MAINNET,
+    DEFAULT_LSPS1_REST_TESTNET,
+    DEFAULT_LSP_MUTINYNET,
+    DEFAULT_LSPS1_REST_MUTINYNET,
+    DEFAULT_SPEEDLOADER,
+    DEFAULT_SWAP_HOST_MAINNET,
+    DEFAULT_SWAP_HOST_TESTNET,
+    LEGACY_ZEUS_SWAP_HOST_MAINNET,
+    LEGACY_ZEUS_SWAP_HOST_TESTNET,
+    RETIRED_SWAP_HOSTS_MAINNET,
+    RETIRED_SWAP_HOSTS_MAINNET_V2,
+    RETIRED_THEMES,
+    DEFAULT_THEME,
+    DEFAULT_NOSTR_RELAYS_2023,
+    PosEnabled,
+    DEFAULT_SLIDE_TO_PAY_THRESHOLD,
+    STORAGE_KEY,
+    LEGACY_CURRENCY_CODES_KEY,
+    CURRENCY_CODES_KEY
+} from '../stores/SettingsStore';
+
+import { SETTINGS_VERSION } from './SettingsVersion';
+
+import { LEGACY_NOTES_KEY, NOTES_KEY } from '../stores/NotesStore';
+import { LEGACY_CONTACTS_KEY, CONTACTS_KEY } from '../stores/ContactStore';
+import {
+    LEGACY_LAST_CHANNEL_BACKUP_STATUS,
+    LEGACY_LAST_CHANNEL_BACKUP_TIME,
+    LAST_CHANNEL_BACKUP_STATUS,
+    LAST_CHANNEL_BACKUP_TIME
+} from '../stores/ChannelBackupStore';
+import {
+    LEGACY_ADDRESS_ACTIVATED_STRING,
+    LEGACY_HASHES_STORAGE_STRING,
+    ADDRESS_ACTIVATED_STRING,
+    HASHES_STORAGE_STRING
+} from '../stores/LightningAddressStore';
+import {
+    LEGACY_POS_HIDDEN_KEY,
+    LEGACY_POS_STANDALONE_KEY,
+    POS_HIDDEN_KEY,
+    POS_STANDALONE_KEY
+} from '../stores/PosStore';
+import {
+    LEGACY_CATEGORY_KEY,
+    LEGACY_PRODUCT_KEY,
+    CATEGORY_KEY,
+    PRODUCT_KEY
+} from '../stores/InventoryStore';
+import { LEGACY_UNIT_KEY, UNIT_KEY } from '../stores/UnitsStore';
+import {
+    LEGACY_HIDDEN_ACCOUNTS_KEY,
+    HIDDEN_ACCOUNTS_KEY
+} from '../stores/UTXOsStore';
+
+import { LEGACY_LSPS1_ORDERS_KEY, LSPS_ORDERS_KEY } from '../stores/LSPStore';
+
+import { LNC_STORAGE_KEY, hash } from '../backends/LNC/credentialStore';
+
+import {
+    SWAPS_KEY,
+    REVERSE_SWAPS_KEY,
+    SWAPS_RESCUE_KEY,
+    SWAPS_LAST_USED_KEY,
+    purgeLegacyRescueKeyFiles,
+    unlinkRescueKeyStagingFile
+} from '../utils/SwapUtils';
+
+import {
+    TimePeriod,
+    displayFromExpirySeconds,
+    expirySecondsFromInput
+} from '../utils/ExpiryUtils';
+
+import {
+    LEGACY_ACTIVITY_FILTERS_KEY,
+    ACTIVITY_FILTERS_KEY
+} from '../stores/ActivityStore';
+
+const LEGACY_IS_BACKED_UP_KEY = 'backup-complete';
+export const IS_BACKED_UP_KEY = 'backup-complete-v2';
+
+const KEYCHAIN_MIGRATION_KEY = 'ios-keychain-cloud-sync-migration-v1';
+const CASHU_MIGRATION_KEY = 'ios-keychain-cashu-fix-v1';
+
+import EncryptedStorage from 'react-native-encrypted-storage';
+import Storage, {
+    KEY_PREFIX,
+    getInternetPasswordServers,
+    getRawItem,
+    setRawLocalItem
+} from '../storage';
+
+export const KEYCHAIN_DESYNC_KEY = 'keychain-desync-v1';
+
+class MigrationsUtils {
+    // One-shot migration flags that have read 'true' in this process.
+    // They are only ever written as 'true', and Clear All Data (the only
+    // thing that removes them) calls clearConfirmedFlags. getSettings
+    // runs the flag-gated migrations before every queued settings write,
+    // so caching saves one keychain read per flag per write (#4903).
+    private confirmedFlags = new Set<string>();
+
+    private async readFlag(key: string): Promise<string | null> {
+        if (this.confirmedFlags.has(key)) return 'true';
+        const value = await EncryptedStorage.getItem(key);
+        if (value === 'true') this.confirmedFlags.add(key);
+        return value;
+    }
+
+    private async writeFlag(key: string): Promise<void> {
+        await EncryptedStorage.setItem(key, 'true');
+        this.confirmedFlags.add(key);
+    }
+
+    public clearConfirmedFlags(): void {
+        this.confirmedFlags.clear();
+    }
+
+    /**
+     * Migrates a key from old keychain (cloud or local) to new Storage namespace.
+     * Safe order: read → write → verify → delete
+     *
+     * Since Storage now uses a "zeus:" prefix, old and new keys are in different
+     * namespaces, so deleting old keys won't affect newly written data.
+     */
+    private async migrateKey(key: string): Promise<string | null> {
+        try {
+            // 1. Check if already migrated to new Storage namespace
+            const existingData = await Storage.getItem(key);
+            if (existingData) return existingData;
+
+            // 2. Read from old keychain (local first, then cloud)
+            const credentials = await this.readFromOldKeychain(key);
+            if (!credentials) return null;
+
+            console.log(`[Migration] Moving ${key} to Local Storage...`);
+
+            // iOS: Add delay after read to allow iCloud sync
+            if (Platform.OS === 'ios') {
+                await sleep(500);
+            }
+
+            // 3. Write to new Storage namespace (zeus:key)
+            const writeSuccess = await Storage.setItem(
+                key,
+                credentials.password
+            );
+
+            if (!writeSuccess) {
+                throw new Error(
+                    `Write failed for ${key}. Storage.setItem returned false.`
+                );
+            }
+
+            // 4. Verify the write by reading the value back and comparing it
+            // against what was sent. A truthiness check passes on any
+            // non-empty value, so a write that landed as something else -
+            // another writer between step 1 and here, or a partial write -
+            // is reported as a successful migration. Step 1 rules out a
+            // pre-existing copy: it returns early if the key holds anything,
+            // so a mismatch here is newer than what we wrote, not older.
+            const verifyData = await Storage.getItem(key);
+            if (verifyData !== credentials.password) {
+                throw new Error(
+                    `Verification failed for ${key}. Read-back does not match what was written.`
+                );
+            }
+
+            // iOS: Add delay before delete to allow iCloud sync
+            if (Platform.OS === 'ios') {
+                await sleep(500);
+            }
+
+            // 5. Only delete old keychain entries after successful write + verify
+            await this.deleteFromOldKeychain(key);
+
+            console.log(`[Migration] Successfully migrated ${key}`);
+            return credentials.password;
+        } catch (error) {
+            console.error(`[Migration] Failed to migrate ${key}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Reads from old keychain (without zeus: prefix).
+     * Tries local keychain first, then cloud keychain as fallback.
+     */
+    private async readFromOldKeychain(key: string) {
+        try {
+            // Try local keychain first
+            const localCreds = await Keychain.getInternetCredentials(key);
+            if (localCreds) return localCreds;
+
+            // Fallback to cloud keychain
+            return await Keychain.getInternetCredentials(key, {
+                cloudSync: true
+            });
+        } catch (e) {
+            console.warn(`[Migration] Read error for ${key}`, e);
+            return null;
+        }
+    }
+
+    /**
+     * Deletes from old keychain entries (without zeus: prefix).
+     *
+     * DISABLED: To prevent potential data loss during migration.
+     * Old keychain entries will remain but are harmless (orphaned data).
+     * The new Storage uses a "zeus:" prefix, so old and new keys don't conflict.
+     */
+    private async deleteFromOldKeychain(key: string) {
+        // Safety measure: skip deletion to prevent any potential data loss
+        console.log(`[Migration] Skipping delete for ${key} (safety measure)`);
+        return;
+
+        // Original delete code - commented out for safety:
+        // try {
+        //     await Keychain.resetInternetCredentials({
+        //         server: key,
+        //         cloudSync: true
+        //     });
+        // } catch (e) {
+        //     console.warn(
+        //         `[Migration] Error deleting from cloud keychain: ${key}`,
+        //         e
+        //     );
+        // }
+        // try {
+        //     await Keychain.resetInternetCredentials({ server: key });
+        // } catch (e) {
+        //     console.warn(
+        //         `[Migration] Error deleting from local keychain: ${key}`,
+        //         e
+        //     );
+        // }
+    }
+
+    private async migrateCashuForNode(lndDir: string) {
+        console.log(`Migrating Cashu data for node: ${lndDir}`);
+
+        const cashuKeys = [
+            `${lndDir}-cashu-mintUrls`,
+            `${lndDir}-cashu-selectedMintUrl`,
+            `${lndDir}-cashu-totalBalanceSats`,
+            `${lndDir}-cashu-invoices`,
+            `${lndDir}-cashu-payments`,
+            `${lndDir}-cashu-received-tokens`,
+            `${lndDir}-cashu-sent-tokens`,
+            `${lndDir}-cashu-seed-version`,
+            `${lndDir}-cashu-seed-phrase`,
+            `${lndDir}-cashu-seed`
+        ];
+
+        for (const key of cashuKeys) {
+            await this.migrateKey(key);
+        }
+
+        const mintUrlsJson = await this.migrateKey(`${lndDir}-cashu-mintUrls`);
+
+        if (mintUrlsJson) {
+            try {
+                const mintUrls = JSON.parse(mintUrlsJson);
+                if (Array.isArray(mintUrls)) {
+                    for (const mintUrl of mintUrls) {
+                        const walletId = `${lndDir}==${mintUrl}`;
+                        const walletKeys = [
+                            `${walletId}-mintInfo`,
+                            `${walletId}-counter`,
+                            `${walletId}-proofs`,
+                            `${walletId}-balance`,
+                            `${walletId}-pubkey`
+                        ];
+                        for (const wKey of walletKeys) {
+                            await this.migrateKey(wKey);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn(`Failed to parse mintUrls for ${lndDir}`, e);
+            }
+        }
+    }
+
+    public async legacySettingsMigrations(settings: string) {
+        const newSettings = JSON.parse(settings) as Settings;
+        if (!newSettings.fiatRatesSource) {
+            newSettings.fiatRatesSource = DEFAULT_FIAT_RATES_SOURCE;
+        }
+
+        // migrate fiat settings from older versions
+        if (!newSettings.fiat || newSettings.fiat === 'Disabled') {
+            newSettings.fiat = DEFAULT_FIAT;
+            newSettings.fiatEnabled = false;
+        } else if (newSettings.fiatEnabled == null) {
+            newSettings.fiatEnabled = true;
+        }
+
+        // set default LSPs if not defined
+        if (newSettings.enableLSP === undefined) {
+            newSettings.enableLSP = true;
+        }
+        if (!newSettings.lspMainnet) {
+            newSettings.lspMainnet = DEFAULT_LSP_MAINNET;
+        }
+        if (!newSettings.lspTestnet) {
+            newSettings.lspTestnet = DEFAULT_LSP_TESTNET;
+        }
+
+        // Every top-level group missing from this blob (lightningAddress,
+        // etc.) is backfilled from DEFAULT_SETTINGS by
+        // applyMissingSettingsGroups below.
+
+        // migrate locale to ISO 639-1
+        if (
+            newSettings.locale != null &&
+            localeMigrationMapping[newSettings.locale]
+        ) {
+            newSettings.locale = localeMigrationMapping[newSettings.locale];
+        }
+
+        // One-shot MOD_KEY migrations. The flags are still read (once —
+        // this path only runs while a legacy blob exists) so migrations a
+        // previous app version already applied are not re-applied over
+        // values the user has since changed. They are no longer written,
+        // and no intermediate setSettings calls are made: the migrated
+        // blob is persisted once by storageMigrationV2 and stamped with
+        // settingsVersion, which the modern load path checks instead
+        // (#4470: fewer keystore ops).
+        const [mod, mod2, mod3, mod4, mod5, mod6, mod7, mod8] =
+            await Promise.all([
+                EncryptedStorage.getItem('lsp-taproot-mod'),
+                EncryptedStorage.getItem('lsp-preview-mod'),
+                EncryptedStorage.getItem('neutrino-peers-mod1'),
+                EncryptedStorage.getItem('lsps1-hosts1'),
+                EncryptedStorage.getItem('millisat_amounts'),
+                EncryptedStorage.getItem('egs-host'),
+                EncryptedStorage.getItem('bimodal-bug-9085'),
+                EncryptedStorage.getItem('nostr-relays-2024')
+            ]);
+
+        if (!mod) {
+            newSettings.requestSimpleTaproot = true;
+        }
+
+        if (!mod2) {
+            if (newSettings?.lspMainnet === 'https://lsp-preview.lnolymp.us') {
+                newSettings.lspMainnet = DEFAULT_LSP_MAINNET;
+            }
+            if (newSettings?.lspTestnet === 'https://testnet-lsp.lnolymp.us') {
+                newSettings.lspTestnet = DEFAULT_LSP_TESTNET;
+            }
+        }
+
+        if (!mod3) {
+            const neutrinoPeersMainnetOld = [
+                'btcd1.lnolymp.us',
+                'btcd2.lnolymp.us',
+                'btcd-mainnet.lightning.computer',
+                'node.eldamar.icu',
+                'noad.sathoarder.com'
+            ];
+            if (
+                JSON.stringify(newSettings?.neutrinoPeersMainnet) ===
+                JSON.stringify(neutrinoPeersMainnetOld)
+            ) {
+                newSettings.neutrinoPeersMainnet =
+                    DEFAULT_NEUTRINO_PEERS_MAINNET;
+            }
+        }
+
+        if (!mod4) {
+            if (!newSettings?.lsps1HostMainnet) {
+                newSettings.lsps1HostMainnet = DEFAULT_LSPS1_HOST_MAINNET;
+            }
+            if (!newSettings?.lsps1HostTestnet) {
+                newSettings.lsps1HostTestnet = DEFAULT_LSPS1_HOST_TESTNET;
+            }
+            if (!newSettings?.lsps1PubkeyMainnet) {
+                newSettings.lsps1PubkeyMainnet = DEFAULT_LSPS1_PUBKEY_MAINNET;
+            }
+            if (!newSettings?.lsps1PubkeyTestnet) {
+                newSettings.lsps1PubkeyTestnet = DEFAULT_LSPS1_PUBKEY_TESTNET;
+            }
+            if (!newSettings?.lsps1RestMainnet) {
+                newSettings.lsps1RestMainnet = DEFAULT_LSPS1_REST_MAINNET;
+            }
+            if (!newSettings?.lsps1RestTestnet) {
+                newSettings.lsps1RestTestnet = DEFAULT_LSPS1_REST_TESTNET;
+            }
+
+            if (!newSettings?.lsps1Token) {
+                newSettings.lsps1Token = '';
+            }
+        }
+
+        if (!mod5) {
+            if (!newSettings?.display?.showMillisatoshiAmounts) {
+                if (!newSettings.display) {
+                    newSettings.display = {
+                        showMillisatoshiAmounts: true
+                    };
+                } else {
+                    newSettings.display.showMillisatoshiAmounts = true;
+                }
+            }
+        }
+
+        if (!mod6) {
+            if (!newSettings?.speedloader) {
+                newSettings.speedloader = DEFAULT_SPEEDLOADER;
+                newSettings.customSpeedloader = '';
+            }
+        }
+
+        // switch off bimodal pathfinding while bug exists
+        // https://github.com/lightningnetwork/lnd/issues/9085
+        if (!mod7) {
+            if (newSettings?.bimodalPathfinding) {
+                newSettings.bimodalPathfinding = false;
+            }
+        }
+
+        if (!mod8) {
+            if (
+                JSON.stringify(newSettings?.lightningAddress?.nostrRelays) ===
+                JSON.stringify(DEFAULT_NOSTR_RELAYS_2023)
+            ) {
+                newSettings.lightningAddress.nostrRelays = DEFAULT_NOSTR_RELAYS;
+            }
+        }
+
+        // migrate old POS squareEnabled setting to posEnabled
+        if (newSettings?.pos?.squareEnabled) {
+            newSettings.pos.posEnabled = PosEnabled.Square;
+            newSettings.pos.squareEnabled = false;
+        }
+
+        if (!newSettings.neutrinoPeersMainnet) {
+            newSettings.neutrinoPeersMainnet = DEFAULT_NEUTRINO_PEERS_MAINNET;
+        }
+        if (!newSettings.neutrinoPeersTestnet) {
+            newSettings.neutrinoPeersTestnet = DEFAULT_NEUTRINO_PEERS_TESTNET;
+        }
+
+        if (newSettings.payments == null) {
+            newSettings.payments = {
+                slideToPayThreshold: DEFAULT_SLIDE_TO_PAY_THRESHOLD
+            };
+        } else if (newSettings.payments.slideToPayThreshold == null) {
+            newSettings.payments.slideToPayThreshold =
+                DEFAULT_SLIDE_TO_PAY_THRESHOLD;
+        }
+
+        // shared one-shot migrations + settingsVersion stamp; the result
+        // is persisted once by storageMigrationV2
+        await this.applySettingsMigrations(newSettings);
+
+        // Any top-level group not already set above (lightningAddress,
+        // privacy, ecash, networking, ...) gets the same default a fresh
+        // install would get. Groups this function has already narrowly
+        // repaired (display, payments) are left as they are. Runs AFTER
+        // applySettingsMigrations, matching the queued path in
+        // runSettingsMigrations: a version-gated migration must see the
+        // blob as the install actually had it, not a group we have
+        // already defaulted, or a migration that builds a group from
+        // older flat keys (guarded on that group being absent) would
+        // find it already present and skip, discarding the user's
+        // legacy values.
+        this.applyMissingSettingsGroups(newSettings);
+
+        return newSettings;
+    }
+
+    // ------------------------------------------------------------------
+    // Consolidated settings migrations (#4470)
+    //
+    // The blob carries a settingsVersion stamp (SETTINGS_VERSION in
+    // SettingsStore). A stamped blob skips migrations entirely, so the
+    // modern load path performs zero migration keystore reads per boot.
+    // Blobs without the stamp (installs predating it) get a one-time
+    // consolidation: the retired per-migration EncryptedStorage flags
+    // are read once so already-applied migrations are not re-applied
+    // over values the user has since changed, the needed mutations run
+    // in memory, and a single write (applySettingsUpdate's persist on
+    // the modern path, storageMigrationV2's on the legacy path) lands
+    // the result together with the stamp, so migrated values and
+    // migration state can no longer diverge if we crash mid-way. The
+    // retired flags are never written again; leftover entries are inert
+    // and cleared by Clear All Data.
+    //
+    // Adding a future migration: bump SETTINGS_VERSION, add a pure
+    // mutation, and gate its block in applySettingsMigrations on
+    // `priorVersion < N` (N = the bumped version), leaving the existing
+    // blocks untouched. The gate-consistency test in
+    // MigrationUtils.test.ts fails whenever the highest gate and
+    // SETTINGS_VERSION diverge, in either direction. A version number is
+    // FROZEN the moment any public build (alphas and TestFlight included)
+    // ships stamping it: blobs already stamped N skip every `< N` block
+    // forever, so a migration added after that point must take a fresh
+    // bump, never share a shipped one.
+    // ------------------------------------------------------------------
+    public async runSettingsMigrations(
+        settings: any,
+        inQueue: boolean = false
+    ) {
+        if (inQueue) {
+            // Inside the updateSettings queue's critical section
+            // (applySettingsUpdate -> getSettings(fromQueue) -> here):
+            // mutate in memory only. applySettingsUpdate persists right
+            // after this getSettings returns, so the migrated values and
+            // stamp ride that single serialized write; a write of our own
+            // would be redundant, and enqueueing would deadlock behind
+            // the very task awaiting us. The fact arrives as a parameter
+            // because settingsStore.settingsUpdateInProgress only says
+            // some update is in flight somewhere, not that we are on the
+            // queue's call stack.
+            if ((settings?.settingsVersion ?? 0) < SETTINGS_VERSION) {
+                await this.applySettingsMigrations(settings);
+            }
+            // Independent of the version gate above and always run: see
+            // applyMissingSettingsGroups.
+            this.applyMissingSettingsGroups(settings);
+            return settings;
+        }
+
+        if (
+            (settings?.settingsVersion ?? 0) >= SETTINGS_VERSION &&
+            !this.hasMissingSettingsGroups(settings)
+        ) {
+            return settings;
+        }
+
+        // Outside the queue `settings` is a snapshot that can go stale
+        // before any write lands (the blob read and the flag reads all
+        // yield), and a concurrent updateSettings landing in that window
+        // would be clobbered by persisting it. Never touch the snapshot;
+        // enqueue a no-op update instead: its critical section re-runs
+        // getSettings on fresh state, which re-enters this method through
+        // the inQueue branch above.
+        return await settingsStore.updateSettings({});
+    }
+
+    // Keys of DEFAULT_SETTINGS whose default value is a plain settings
+    // group (not a scalar or an array) and which are entirely absent from
+    // `settings`. Read-only.
+    private missingSettingsGroupKeys(settings: any): string[] {
+        return Object.keys(DEFAULT_SETTINGS).filter((key) => {
+            const defaultValue = (DEFAULT_SETTINGS as any)[key];
+            const isGroup =
+                defaultValue !== null &&
+                typeof defaultValue === 'object' &&
+                !Array.isArray(defaultValue);
+            return isGroup && settings?.[key] === undefined;
+        });
+    }
+
+    // True when `settings` is missing at least one top-level group that
+    // DEFAULT_SETTINGS defines. Read-only.
+    public hasMissingSettingsGroups(settings: any): boolean {
+        return this.missingSettingsGroupKeys(settings).length > 0;
+    }
+
+    // Per-group field overrides applied on top of DEFAULT_SETTINGS when
+    // backfilling a missing group, so a group's absence and its backfilled
+    // presence read the same to call sites that treat an absent group as
+    // that field being off (clipboard reads, mempool-rate fetches).
+    private static readonly BACKFILL_OVERRIDES: {
+        [group: string]: Record<string, unknown>;
+    } = {
+        privacy: { clipboard: false, enableMempoolRates: false }
+    };
+
+    // Backfills any top-level settings group that is entirely missing from
+    // `settings`, from DEFAULT_SETTINGS (with BACKFILL_OVERRIDES applied).
+    // Only a group that is entirely ABSENT is filled in; a group that
+    // already exists, even partially populated, is left untouched.
+    //
+    // Deliberately independent of SETTINGS_VERSION and safe to call on
+    // every settings load: a no-op once every group is present. (#4776)
+    public applyMissingSettingsGroups(settings: any): boolean {
+        const missing = this.missingSettingsGroupKeys(settings);
+        for (const key of missing) {
+            // Deep clone: DEFAULT_SETTINGS is a module-level object shared
+            // by every caller. Assigning the same nested object reference
+            // would let a later in-place mutation of the backfilled group
+            // (rather than a full replacement) corrupt the shared default
+            // for the next settings load.
+            settings[key] = {
+                ...JSON.parse(JSON.stringify((DEFAULT_SETTINGS as any)[key])),
+                ...MigrationsUtils.BACKFILL_OVERRIDES[key]
+            };
+        }
+        return missing.length > 0;
+    }
+
+    // Applies every migration between the blob's prior version and the
+    // current SETTINGS_VERSION in memory and stamps the blob. Does NOT
+    // persist: applySettingsUpdate (modern path) and storageMigrationV2
+    // (legacy path) own the write.
+    public async applySettingsMigrations(settings: any): Promise<boolean> {
+        const priorVersion = settings?.settingsVersion ?? 0;
+
+        let changed = false;
+        if (priorVersion < 1) {
+            // v0 -> v1 consolidation. The version gate keeps these blocks
+            // exactly-once: a blob stamped at 1+ already ran them when it
+            // was stamped, but the retired flags below are never written
+            // under the stamp system, so without the gate a later version
+            // bump would re-apply them over values the user has since
+            // restored (and pay the five flag reads again).
+            const [
+                rgsDone,
+                olympusDone,
+                swapDone,
+                retiredSwapDone,
+                expiryDone
+            ] = await Promise.all([
+                EncryptedStorage.getItem('rgs-defaults-v2'),
+                EncryptedStorage.getItem('zeuslsp-hosts-2026'),
+                EncryptedStorage.getItem('swap-hosts-boltz'),
+                EncryptedStorage.getItem('swap-hosts-retired-eldamar'),
+                EncryptedStorage.getItem('invoices-expiry-display-fix-v2')
+            ]);
+
+            if (!rgsDone) {
+                changed = this.applyRgsDefaultsToV2(settings) || changed;
+            }
+            if (!olympusDone) {
+                changed = this.applyOlympusHostsToZeusLsp(settings) || changed;
+            }
+            if (!swapDone) {
+                changed = this.applySwapHostsToBoltz(settings) || changed;
+            }
+            if (!retiredSwapDone) {
+                changed = this.applyRetiredSwapHosts(settings) || changed;
+            }
+            if (!expiryDone) {
+                changed = this.applyInvoiceExpiryDisplay(settings) || changed;
+            }
+        }
+
+        if (priorVersion < 2) {
+            // v1 -> v2: retire Boltz and SwapMarket. No flag read: the stamp
+            // alone keeps this exactly-once. The v1 'swap-hosts-retired-eldamar'
+            // flag must not gate it either — that flag is set on every install
+            // that ran the Eldamar migration, which covers nearly every user
+            // still pinned to these hosts.
+            changed =
+                this.applyRetiredSwapHosts(
+                    settings,
+                    RETIRED_SWAP_HOSTS_MAINNET_V2
+                ) || changed;
+        }
+
+        if (priorVersion < 3) {
+            // v2 -> v3: move users off the removed themes. No flag read:
+            // the stamp alone keeps this exactly-once.
+            changed = this.applyRetiredThemes(settings) || changed;
+        }
+
+        settings.settingsVersion = SETTINGS_VERSION;
+        return changed;
+    }
+
+    // Rewrite persisted v1 RGS endpoints to their v2 equivalents in a
+    // single pass. RGS v1 snapshots lack node announcement data (features
+    // + addresses), which LDK requires to deliver BOLT 12 invoice_requests
+    // to an offer's introduction node. Only values still equal to a known
+    // old default are touched; custom URLs are left alone. Unset values
+    // need no migration — runtime falls back to the (updated)
+    // RGS_SERVERS_MAINNET / RGS_SERVERS_TESTNET constants. Mappings are
+    // scoped per network so a URL is only rewritten on nodes of the
+    // network it belongs to. Supersedes migrateRgsDefaultToZeus
+    // ('rgs-default-zeus'), which pinned the then-default into every
+    // mainnet node; the values it wrote are matched here, so its flag is
+    // no longer consulted and unset values are no longer pinned (#4470:
+    // fewer keystore ops).
+    public applyRgsDefaultsToV2(settings: any): boolean {
+        const urlMigrationsByNetwork: {
+            [network: string]: { [oldUrl: string]: string };
+        } = {
+            mainnet: {
+                'https://rgs.zeusln.com/snapshot':
+                    'https://rgs.zeusln.com/snapshot/v2',
+                'https://rapidsync.lightningdevkit.org/snapshot':
+                    'https://rapidsync.lightningdevkit.org/snapshot/v2'
+            },
+            testnet: {
+                'https://rapidsync.lightningdevkit.org/testnet/snapshot':
+                    'https://rapidsync.lightningdevkit.org/testnet/v2/snapshot'
+            }
+        };
+
+        let changed = false;
+        if (settings?.nodes && Array.isArray(settings.nodes)) {
+            for (const node of settings.nodes) {
+                const urlMigrations =
+                    urlMigrationsByNetwork[node.ldkNetwork || 'mainnet'];
+                if (
+                    urlMigrations &&
+                    node.ldkRgsServer &&
+                    urlMigrations[node.ldkRgsServer]
+                ) {
+                    node.ldkRgsServer = urlMigrations[node.ldkRgsServer];
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    // Rewrite persisted old-default Olympus LSP hosts (lnolymp.us) to the
+    // new zeuslsp.com hosts. Only values still equal to an old default are
+    // touched; custom hosts are left alone. Unset values need no migration —
+    // runtime falls back to the (updated) DEFAULT_* constants.
+    public applyOlympusHostsToZeusLsp(settings: any): boolean {
+        const hostMigrations: Array<{
+            settingsKey: string;
+            oldHost: string;
+            newHost: string;
+        }> = [
+            {
+                settingsKey: 'lspMainnet',
+                oldHost: 'https://0conf.lnolymp.us',
+                newHost: DEFAULT_LSP_MAINNET
+            },
+            {
+                settingsKey: 'lspTestnet',
+                oldHost: 'https://testnet-0conf.lnolymp.us',
+                newHost: DEFAULT_LSP_TESTNET
+            },
+            {
+                settingsKey: 'lspMutinynet',
+                oldHost: 'https://mutinynet-flow.lnolymp.us',
+                newHost: DEFAULT_LSP_MUTINYNET
+            },
+            {
+                settingsKey: 'lsps1RestMainnet',
+                oldHost: 'https://lsps1.lnolymp.us',
+                newHost: DEFAULT_LSPS1_REST_MAINNET
+            },
+            {
+                settingsKey: 'lsps1RestTestnet',
+                oldHost: 'https://testnet-lsps1.lnolymp.us',
+                newHost: DEFAULT_LSPS1_REST_TESTNET
+            },
+            {
+                settingsKey: 'lsps1RestMutinynet',
+                oldHost: 'https://mutinynet-lsps1.lnolymp.us',
+                newHost: DEFAULT_LSPS1_REST_MUTINYNET
+            }
+        ];
+
+        let changed = false;
+        for (const { settingsKey, oldHost, newHost } of hostMigrations) {
+            if (settings?.[settingsKey] === oldHost) {
+                settings[settingsKey] = newHost;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    // migrate users pointed at the retired ZEUS swap server to the default
+    // host. Named for Boltz, which was the default when this was written; it
+    // rewrites to whatever DEFAULT_SWAP_HOST_* currently is.
+    public applySwapHostsToBoltz(settings: any): boolean {
+        let changed = false;
+        if (settings?.swaps) {
+            if (settings.swaps.hostMainnet === LEGACY_ZEUS_SWAP_HOST_MAINNET) {
+                settings.swaps.hostMainnet = DEFAULT_SWAP_HOST_MAINNET;
+                changed = true;
+            }
+            if (settings.swaps.hostTestnet === LEGACY_ZEUS_SWAP_HOST_TESTNET) {
+                settings.swaps.hostTestnet = DEFAULT_SWAP_HOST_TESTNET;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    // Move users pinned to a swap provider that is no longer usable back to the
+    // default host. Without this their persisted host no longer matches any
+    // entry in SWAP_HOST_KEYS_MAINNET, so the provider dropdown renders no
+    // selection while every swap request goes to a dead endpoint. Custom
+    // hosts are left alone: a retired host is only rewritten when it was
+    // picked from the dropdown, not typed in as a custom host.
+    //
+    // Takes the list to apply because retirements are frozen per settings
+    // version (see RETIRED_SWAP_HOSTS_MAINNET): the v1 block applies the v1
+    // list under its 'swap-hosts-retired-eldamar' flag, the v2 block applies
+    // RETIRED_SWAP_HOSTS_MAINNET_V2, and neither re-applies the other's.
+    // Defaults to the v1 list so the v1 block stays unchanged.
+    public applyRetiredSwapHosts(
+        settings: any,
+        retiredHosts: string[] = RETIRED_SWAP_HOSTS_MAINNET
+    ): boolean {
+        let changed = false;
+        if (
+            settings?.swaps?.hostMainnet &&
+            retiredHosts.includes(settings.swaps.hostMainnet)
+        ) {
+            settings.swaps.hostMainnet = DEFAULT_SWAP_HOST_MAINNET;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // Move users whose selected theme was removed back to the default
+    // theme. Without this themeColor() falls through to the Dark palette
+    // for them, and their persisted value matches no entry in THEME_KEYS,
+    // so the theme picker cannot show it as selected.
+    public applyRetiredThemes(settings: any): boolean {
+        if (
+            settings?.display?.theme &&
+            RETIRED_THEMES.includes(settings.display.theme)
+        ) {
+            settings.display.theme = DEFAULT_THEME;
+            return true;
+        }
+        return false;
+    }
+
+    // Repair invoice expiry display fields when out of sync with
+    // `expirySeconds`. Older installs default `expiry: '3600'` and
+    // never stored `timePeriod`/`expirySeconds`, so once Receive.tsx's
+    // fallback for `timePeriod` became 'Hours' the UI rendered
+    // "3600 hours" while invoices still expired in one hour. Derive a
+    // canonical seconds value (stored → derived from expiry+timePeriod
+    // → '3600') and rewrite all three fields from it when anything is
+    // missing or inconsistent (#4149). Value-conditional: consistent
+    // settings are left untouched.
+    public applyInvoiceExpiryDisplay(settings: any): boolean {
+        const invoices: any = settings?.invoices;
+        if (!invoices) return false;
+
+        const storedValid = Number(invoices.expirySeconds) > 0;
+        const derivable = invoices.expiry && invoices.timePeriod;
+        const canonical = storedValid
+            ? invoices.expirySeconds
+            : derivable
+            ? expirySecondsFromInput(
+                  invoices.expiry,
+                  invoices.timePeriod as TimePeriod
+              )
+            : '3600';
+
+        const inconsistent =
+            !invoices.expiry ||
+            !invoices.timePeriod ||
+            invoices.expirySeconds !== canonical ||
+            expirySecondsFromInput(
+                invoices.expiry,
+                invoices.timePeriod as TimePeriod
+            ) !== canonical;
+
+        if (!inconsistent) return false;
+
+        const repaired = displayFromExpirySeconds(canonical);
+        invoices.expiry = repaired.expiry;
+        invoices.timePeriod = repaired.timePeriod;
+        invoices.expirySeconds = canonical;
+        return true;
+    }
+
+    // Rescue-key export file cleanup, in two parts with different cadences.
+    //
+    // Staging file: the save-dialog export stages the mnemonic in app cache
+    // and removes it before returning, so this unlink is belt-and-braces for
+    // saves interrupted by a crash and for files staged by earlier
+    // share-sheet builds of this flow. It must run at most once per process:
+    // getSettings() is not a launch-only path, it also runs on every
+    // transition to the background (App.tsx stealth-mode handler), and the
+    // Android save dialog backgrounds the app while the staging file still
+    // has to be readable - saveDocuments() only copies it once the app is
+    // back in the foreground. Unlinking on every call deletes the source out
+    // from under the copy and fails the export.
+    //
+    // Legacy shared-storage files: older builds' download wrote the mnemonic
+    // as plaintext JSON into shared storage (Android public Downloads, iOS
+    // Files-visible Documents), with nothing ever deleting it. One-shot
+    // best-effort cleanup; the flag is set regardless of outcome because a
+    // failed unlink (scoped storage, file owned by a previous install) can
+    // never succeed on a later retry.
+    //
+    // Runs before the settings blob is even read, so it covers both the
+    // legacy and modern (zeus-settings-v2) paths.
+    private rescueKeyStagingPurged = false;
+
+    public async purgeRescueKeyFiles() {
+        if (!this.rescueKeyStagingPurged) {
+            this.rescueKeyStagingPurged = true;
+            await unlinkRescueKeyStagingFile();
+        }
+
+        const MOD_KEY_RESCUE_FILE = 'rescue-key-file-cleanup';
+        const modRescueFile = await this.readFlag(MOD_KEY_RESCUE_FILE);
+        if (modRescueFile) return;
+
+        await purgeLegacyRescueKeyFiles();
+
+        await this.writeFlag(MOD_KEY_RESCUE_FILE);
+    }
+
+    public async storageMigrationV2(settings: any) {
+        const migrationTasks = [];
+
+        // Settings migration
+        console.log('Attemping settings migration');
+        const settingsMigration = Storage.setItem(STORAGE_KEY, settings).then(
+            (writeSuccess) => {
+                console.log('Settings migration status', writeSuccess);
+                return writeSuccess;
+            }
+        );
+        migrationTasks.push(settingsMigration);
+
+        // Contacts migration
+        const contactsMigration = (async () => {
+            try {
+                const contacts = await EncryptedStorage.getItem(
+                    LEGACY_CONTACTS_KEY
+                );
+                if (contacts) {
+                    console.log('Attemping contacts migration');
+                    const writeSuccess = await Storage.setItem(
+                        CONTACTS_KEY,
+                        contacts
+                    );
+                    console.log('Contacts migration status', writeSuccess);
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading contacts from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(contactsMigration);
+
+        // Notes migration
+        const notesMigration = (async () => {
+            try {
+                const storedKeys = await EncryptedStorage.getItem(
+                    LEGACY_NOTES_KEY
+                );
+                if (storedKeys) {
+                    const noteKeys = JSON.parse(storedKeys);
+                    console.log('Attemping notes migration');
+                    const writeSuccess = await Storage.setItem(
+                        NOTES_KEY,
+                        noteKeys
+                    );
+                    console.log('Notes keys migration status', writeSuccess);
+
+                    // Load all legacy notes
+                    const notesPromises = noteKeys.map(async (key: string) => {
+                        const note = await EncryptedStorage.getItem(key);
+                        if (note) {
+                            const writeSuccess = await Storage.setItem(
+                                key,
+                                note
+                            );
+                            console.log(
+                                `Notes keys migration status: ${key}`,
+                                writeSuccess
+                            );
+                            return writeSuccess;
+                        }
+                    });
+
+                    const noteResults = await Promise.all(notesPromises);
+                    return (
+                        writeSuccess &&
+                        noteResults.every((result) => result !== false)
+                    );
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading note keys from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(notesMigration);
+
+        // Lightning address migration
+        const lightningAddressMigration = (async () => {
+            try {
+                let activatedSuccess: any = true;
+                let hashesSuccess: any = true;
+
+                const activated = await EncryptedStorage.getItem(
+                    LEGACY_ADDRESS_ACTIVATED_STRING
+                );
+                if (activated) {
+                    console.log(
+                        'Attemping lightning address activated migration'
+                    );
+                    activatedSuccess = await Storage.setItem(
+                        ADDRESS_ACTIVATED_STRING,
+                        activated
+                    );
+                    console.log(
+                        'Lightning address activated migration status',
+                        activatedSuccess
+                    );
+                }
+
+                const hashes = await EncryptedStorage.getItem(
+                    LEGACY_HASHES_STORAGE_STRING
+                );
+                if (hashes) {
+                    console.log('Attemping lightning address hashes migration');
+                    hashesSuccess = await Storage.setItem(
+                        HASHES_STORAGE_STRING,
+                        hashes
+                    );
+                    console.log(
+                        'Lightning address hashes migration status',
+                        hashesSuccess
+                    );
+                }
+
+                return activatedSuccess && hashesSuccess;
+            } catch (error) {
+                console.error(
+                    'Error loading lightning address data from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(lightningAddressMigration);
+
+        // Backup status migration
+        const backupStatusMigration = (async () => {
+            try {
+                let statusSuccess: any = true;
+                let timeSuccess: any = true;
+
+                const status = await EncryptedStorage.getItem(
+                    LEGACY_LAST_CHANNEL_BACKUP_STATUS
+                );
+                if (status) {
+                    console.log('Attemping backup status migration');
+                    statusSuccess = await Storage.setItem(
+                        LAST_CHANNEL_BACKUP_STATUS,
+                        status
+                    );
+                    console.log(
+                        'Backup status migration status',
+                        statusSuccess
+                    );
+                }
+
+                const time = await EncryptedStorage.getItem(
+                    LEGACY_LAST_CHANNEL_BACKUP_TIME
+                );
+                if (time) {
+                    console.log('Attemping backup time migration');
+                    timeSuccess = await Storage.setItem(
+                        LAST_CHANNEL_BACKUP_TIME,
+                        time
+                    );
+                    console.log('Backup time migration status', timeSuccess);
+                }
+
+                return statusSuccess && timeSuccess;
+            } catch (error) {
+                console.error(
+                    'Error loading backup status from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(backupStatusMigration);
+
+        // POS migration
+        const posMigration = (async () => {
+            try {
+                let hiddenKeySuccess: any = true;
+                let standaloneKeySuccess: any = true;
+                let categoriesSuccess: any = true;
+                let productsSuccess: any = true;
+
+                const posHiddenKey = await EncryptedStorage.getItem(
+                    LEGACY_POS_HIDDEN_KEY
+                );
+                if (posHiddenKey) {
+                    console.log('Attemping POS hidden key migration');
+                    hiddenKeySuccess = await Storage.setItem(
+                        POS_HIDDEN_KEY,
+                        posHiddenKey
+                    );
+                    console.log(
+                        'POS hidden key migration status',
+                        hiddenKeySuccess
+                    );
+                }
+
+                const posStandaloneKey = await EncryptedStorage.getItem(
+                    LEGACY_POS_STANDALONE_KEY
+                );
+                if (posStandaloneKey) {
+                    console.log('Attemping POS standalone key migration');
+                    standaloneKeySuccess = await Storage.setItem(
+                        POS_STANDALONE_KEY,
+                        posStandaloneKey
+                    );
+                    console.log(
+                        'POS standalone key migration status',
+                        standaloneKeySuccess
+                    );
+                }
+
+                const categories = await EncryptedStorage.getItem(
+                    LEGACY_CATEGORY_KEY
+                );
+                if (categories) {
+                    console.log('Attemping POS categories migration');
+                    categoriesSuccess = await Storage.setItem(
+                        CATEGORY_KEY,
+                        categories
+                    );
+                    console.log(
+                        'POS categories migration status',
+                        categoriesSuccess
+                    );
+                }
+
+                const products = await EncryptedStorage.getItem(
+                    LEGACY_PRODUCT_KEY
+                );
+                if (products) {
+                    console.log('Attemping POS products migration');
+                    productsSuccess = await Storage.setItem(
+                        PRODUCT_KEY,
+                        products
+                    );
+                    console.log(
+                        'POS products migration status',
+                        productsSuccess
+                    );
+                }
+
+                return (
+                    hiddenKeySuccess &&
+                    standaloneKeySuccess &&
+                    categoriesSuccess &&
+                    productsSuccess
+                );
+            } catch (error) {
+                console.error(
+                    'Error loading POS data from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(posMigration);
+
+        // Units migration
+        const unitsMigration = (async () => {
+            try {
+                const units = await EncryptedStorage.getItem(LEGACY_UNIT_KEY);
+                if (units) {
+                    console.log('Attemping units migration');
+                    const writeSuccess = await Storage.setItem(UNIT_KEY, units);
+                    console.log('Units migration status', writeSuccess);
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading units data from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(unitsMigration);
+
+        // Hidden accounts migration
+        const hiddenAccountsMigration = (async () => {
+            try {
+                const accounts = await EncryptedStorage.getItem(
+                    LEGACY_HIDDEN_ACCOUNTS_KEY
+                );
+                if (accounts) {
+                    console.log('Attemping hidden accounts migration');
+                    const writeSuccess = await Storage.setItem(
+                        HIDDEN_ACCOUNTS_KEY,
+                        accounts
+                    );
+                    console.log(
+                        'Hidden accounts migration status',
+                        writeSuccess
+                    );
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading hidden accounts from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(hiddenAccountsMigration);
+
+        // Currency codes migration
+        const currencyCodesMigration = (async () => {
+            try {
+                const currencyCodes = await EncryptedStorage.getItem(
+                    LEGACY_CURRENCY_CODES_KEY
+                );
+                if (currencyCodes) {
+                    console.log('Attemping currency codes migration');
+                    const writeSuccess = await Storage.setItem(
+                        CURRENCY_CODES_KEY,
+                        currencyCodes
+                    );
+                    console.log(
+                        'Currency codes migration status',
+                        writeSuccess
+                    );
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading currency codes from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(currencyCodesMigration);
+
+        // Activity filters migration
+        const activityFiltersMigration = (async () => {
+            try {
+                const activityFilters = await EncryptedStorage.getItem(
+                    LEGACY_ACTIVITY_FILTERS_KEY
+                );
+                if (activityFilters) {
+                    console.log('Attemping activity filters migration');
+                    const writeSuccess = await Storage.setItem(
+                        ACTIVITY_FILTERS_KEY,
+                        activityFilters
+                    );
+                    console.log(
+                        'Activity filters migration status',
+                        writeSuccess
+                    );
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading activity filters from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(activityFiltersMigration);
+
+        // Embedded LND is backed up migration
+        const embeddedLndIsBackedUpMigration = (async () => {
+            try {
+                const embeddedLndIsBackedUp = await EncryptedStorage.getItem(
+                    LEGACY_IS_BACKED_UP_KEY
+                );
+                if (embeddedLndIsBackedUp) {
+                    console.log(
+                        'Attemping Embedded LND is backed up migration'
+                    );
+                    const writeSuccess = await Storage.setItem(
+                        IS_BACKED_UP_KEY,
+                        embeddedLndIsBackedUp
+                    );
+                    console.log(
+                        'Embedded LND is backed up migration status',
+                        writeSuccess
+                    );
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading Embedded LND is backed up from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(embeddedLndIsBackedUpMigration);
+
+        // LSPS1 orders migration
+        const lsps1OrdersMigration = (async () => {
+            try {
+                const lsps1orders = await EncryptedStorage.getItem(
+                    LEGACY_LSPS1_ORDERS_KEY
+                );
+                if (lsps1orders) {
+                    console.log('Attemping LSPS1 orders migration');
+                    const writeSuccess = await Storage.setItem(
+                        LSPS_ORDERS_KEY,
+                        lsps1orders
+                    );
+                    console.log('LSPS1 orders migration status', writeSuccess);
+                    return writeSuccess;
+                }
+            } catch (error) {
+                console.error(
+                    'Error loading LSPS1 orders from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(lsps1OrdersMigration);
+
+        // LNC migrations
+        const lncMigration = (async () => {
+            try {
+                const migrationPromises =
+                    settings?.nodes.map(async (node: any) => {
+                        if (node.implementation === 'lightning-node-connect') {
+                            const baseKey = `${LNC_STORAGE_KEY}:${hash(
+                                node.pairingPhrase
+                            )}`;
+                            const hostKey = `${baseKey}:host`;
+
+                            const baseKeyData: string =
+                                (await EncryptedStorage.getItem(baseKey)) ||
+                                '{}';
+
+                            console.log(
+                                'Attemping LNC base key migration',
+                                baseKey
+                            );
+                            const writeSuccess1 = await Storage.setItem(
+                                baseKey,
+                                JSON.parse(baseKeyData)
+                            );
+                            console.log(
+                                'LNC base key migration status',
+                                writeSuccess1
+                            );
+
+                            const hostKeyData = await EncryptedStorage.getItem(
+                                hostKey
+                            );
+
+                            console.log(
+                                'Attemping LNC host key migration',
+                                baseKey
+                            );
+                            const writeSuccess2 = await Storage.setItem(
+                                hostKey,
+                                hostKeyData
+                            );
+                            console.log(
+                                'LNC host key migration status',
+                                writeSuccess2
+                            );
+
+                            return writeSuccess1 && writeSuccess2;
+                        }
+                    }) || [];
+
+                const results = await Promise.all(migrationPromises);
+                return results.every((result) => result !== false);
+            } catch (error) {
+                console.error(
+                    'Error loading LNC data from encrypted storage',
+                    error
+                );
+                return false;
+            }
+        })();
+        migrationTasks.push(lncMigration);
+
+        const results = await Promise.all(migrationTasks);
+        console.log('storageMigrationV2 completed!', results);
+        return results.every((result) => result === true);
+    }
+
+    public async migrateCashuSeedVersion(cashuStore: any) {
+        // cashuStore is passed as 'any' to avoid circular dependency issues
+        // but it's an instance of CashuStore
+        // TODO fix circular dependency
+        if (
+            cashuStore.settingsStore?.implementation === 'embedded-lnd' &&
+            cashuStore.seedVersion === undefined
+        ) {
+            console.log('Migrating Cashu seed version to v1');
+            cashuStore.seedVersion = 'v1';
+            try {
+                await Storage.setItem(
+                    `${cashuStore.getNodeDir()}-cashu-seed-version`,
+                    'v1'
+                );
+                console.log('Cashu seed version migrated and saved as v1.');
+            } catch (error) {
+                console.error(
+                    'Error saving migrated Cashu seed version:',
+                    error
+                );
+            }
+        }
+    }
+
+    /**
+     * One-shot iOS repair for the react-native-keychain cloudSync bug
+     * (oblador/react-native-keychain#800; tracked for removal in
+     * ZeusLN/zeus#4403): every Storage write passed { cloudSync: false },
+     * which the unpatched library treated as true, so all zeus:-prefixed
+     * data (including the settings blob with wallet seeds) lived in the
+     * SYNCHRONIZABLE keychain partition and synced to iCloud Keychain. With the patched library, Storage reads
+     * the device-local partition, which is empty for existing users; this
+     * migration copies every zeus:* item from the synchronizable partition
+     * into the local one. It never deletes anything (migrations must stay
+     * non-destructive); removal of the synchronizable copies is the
+     * separate one-shot purge in KeychainPurgeUtils, which only runs after
+     * this migration's flag proves the local copies exist.
+     *
+     * Only zeus:* servers are copied: unprefixed synchronizable entries are
+     * stale pre-2026 legacy data, and copying them would resurrect old state
+     * into partitions the Keychain Recovery tool treats as meaningful.
+     *
+     * Copy-if-missing on purpose: if a crash interrupts the run and the user
+     * then writes settings (patched build writes locally), a retry must not
+     * clobber that fresh local data with the older synchronizable copy.
+     *
+     * No 500ms pacing sleeps here, unlike migrateKey: those mitigate iCloud
+     * latency around cross-device deletes (35aaf8897), and this migration
+     * performs local-only reads and writes.
+     */
+    public async keychainDesyncMigration() {
+        if (Platform.OS !== 'ios') return;
+
+        try {
+            const hasRun = await this.readFlag(KEYCHAIN_DESYNC_KEY);
+            if (hasRun === 'true') return;
+
+            console.log('Attempting keychain desync migration...');
+
+            const syncServers = (await getInternetPasswordServers(true)).filter(
+                (server) => server.startsWith(KEY_PREFIX)
+            );
+
+            // Failures are contained PER KEY: SecItemCopyMatching returns
+            // servers in arbitrary order, so aborting the loop on the first
+            // bad key would leave an arbitrary subset uncopied. Only the
+            // settings blob has a synchronizable-partition read fallback in
+            // getSettings; any other uncopied key that a store writes before
+            // a later retry succeeds is permanently shadowed under
+            // copy-if-missing. Copying the maximum each pass keeps that
+            // window as small as possible and lets retries converge instead
+            // of re-failing at the same arbitrary point.
+            let failedCount = 0;
+            for (const server of syncServers) {
+                try {
+                    const localValue = await getRawItem(server, false);
+                    if (localValue !== null) continue;
+
+                    const syncValue = await getRawItem(server, true);
+                    // Empty means deleted under Storage semantics; nothing
+                    // to copy
+                    if (!syncValue) continue;
+
+                    if (!settingsStore.isMigrating)
+                        settingsStore.isMigrating = true;
+
+                    await setRawLocalItem(server, syncValue);
+
+                    const verify = await getRawItem(server, false);
+                    if (verify !== syncValue) {
+                        // Counted as a failure so the flag stays unset and
+                        // this key retries on the next boot instead of being
+                        // silently skipped forever
+                        throw new Error(
+                            `Keychain desync migration verify failed for ${server}`
+                        );
+                    }
+                } catch (error) {
+                    console.error(
+                        `Keychain desync migration failed for ${server}`,
+                        error
+                    );
+                    failedCount++;
+                }
+            }
+
+            if (failedCount > 0) {
+                // Flag stays unset so the migration retries on the next
+                // boot; keys copied above are then skipped by the
+                // copy-if-missing guard and only the failed ones re-run
+                console.error(
+                    `Keychain desync migration incomplete (${failedCount} of ${syncServers.length} synchronizable zeus: entries failed)`
+                );
+                return;
+            }
+
+            await this.writeFlag(KEYCHAIN_DESYNC_KEY);
+            console.log(
+                `Keychain desync migration completed (${syncServers.length} synchronizable zeus: entries)`
+            );
+        } catch (error) {
+            // Swallowed WITHOUT setting the flag: the migration retries on
+            // the next boot. Propagating would abort getSettings before the
+            // blob read; the in-memory defaults it falls back to render the
+            // onboarding flow, and a wallet created there would permanently
+            // shadow the real blob under copy-if-missing. getSettings'
+            // synchronizable-partition fallback covers this boot instead.
+            console.error('Keychain desync migration failed', error);
+        }
+    }
+
+    public async keychainCloudSyncMigration() {
+        try {
+            const hasMigrated = await this.readFlag(KEYCHAIN_MIGRATION_KEY);
+
+            if (hasMigrated !== 'true') {
+                console.log('Attempting keychain cloud sync migration...');
+
+                const settingsData = await this.migrateKey(STORAGE_KEY);
+
+                if (settingsData) {
+                    settingsStore.isMigrating = true;
+                }
+
+                const migrationKeys = [
+                    CONTACTS_KEY,
+                    LAST_CHANNEL_BACKUP_STATUS,
+                    LAST_CHANNEL_BACKUP_TIME,
+                    ADDRESS_ACTIVATED_STRING,
+                    HASHES_STORAGE_STRING,
+                    POS_HIDDEN_KEY,
+                    POS_STANDALONE_KEY,
+                    CATEGORY_KEY,
+                    PRODUCT_KEY,
+                    UNIT_KEY,
+                    HIDDEN_ACCOUNTS_KEY,
+                    CURRENCY_CODES_KEY,
+                    ACTIVITY_FILTERS_KEY,
+                    IS_BACKED_UP_KEY,
+                    LSPS_ORDERS_KEY,
+                    SWAPS_KEY,
+                    REVERSE_SWAPS_KEY,
+                    SWAPS_RESCUE_KEY,
+                    SWAPS_LAST_USED_KEY
+                ];
+
+                for (const key of migrationKeys) {
+                    await this.migrateKey(key);
+                }
+
+                const notesListJson = await this.migrateKey(NOTES_KEY);
+                if (notesListJson) {
+                    const noteKeys = JSON.parse(notesListJson);
+                    if (Array.isArray(noteKeys)) {
+                        for (const noteKey of noteKeys) {
+                            await this.migrateKey(noteKey);
+                        }
+                    }
+                }
+
+                if (settingsData) {
+                    const settings = JSON.parse(settingsData);
+                    if (settings.nodes && Array.isArray(settings.nodes)) {
+                        for (const node of settings.nodes) {
+                            if (
+                                node.implementation ===
+                                    'lightning-node-connect' &&
+                                node.pairingPhrase
+                            ) {
+                                const baseKey = `${LNC_STORAGE_KEY}:${hash(
+                                    node.pairingPhrase
+                                )}`;
+                                const hostKey = `${baseKey}:host`;
+
+                                await this.migrateKey(baseKey);
+                                await this.migrateKey(hostKey);
+                            }
+                        }
+                    }
+                }
+
+                await this.writeFlag(KEYCHAIN_MIGRATION_KEY);
+                console.log(
+                    'Keychain cloud sync migration completed successfully.'
+                );
+            }
+
+            const cashuMigration = await this.readFlag(CASHU_MIGRATION_KEY);
+
+            if (cashuMigration !== 'true') {
+                // Only run the Cashu keychain migration if the main keychain
+                // migration actually ran this time (hasMigrated was not 'true'
+                // when we entered). If the main migration was already done from
+                // a prior launch, there can't be unmigrated Cashu data in the
+                // old keychain — skip the expensive keychain reads.
+                if (hasMigrated !== 'true') {
+                    console.log('Running Cashu Multi-Node Migration...');
+
+                    const settingsJson = await Storage.getItem(STORAGE_KEY);
+                    if (settingsJson) {
+                        settingsStore.isMigrating = true;
+                        const settings = JSON.parse(settingsJson);
+                        if (settings.nodes && Array.isArray(settings.nodes)) {
+                            for (const node of settings.nodes) {
+                                if (node.implementation === 'embedded-lnd') {
+                                    const lndDir = node.lndDir || 'lnd';
+                                    await this.migrateCashuForNode(lndDir);
+                                }
+                            }
+                        }
+                    }
+                    console.log('Cashu Migration Completed.');
+                } else {
+                    console.log(
+                        'Skipping Cashu migration - main keychain migration was already done.'
+                    );
+                }
+                await this.writeFlag(CASHU_MIGRATION_KEY);
+            }
+        } catch (error) {
+            console.error('Error during keychain cloud sync migration:', error);
+        }
+    }
+}
+
+const migrationsUtils = new MigrationsUtils();
+export default migrationsUtils;

@@ -1,0 +1,659 @@
+import { action, computed, observable } from 'mobx';
+import { Nip47Method } from '@getalby/sdk';
+import { localeString } from '../utils/LocaleUtils';
+
+import BaseModel from './BaseModel';
+
+import { Implementations } from '../stores/SettingsStore';
+
+import Invoice from './Invoice';
+import CashuInvoice from './CashuInvoice';
+import Payment from './Payment';
+import CashuPayment from './CashuPayment';
+import NostrConnectUtils from '../utils/NostrConnectUtils';
+
+export type ConnectionActivityType = 'pay_invoice' | 'make_invoice';
+export type ConnectionActivityStatus =
+    | 'success'
+    | 'pending'
+    | 'failed'
+    | 'expired';
+export type ConnectionPaymentSourceType = 'lightning' | 'cashu';
+
+export enum PermissionType {
+    FullAccess = 'full_access',
+    ReadOnly = 'read_only',
+    Custom = 'custom'
+}
+export interface ConnectionActivity {
+    id: string; // lightning invoice
+    type: ConnectionActivityType;
+    payment_source: ConnectionPaymentSourceType;
+    status: ConnectionActivityStatus;
+    payment?: Payment | CashuPayment | null;
+    invoice?: Invoice | CashuInvoice | null;
+    error?: string;
+    preimage?: string;
+    paymentHash?: string;
+    satAmount?: number;
+    createdAt?: Date;
+    expiresAt?: Date;
+    isExpired?: boolean;
+    expiryLabel?: string;
+    fees_paid?: number;
+    // routing fee cap sent with a pay_invoice, or the fee reserve on
+    // backends that take no fee limit; held with satAmount while pending
+    feeLimitSats?: number;
+    isBudgetDebited?: boolean;
+}
+
+export enum BudgetRenewalType {
+    Never = 'never',
+    Daily = 'daily',
+    Weekly = 'weekly',
+    Monthly = 'monthly',
+    Yearly = 'yearly'
+}
+export enum ConnectionWarningType {
+    WalletBalanceLowerThanBudget = 'wallet_balance_lower_than_budget',
+    BudgetLimitReached = 'budget_limit_reached'
+}
+export type TimeUnit = 'Hours' | 'Days' | 'Weeks' | 'Months' | 'Years';
+export interface NWCConnectionData {
+    id: string;
+    name: string;
+    icon?: any;
+    description?: string;
+    pubkey: string;
+    relayUrl: string;
+    permissions: Nip47Method[];
+    createdAt: Date;
+    lastUsed?: Date;
+    totalSpendSats: number;
+    maxAmountSats?: number;
+    budgetRenewal?: BudgetRenewalType;
+    expiresAt?: Date;
+    lastBudgetReset?: Date;
+    customExpiryValue?: number;
+    customExpiryUnit?: TimeUnit;
+    nodePubkey: string;
+    implementation: string;
+    walletConfigId?: string;
+    activity?: ConnectionActivity[];
+    metadata?: any;
+}
+export interface ConnectionWarning {
+    type: ConnectionWarningType;
+    severity: 'info' | 'warning' | 'error';
+    translationKey: string;
+    metadata?: Record<string, any>;
+}
+export const WARNING_CONFIG: Record<
+    ConnectionWarningType,
+    Omit<ConnectionWarning, 'type' | 'metadata'>
+> = {
+    [ConnectionWarningType.WalletBalanceLowerThanBudget]: {
+        severity: 'warning',
+        translationKey:
+            'views.Settings.NostrWalletConnect.warning.walletBalanceLowerThanBudget'
+    },
+    [ConnectionWarningType.BudgetLimitReached]: {
+        severity: 'warning',
+        translationKey:
+            'views.Settings.NostrWalletConnect.warning.budgetLimitReached'
+    }
+};
+
+const BUDGET_RENEWAL_MS = {
+    daily: 24 * 60 * 60 * 1000,
+    weekly: 7 * 24 * 60 * 60 * 1000,
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    yearly: 365 * 24 * 60 * 60 * 1000
+} as const;
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+export default class NWCConnection extends BaseModel {
+    id: string;
+    @observable name: string;
+    @observable icon?: any;
+    @observable description?: string;
+    pubkey: string;
+    relayUrl: string;
+    @observable permissions: Nip47Method[];
+    createdAt: Date;
+    @observable lastUsed?: Date;
+    @observable totalSpendSats: number;
+    @observable maxAmountSats?: number;
+    @observable budgetRenewal?: BudgetRenewalType;
+    @observable expiresAt?: Date;
+    @observable lastBudgetReset?: Date;
+    @observable customExpiryValue?: number;
+    @observable customExpiryUnit?: TimeUnit;
+    @observable nodePubkey: string;
+    @observable implementation: Implementations;
+    // NostrConnectUtils.getWalletConfigId of the wallet config that last
+    // loaded this connection
+    walletConfigId?: string;
+    @observable metadata?: any;
+    @observable activity: ConnectionActivity[] = [];
+    @observable private _warningTypes: ConnectionWarningType[] = [];
+
+    constructor(data?: NWCConnectionData) {
+        super(data);
+
+        this.totalSpendSats = Math.floor(Number(this.totalSpendSats || 0));
+        this.maxAmountSats =
+            this.maxAmountSats !== undefined
+                ? Math.floor(Number(this.maxAmountSats))
+                : undefined;
+        this.normalizeDates();
+    }
+
+    private coerceToDate(value: unknown): Date | undefined {
+        if (!value) return undefined;
+        if (value instanceof Date) return value;
+        if (typeof value === 'string') {
+            const d = new Date(value);
+            return isNaN(d.getTime()) ? undefined : d;
+        }
+        if (typeof value === 'number') {
+            const ms = value < 1_000_000_000_000 ? value * 1000 : value;
+            const d = new Date(ms);
+            return isNaN(d.getTime()) ? undefined : d;
+        }
+        return undefined;
+    }
+
+    private normalizeDates(): void {
+        const dateFields = [
+            'createdAt',
+            'lastUsed',
+            'expiresAt',
+            'lastBudgetReset'
+        ] as const;
+
+        dateFields.forEach((field) => {
+            const value = (this as any)[field];
+            const coerced = this.coerceToDate(value);
+            if (coerced) {
+                (this as any)[field] = coerced;
+            }
+        });
+
+        if (this.activity && this.activity.length > 0) {
+            this.activity = this.activity.map((a: any) => {
+                const createdAt = this.coerceToDate(a?.createdAt);
+                const expiresAt = this.coerceToDate(a?.expiresAt);
+                return {
+                    ...a,
+                    ...(createdAt ? { createdAt } : {}),
+                    ...(expiresAt ? { expiresAt } : {})
+                };
+            });
+        } else if (!this.activity) {
+            this.activity = [];
+        }
+    }
+    @computed public get isExpired(): boolean {
+        return this.isExpiredNow();
+    }
+
+    // plain method, not @computed: the current time is not observable, so
+    // while a mounted screen tracks the computed it keeps returning a stale
+    // "not expired". Use this for the request checks (withGlobalHandler,
+    // validateBudgetBeforePayment)
+    public isExpiredNow(): boolean {
+        return this.expiresAt ? new Date() > this.expiresAt : false;
+    }
+    @computed public get statusText(): string {
+        return this.isExpired
+            ? localeString('channel.expirationStatus.expired')
+            : localeString('general.active');
+    }
+    @computed public get hasRecentActivity(): boolean {
+        if (!this.lastUsed) return false;
+
+        const dayAgo = new Date(Date.now() - ONE_DAY_MS);
+        return this.lastUsed > dayAgo;
+    }
+
+    @computed public get hasBudgetLimit(): boolean {
+        return !!(this.maxAmountSats && this.maxAmountSats > 0);
+    }
+
+    @computed public get budgetLimitReached(): boolean {
+        return (
+            this.hasBudgetLimit &&
+            this.effectiveSpendSats >= this.maxAmountSats!
+        );
+    }
+
+    /**
+     * Sum of in-flight (pending) pay_invoice amounts on this connection's
+     * activity log, each with the routing fee cap it was sent with. Counted
+     * against the budget so concurrent or slow-settling (hodl) payments
+     * cannot exceed the limit while their debits are deferred to reconcile.
+     * Reconcile flips an activity to success and calls trackSpending in one
+     * atomic action, so an amount is never counted in both this and
+     * totalSpendSats.
+     */
+    @computed public get pendingSpendSats(): number {
+        if (!this.activity?.length) return 0;
+        return this.activity.reduce((sum, a) => {
+            if (a.type !== 'pay_invoice' || a.status !== 'pending') {
+                return sum;
+            }
+            return (
+                sum +
+                Math.max(0, Math.floor(Number(a.satAmount) || 0)) +
+                Math.max(0, Math.floor(Number(a.feeLimitSats) || 0))
+            );
+        }, 0);
+    }
+
+    /**
+     * Total budget consumption: settled spends plus in-flight pending
+     * amounts. All budget-facing values (canSpend, remainingBudget,
+     * budgetUsagePercentage, budgetLimitReached) derive from this so the
+     * UI and enforcement always agree.
+     */
+    @computed public get effectiveSpendSats(): number {
+        return this.totalSpendSats + this.pendingSpendSats;
+    }
+
+    public findPayInvoiceActivityIndex(
+        id: string,
+        paymentHash?: string
+    ): number {
+        return (this.activity ?? []).findIndex(
+            (a) =>
+                a.type === 'pay_invoice' &&
+                (a.id === id ||
+                    (!!paymentHash &&
+                        !!a.paymentHash &&
+                        a.paymentHash === paymentHash))
+        );
+    }
+
+    public findPayInvoiceActivity(
+        id: string,
+        paymentHash?: string
+    ): ConnectionActivity | undefined {
+        const index = this.findPayInvoiceActivityIndex(id, paymentHash);
+        return index !== -1 ? this.activity[index] : undefined;
+    }
+
+    /** Pending hold or timeout-failed row still awaiting node reconciliation. */
+    public isUnresolvedPayInvoiceActivity(
+        activity: ConnectionActivity
+    ): boolean {
+        if (
+            activity.type !== 'pay_invoice' ||
+            activity.payment_source === 'cashu' ||
+            activity.isBudgetDebited
+        ) {
+            return false;
+        }
+        return (
+            activity.status === 'pending' ||
+            (activity.status === 'failed' &&
+                NostrConnectUtils.isPaymentTimedOutMessage(activity.error))
+        );
+    }
+
+    @computed public get remainingBudget(): number {
+        if (!this.hasBudgetLimit) return Infinity;
+        return Math.max(0, this.maxAmountSats! - this.effectiveSpendSats);
+    }
+
+    @computed public get budgetUsagePercentage(): number {
+        if (!this.hasBudgetLimit) return 0;
+        return Math.min(
+            100,
+            (this.effectiveSpendSats / this.maxAmountSats!) * 100
+        );
+    }
+
+    private resolveMakeInvoiceActivitySats(a: ConnectionActivity): number {
+        const fromSat = Math.floor(Number(a.satAmount) || 0);
+        // satAmount first: amountless invoices report 0 from bolt11
+        if (fromSat > 0) return fromSat;
+
+        if (a.invoice != null) {
+            const inv =
+                a.invoice instanceof CashuInvoice
+                    ? a.invoice
+                    : a.invoice instanceof Invoice
+                    ? a.invoice
+                    : a.payment_source === 'cashu'
+                    ? new CashuInvoice(a.invoice)
+                    : new Invoice(a.invoice);
+            const fromInvoice = Math.floor(Number(inv.getAmount) || 0);
+            if (fromInvoice > 0) return fromInvoice;
+        }
+
+        if (a.payment != null) {
+            const pay =
+                a.payment instanceof CashuPayment
+                    ? a.payment
+                    : a.payment instanceof Payment
+                    ? a.payment
+                    : a.payment_source === 'cashu'
+                    ? new CashuPayment(a.payment)
+                    : new Payment(a.payment);
+            return Math.floor(Number(pay.getAmount) || 0);
+        }
+
+        return 0;
+    }
+
+    /**
+     * Sum of settled incoming invoice amounts recorded on this connection's
+     * activity log (successful make_invoice only).
+     */
+    @computed
+    public get totalReceivedActivitySats(): number {
+        if (!this.activity?.length) return 0;
+        return this.activity.reduce((sum, a) => {
+            if (a.type !== 'make_invoice' || a.status !== 'success') {
+                return sum;
+            }
+            return sum + Math.max(0, this.resolveMakeInvoiceActivitySats(a));
+        }, 0);
+    }
+
+    @action
+    public addWarning(warningType: ConnectionWarningType): void {
+        if (!this._warningTypes.includes(warningType)) {
+            this._warningTypes.push(warningType);
+        }
+    }
+    @action
+    public removeWarning(warningType: ConnectionWarningType): void {
+        const index = this._warningTypes.indexOf(warningType);
+        if (index > -1) {
+            this._warningTypes.splice(index, 1);
+        }
+    }
+    @action
+    public clearWarnings(): void {
+        this._warningTypes = [];
+    }
+    @computed public get warnings(): ConnectionWarning[] {
+        return this._warningTypes.map((type) => ({
+            type,
+            ...WARNING_CONFIG[type],
+            metadata: this.getWarningMetadata(type)
+        }));
+    }
+    @computed public get hasWarnings(): boolean {
+        return this._warningTypes.length > 0;
+    }
+    @computed public get hasErrors(): boolean {
+        return this.warnings.some((w) => w.severity === 'error');
+    }
+    @computed public get primaryWarning(): ConnectionWarning | null {
+        // Return highest severity warning (error > warning > info)
+        const errors = this.warnings.filter((w) => w.severity === 'error');
+        if (errors.length > 0) return errors[0];
+
+        const warnings = this.warnings.filter((w) => w.severity === 'warning');
+        if (warnings.length > 0) return warnings[0];
+
+        const info = this.warnings.filter((w) => w.severity === 'info');
+        if (info.length > 0) return info[0];
+
+        return null;
+    }
+    private getWarningMetadata(
+        warningType: ConnectionWarningType
+    ): Record<string, any> | undefined {
+        switch (warningType) {
+            case ConnectionWarningType.WalletBalanceLowerThanBudget:
+                return {
+                    maxAmount: this.maxAmountSats
+                };
+            default:
+                return undefined;
+        }
+    }
+    @computed public get needsBudgetReset(): boolean {
+        if (
+            !this.hasBudgetLimit ||
+            !this.budgetRenewal ||
+            this.budgetRenewal === 'never'
+        ) {
+            return false;
+        }
+        // If no last reset, needs reset
+        if (!this.lastBudgetReset) {
+            return true;
+        }
+        const timeDiff = Date.now() - this.lastBudgetReset.getTime();
+        const renewalMs = BUDGET_RENEWAL_MS[this.budgetRenewal];
+
+        return timeDiff >= renewalMs;
+    }
+
+    @computed public get isActive(): boolean {
+        return !this.isExpired;
+    }
+
+    @computed public get displayName(): string {
+        return this.name || this.pubkey.slice(0, 8) + '...';
+    }
+
+    @computed public get permissionsCount(): number {
+        return this.permissions?.length || 0;
+    }
+
+    public canSpend(amountSats: number): boolean {
+        if (!this.hasBudgetLimit) return true;
+        return this.effectiveSpendSats + amountSats <= this.maxAmountSats!;
+    }
+
+    /**
+     * Routing fee cap for a payment of amountSats: what the budget has left
+     * after the amount, at most maxFeeLimitSats. Unchanged without a budget.
+     */
+    public feeLimitSatsForPayment(
+        amountSats: number,
+        maxFeeLimitSats: number
+    ): number {
+        if (!this.hasBudgetLimit) return maxFeeLimitSats;
+        return Math.max(
+            0,
+            Math.min(maxFeeLimitSats, this.remainingBudget - amountSats)
+        );
+    }
+
+    /**
+     * Fee reserve for a payment of amountSats on backends that take no fee
+     * limit (LndHub): 1% of the amount, rounded up, and at least 10 sats.
+     */
+    public static feeReserveSatsWithoutFeeLimit(amountSats: number): number {
+        return Math.max(Math.ceil(amountSats / 100), 10);
+    }
+
+    @action
+    public resetBudget(): void {
+        this.totalSpendSats = 0;
+        this.lastBudgetReset = new Date();
+    }
+
+    /**
+     * Align warning flags with current budget state.
+     *
+     * - Always syncs BudgetLimitReached (from effectiveSpendSats).
+     * - Syncs WalletBalanceLowerThanBudget only when availableBalance is passed
+     *   (trackSpending has no wallet balance — leave that to store/init paths).
+     *
+     * @returns true if the warning set changed
+     */
+    @action
+    public syncWarnings(availableBalance?: number): boolean {
+        let changed = false;
+
+        if (this.budgetLimitReached) {
+            if (
+                !this._warningTypes.includes(
+                    ConnectionWarningType.BudgetLimitReached
+                )
+            ) {
+                this.addWarning(ConnectionWarningType.BudgetLimitReached);
+                changed = true;
+            }
+        } else if (
+            this._warningTypes.includes(
+                ConnectionWarningType.BudgetLimitReached
+            )
+        ) {
+            this.removeWarning(ConnectionWarningType.BudgetLimitReached);
+            changed = true;
+        }
+
+        if (availableBalance !== undefined && this.hasBudgetLimit) {
+            const normalizedAvailable = Math.max(
+                0,
+                Math.floor(Number(availableBalance))
+            );
+            const shouldWarn = this.maxAmountSats! >= normalizedAvailable;
+
+            if (shouldWarn) {
+                if (
+                    !this._warningTypes.includes(
+                        ConnectionWarningType.WalletBalanceLowerThanBudget
+                    )
+                ) {
+                    this.addWarning(
+                        ConnectionWarningType.WalletBalanceLowerThanBudget
+                    );
+                    changed = true;
+                }
+            } else if (
+                this._warningTypes.includes(
+                    ConnectionWarningType.WalletBalanceLowerThanBudget
+                )
+            ) {
+                this.removeWarning(
+                    ConnectionWarningType.WalletBalanceLowerThanBudget
+                );
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    @action
+    public checkAndResetBudgetIfNeeded(availableBalance?: number): boolean {
+        let changed = false;
+        if (this.needsBudgetReset) {
+            this.resetBudget();
+            changed = true;
+        }
+        if (this.syncWarnings(availableBalance)) {
+            changed = true;
+        }
+        return changed;
+    }
+
+    private validateAmount(amountSats: number): void {
+        if (!Number.isInteger(amountSats) || amountSats < 0) {
+            throw new Error(
+                localeString(
+                    'views.Settings.NostrWalletConnect.error.invalidAmount'
+                )
+            );
+        }
+    }
+    /**
+     * Validates spendable budget against the invoice amount only.
+     *
+     * Routing fees are unknown until the payment settles, so they are not
+     * required here. Instead, on backends that enforce a fee limit, the fee
+     * cap passed to the backend comes from feeLimitSatsForPayment, which
+     * limits it to the budget left after the amount, and a pending payment
+     * holds that cap until it resolves. Debit happens on finalize/reconcile
+     * for the settled amount plus fee.
+     *
+     * Requiring amount + fee_limit up front would reject payments when the
+     * remaining budget is in [amount, amount + fee_limit); those are still
+     * attempted, with the smaller fee cap.
+     *
+     * Backends that take no fee limit (LndHub) cannot cap the fee, so
+     * pay_invoice there also requires the budget to cover the amount plus
+     * feeReserveSatsWithoutFeeLimit, and a pending payment holds that
+     * reserve. The fee actually paid is debited once the payment settles.
+     */
+    @action
+    public validateBudgetBeforePayment(amountSats: number): {
+        success: boolean;
+        errorMessage?: string;
+    } {
+        this.validateAmount(amountSats);
+
+        if (this.isExpiredNow()) {
+            return {
+                success: false,
+                errorMessage: localeString(
+                    'views.Settings.NostrWalletConnect.error.connectionExpired'
+                )
+            };
+        }
+
+        this.checkAndResetBudgetIfNeeded();
+
+        if (this.hasBudgetLimit && !this.canSpend(amountSats)) {
+            return {
+                success: false,
+                errorMessage: localeString(
+                    'views.Settings.NostrWalletConnect.error.paymentExceedsBudget',
+                    {
+                        amount: amountSats.toString(),
+                        remaining: this.remainingBudget.toString()
+                    }
+                )
+            };
+        }
+        return {
+            success: true
+        };
+    }
+
+    @action
+    public trackSpending(amountSats: number, maxBudgetLimit?: number): void {
+        this.validateAmount(amountSats);
+        this.totalSpendSats += amountSats;
+        this.syncWarnings(maxBudgetLimit);
+    }
+
+    public hasPermission(permission: Nip47Method): boolean {
+        return this.permissions?.includes(permission) || false;
+    }
+    public hasReadOnlyPermissions(): boolean {
+        return (
+            this.permissions?.some((permission) =>
+                NostrConnectUtils.getReadOnlyPermissions().includes(permission)
+            ) ?? false
+        );
+    }
+    public hasPaymentPermissions(): boolean {
+        return NostrConnectUtils.hasPaymentPermissions(this.permissions ?? []);
+    }
+
+    public getDaysUntilExpiry(): number | null {
+        if (!this.expiresAt) return null;
+        const now = new Date();
+        const timeDiff = this.expiresAt.getTime() - now.getTime();
+        return Math.ceil(timeDiff / ONE_DAY_MS);
+    }
+    public getDaysSinceLastUsed(): number | null {
+        if (!this.lastUsed) return null;
+
+        const now = new Date();
+        const timeDiff = now.getTime() - this.lastUsed.getTime();
+        return Math.floor(timeDiff / ONE_DAY_MS);
+    }
+}

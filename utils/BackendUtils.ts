@@ -1,0 +1,344 @@
+import { settingsStore } from '../stores/Stores';
+import { parseLdkNodeError } from './ErrorUtils';
+import { isReservedSigningMessage } from './LnurlAuthUtils';
+// LND
+import LND from '../backends/LND';
+import LightningNodeConnect from '../backends/LightningNodeConnect';
+import EmbeddedLND from '../backends/EmbeddedLND';
+// LDK Node
+import LdkNode from '../backends/LdkNode';
+// Core Lightning
+import CLNRest from '../backends/CLNRest';
+// Custodial
+import LndHub from '../backends/LndHub';
+import NostrWalletConnect from '../backends/NostrWalletConnect';
+
+class BackendUtils {
+    lnd: LND;
+    lightningNodeConnect: LightningNodeConnect;
+    embeddedLND: EmbeddedLND;
+    ldkNode: LdkNode;
+    clnRest: CLNRest;
+    lndHub: LndHub;
+    nostrWalletConnect: NostrWalletConnect;
+    constructor() {
+        this.lnd = new LND();
+        this.lightningNodeConnect = new LightningNodeConnect();
+        this.embeddedLND = new EmbeddedLND();
+        this.ldkNode = new LdkNode();
+        this.clnRest = new CLNRest();
+        this.lndHub = new LndHub();
+        this.nostrWalletConnect = new NostrWalletConnect();
+    }
+
+    getClass = () => {
+        const { implementation } = settingsStore;
+        switch (implementation) {
+            case 'lnd':
+                return this.lnd;
+            case 'lightning-node-connect':
+                return this.lightningNodeConnect;
+            case 'embedded-lnd':
+                return this.embeddedLND;
+            case 'ldk-node':
+                return this.ldkNode;
+            case 'cln-rest':
+                return this.clnRest;
+            case 'lndhub':
+                return this.lndHub;
+            case 'nostr-wallet-connect':
+                return this.nostrWalletConnect;
+            default:
+                return this.lnd;
+        }
+    };
+
+    call = (funcName: string, args?: any) => {
+        const cls: any = this.getClass();
+        // return false if function is not defined in backend, as a fallback
+        if (!cls[funcName]) return false;
+        const result = cls[funcName].apply(cls, args);
+        // Parse LDK Node native error strings into clean messages
+        if (
+            settingsStore.implementation === 'ldk-node' &&
+            result &&
+            typeof result.catch === 'function'
+        ) {
+            return result.catch((error: any) => {
+                const parsed = parseLdkNodeError(error);
+                const cleanError = new Error(parsed);
+                cleanError.name = error?.name || 'Error';
+                throw cleanError;
+            });
+        }
+        return result;
+    };
+
+    getTransactions = (...args: any[]) => this.call('getTransactions', args);
+    getChannels = (...args: any[]) => this.call('getChannels', args);
+    getPendingChannels = (...args: any[]) =>
+        this.call('getPendingChannels', args);
+    getClosedChannels = (...args: any[]) =>
+        this.call('getClosedChannels', args);
+    getChannelInfo = (...args: any[]) => this.call('getChannelInfo', args);
+    getBlockchainBalance = (...args: any[]) =>
+        this.call('getBlockchainBalance', args);
+    getLightningBalance = (...args: any[]) =>
+        this.call('getLightningBalance', args);
+    sendCoins = (...args: any[]) => this.call('sendCoins', args);
+    sendCustomMessage = (...args: any[]) =>
+        this.call('sendCustomMessage', args);
+    subscribeCustomMessages = (...args: any[]) =>
+        this.call('subscribeCustomMessages', args);
+    getMyNodeInfo = (...args: any[]) => this.call('getMyNodeInfo', args);
+    getNetworkInfo = (...args: any[]) => this.call('getNetworkInfo', args);
+    getRecoveryInfo = (...args: any[]) => this.call('getRecoveryInfo', args);
+    getInvoices = (...args: any[]) => this.call('getInvoices', args);
+    createInvoice = (...args: any[]) => this.call('createInvoice', args);
+    getPayments = (...args: any[]) => this.call('getPayments', args);
+    lookupPayment = (...args: any[]) => this.call('lookupPayment', args);
+    getNewAddress = (...args: any[]) => this.call('getNewAddress', args);
+    getNewChangeAddress = (...args: any[]) =>
+        this.call('getNewChangeAddress', args);
+    openChannelSync = (...args: any[]) => this.call('openChannelSync', args);
+    openChannelStream = (...args: any[]) =>
+        this.call('openChannelStream', args);
+    connectPeer = (...args: any[]) => this.call('connectPeer', args);
+    listPeers = (...args: any[]) => this.call('listPeers', args);
+    disconnectPeer = (...args: any[]) => this.call('disconnectPeer', args);
+    decodePaymentRequest = (...args: any[]) =>
+        this.call('decodePaymentRequest', args);
+    payLightningInvoice = (...args: any[]) =>
+        this.call('payLightningInvoice', args);
+    payLightningInvoiceStreaming = (...args: any[]) =>
+        this.call('payLightningInvoiceStreaming', args);
+    sendKeysend = (...args: any[]) => this.call('sendKeysend', args);
+    closeChannel = (...args: any[]) => this.call('closeChannel', args);
+    getNodeInfo = (...args: any[]) => this.call('getNodeInfo', args);
+    getFees = (...args: any[]) => this.call('getFees', args);
+    setFees = (...args: any[]) => this.call('setFees', args);
+    updateChannelPolicy = (...args: any[]) =>
+        this.call('updateChannelPolicy', args);
+    getRoutes = (...args: any[]) => this.call('getRoutes', args);
+    getForwardingHistory = (...args: any[]) =>
+        this.call('getForwardingHistory', args);
+    getUTXOs = (...args: any[]) => this.call('getUTXOs', args);
+    listAccounts = (...args: any[]) => this.call('listAccounts', args);
+    importAccount = (...args: any[]) => this.call('importAccount', args);
+    listAddresses = (...args: any[]) => this.call('listAddresses', args);
+    // Backstop for every caller that signs with the node key through
+    // BackendUtils. Each backend's lnurlAuth calls its own signMessage
+    // directly, so LNURL-auth is not affected. The Olympus restore flow in
+    // ChannelMigrationUtils signs through lndmobile and checks separately.
+    signMessage = (...args: any[]) =>
+        isReservedSigningMessage(args[0])
+            ? Promise.reject(
+                  new Error(
+                      'Refusing to sign the LNURL-auth key derivation phrase'
+                  )
+              )
+            : this.call('signMessage', args);
+    verifyMessage = (...args: any[]) => this.call('verifyMessage', args);
+    signMessageWithAddr = (...args: any[]) =>
+        this.call('signMessageWithAddr', args);
+    verifyMessageWithAddr = (...args: any[]) =>
+        this.call('verifyMessageWithAddr', args);
+    lnurlAuth = (...args: any[]) => this.call('lnurlAuth', args);
+
+    fundPsbt = (...args: any[]) => this.call('fundPsbt', args);
+    signPsbt = (...args: any[]) => this.call('signPsbt', args);
+    finalizePsbt = (...args: any[]) => this.call('finalizePsbt', args);
+    publishTransaction = (...args: any[]) =>
+        this.call('publishTransaction', args);
+    fundingStateStep = (...args: any[]) => this.call('fundingStateStep', args);
+    bumpFee = (...args: any[]) => this.call('bumpFee', args);
+    bumpForceCloseFee = (...args: any[]) =>
+        this.call('bumpForceCloseFee', args);
+    lookupInvoice = (...args: any[]) => this.call('lookupInvoice', args);
+    // return an unsubscribe function, or false on backends
+    // with no real-time payment detection
+    watchInvoicePaid = (...args: any[]) => this.call('watchInvoicePaid', args);
+    watchOnchainReceived = (...args: any[]) =>
+        this.call('watchOnchainReceived', args);
+    subscribeInvoice = (...args: any[]) => this.call('subscribeInvoice', args);
+    subscribeInvoices = (...args: any[]) =>
+        this.call('subscribeInvoices', args);
+    subscribeTransactions = (...args: any[]) =>
+        this.call('subscribeTransactions', args);
+    // returns an unsubscribe function
+    watchActivityUpdates = (...args: any[]) =>
+        this.call('watchActivityUpdates', args);
+    initChanAcceptor = (...args: any[]) => this.call('initChanAcceptor', args);
+    rescan = (...args: any[]) => this.call('rescan', args);
+
+    // LSPS1 Native (for embedded LDK Node)
+    lsps1RequestChannel = (...args: any[]) =>
+        this.call('lsps1RequestChannel', args);
+    lsps1CheckOrderStatus = (...args: any[]) =>
+        this.call('lsps1CheckOrderStatus', args);
+    requestLsps1Liquidity = (...args: any[]) =>
+        this.call('requestLsps1Liquidity', args);
+    checkLsps1OrderStatus = (...args: any[]) =>
+        this.call('checkLsps1OrderStatus', args);
+
+    // LSPS7 Native (for embedded LDK Node)
+    lsps7GetExtendableChannels = (...args: any[]) =>
+        this.call('lsps7GetExtendableChannels', args);
+    lsps7CreateOrder = (...args: any[]) => this.call('lsps7CreateOrder', args);
+    lsps7CheckOrderStatus = (...args: any[]) =>
+        this.call('lsps7CheckOrderStatus', args);
+
+    // BOLT 12 / Offers
+    listOffers = (...args: any[]) => this.call('listOffers', args);
+    createOffer = (...args: any[]) => this.call('createOffer', args);
+    disableOffer = (...args: any[]) => this.call('disableOffer', args);
+    fetchInvoiceFromOffer = (...args: any[]) =>
+        this.call('fetchInvoiceFromOffer', args);
+    decodeOffer = (...args: any[]) => this.call('decodeOffer', args);
+    payOffer = (...args: any[]) => this.call('payOffer', args);
+    createWithdrawalRequest = (...args: any[]) =>
+        this.call('createWithdrawalRequest', args);
+    redeemWithdrawalRequest = (...args: any[]) =>
+        this.call('redeemWithdrawalRequest', args);
+
+    // Watchtowers
+    listWatchtowers = (...args: any[]) => this.call('listWatchtowers', args);
+    addWatchtower = (...args: any[]) => this.call('addWatchtower', args);
+    removeWatchtower = (...args: any[]) => this.call('removeWatchtower', args);
+    getWatchtowerInfo = (...args: any[]) =>
+        this.call('getWatchtowerInfo', args);
+    deactivateWatchtower = (...args: any[]) =>
+        this.call('deactivateWatchtower', args);
+    getWatchtowerStats = (...args: any[]) =>
+        this.call('getWatchtowerStats', args);
+    getWatchtowerPolicy = (...args: any[]) =>
+        this.call('getWatchtowerPolicy', args);
+    terminateWatchtowerSession = (...args: any[]) =>
+        this.call('terminateWatchtowerSession', args);
+
+    // lndhub
+    login = (...args: any[]) => this.call('login', args);
+
+    // services
+    supportsNostrWalletConnectService = () =>
+        this.call('supportsNostrWalletConnectService');
+    supportsWatchtowerClient = () => this.call('supportsWatchtowerClient');
+    supportsPeers = () => this.call('supportsPeers');
+    supportsFlowLSP = () => this.call('supportsFlowLSP');
+    supportsLSPScustomMessage = () => this.call('supportsLSPScustomMessage');
+    supportsLSPS1rest = () => this.call('supportsLSPS1rest');
+    supportsLSPS1native = () => this.call('supportsLSPS1native');
+    supportsLSPS7native = () => this.call('supportsLSPS7native');
+    supportsMessageSigning = () => this.call('supportsMessageSigning');
+    supportsMessageVerification = () =>
+        this.call('supportsMessageVerification');
+    requiresVerifyPubkey = () => this.call('requiresVerifyPubkey');
+    supportsLnurlAuth = () => this.call('supportsLnurlAuth');
+    supportsOnchainBalance = () => this.call('supportsOnchainBalance');
+    supportsOnchainSends = () => this.call('supportsOnchainSends');
+    supportsOnchainReceiving = () => this.call('supportsOnchainReceiving');
+    supportsUnconfirmedTransactionOrigin = () =>
+        this.call('supportsUnconfirmedTransactionOrigin');
+    supportsLightningSends = () => this.call('supportsLightningSends');
+    supportsKeysend = () => this.call('supportsKeysend');
+    supportsPaymentLookup = () => this.call('supportsPaymentLookup');
+    supportsChannelManagement = () => this.call('supportsChannelManagement');
+    supportsCircularRebalancing = () =>
+        this.call('supportsCircularRebalancing');
+    supportsForceClose = () => this.call('supportsForceClose');
+    supportsPendingChannels = () => this.call('supportsPendingChannels');
+    supportsClosedChannels = () => this.call('supportsClosedChannels');
+    supportsMPP = () => this.call('supportsMPP');
+    supportsAMP = () => this.call('supportsAMP');
+    supportsCoinControl = () => this.call('supportsCoinControl');
+    supportsChannelCoinControl = () => this.call('supportsChannelCoinControl');
+    supportsHopPicking = () => this.call('supportsHopPicking');
+    supportsAccounts = () => this.call('supportsAccounts');
+    supportsAccountImportRescan = () =>
+        this.call('supportsAccountImportRescan');
+    supportsRouting = () => this.call('supportsRouting');
+    supportsForwardingHistory = () => this.call('supportsForwardingHistory');
+    supportsNodeInfo = () => this.call('supportsNodeInfo');
+    singleFeesEarnedTotal = () => this.call('singleFeesEarnedTotal');
+    supportsAddressTypeSelection = () =>
+        this.call('supportsAddressTypeSelection');
+    supportsTaproot = () => this.call('supportsTaproot');
+    supportsBumpFee = () => this.call('supportsBumpFee');
+    supportsOnchainSendFeeRate = () => this.call('supportsOnchainSendFeeRate');
+    supportsChannelOpenFeeRate = () => this.call('supportsChannelOpenFeeRate');
+    supportsChannelOpenMinConfs = () =>
+        this.call('supportsChannelOpenMinConfs');
+    supportsNetworkInfo = () => this.call('supportsNetworkInfo');
+    supportsSimpleTaprootChannels = () =>
+        this.call('supportsSimpleTaprootChannels');
+    supportsCustomPreimages = () => this.call('supportsCustomPreimages');
+    supportsSweep = () => this.call('supportsSweep');
+    supportsOnchainSendMax = () => this.call('supportsOnchainSendMax');
+    supportsChannelMemo = () => this.call('supportsChannelMemo');
+    supportsWithdrawalRequests = () => this.call('supportsWithdrawalRequests');
+    supportsOnchainBatching = () => this.call('supportsOnchainBatching');
+    supportsChannelBatching = () => this.call('supportsChannelBatching');
+    supportsChannelFundMax = () => this.call('supportsChannelFundMax');
+    supportsOffers = () => this.call('supportsOffers');
+    supportsOffersDirectPay = () => this.call('supportsOffersDirectPay');
+    supportsListingOffers = () => this.call('supportsListingOffers');
+    supportsBolt12Address = () => this.call('supportsBolt12Address');
+    supportsBolt11BlindedRoutes = () =>
+        this.call('supportsBolt11BlindedRoutes');
+    supportsAddressesWithDerivationPaths = () =>
+        this.call('supportsAddressesWithDerivationPaths');
+    supportsCustomFeeLimit = () => this.call('supportsCustomFeeLimit');
+    isLNDBased = () => this.call('isLNDBased');
+    supportInboundFees = () => this.call('supportInboundFees');
+    supportsAddressMessageSigning = () =>
+        this.call('supportsAddressMessageSigning');
+    supportsDevTools = () => {
+        return this.isLNDBased() || this.call('supportsDevTools');
+    };
+    supportsCashuWallet = () => this.call('supportsCashuWallet');
+    supportsLightningAddress = () =>
+        this.supportsCustomPreimages() || this.supportsCashuWallet();
+    supportsNestedSegWit = () => this.call('supportsNestedSegWit');
+    supportsSettingInvoiceExpiration = () =>
+        this.call('supportsSettingInvoiceExpiration');
+    supportsForwardingHistoryChannelFilter = (nodeInfoVersion?: string) => {
+        const VersionUtils = require('./VersionUtils').default;
+        return (
+            this.isLNDBased() &&
+            VersionUtils.isSupportedVersion(nodeInfoVersion, 'v0.20.0')
+        );
+    };
+
+    // Implementation type checks
+    isLocalWallet = () => {
+        const { implementation } = settingsStore;
+        return (
+            implementation === 'embedded-lnd' || implementation === 'ldk-node'
+        );
+    };
+
+    // LNC
+    initLNC = (...args: any[]) => this.call('initLNC', args);
+    connect = (...args: any[]) => this.call('connect', args);
+    checkPerms = () => this.call('checkPerms');
+    isConnected = (...args: any[]) => this.call('isConnected', args);
+    disconnect = (...args: any[]) => this.call('disconnect', args);
+
+    // NWC
+    initNWC = (...args: any[]) => this.call('initNWC', args);
+
+    // CLN - Routes used for CLN circular rebalancing
+    askReneCreateLayer = (...args: any[]) =>
+        this.call('askReneCreateLayer', args);
+    askReneUpdateChannel = (...args: any[]) =>
+        this.call('askReneUpdateChannel', args);
+    askReneRemoveLayer = (...args: any[]) =>
+        this.call('askReneRemoveLayer', args);
+    sendPay = (...args: any[]) => this.call('sendPay', args);
+    waitSendPay = (...args: any[]) => this.call('waitSendPay', args);
+
+    clearCachedCalls = (...args: any[]) => this.call('clearCachedCalls', args);
+}
+
+const backendUtils = new BackendUtils();
+export default backendUtils;

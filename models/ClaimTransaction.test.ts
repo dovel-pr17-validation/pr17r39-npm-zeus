@@ -1,0 +1,289 @@
+import ecc from '@bitcoinerlab/secp256k1';
+import { ECPairFactory } from 'ecpair';
+
+import {
+    SubmarineClaimTransaction,
+    ReverseClaimTransaction
+} from './ClaimTransaction';
+import type Swap from './Swap';
+
+beforeAll(() => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+});
+
+afterAll(() => {
+    jest.restoreAllMocks();
+});
+
+const submarineSwap = (overrides: Partial<Swap> = {}): Swap =>
+    ({
+        id: 'swap-id-123',
+        keys: { __D: [1, 2, 3, 4] },
+        swapTreeDetails: {
+            claimLeaf: { output: 'claim-leaf' },
+            refundLeaf: { output: 'refund-leaf' }
+        },
+        servicePubKey: 'service-pubkey',
+        ...overrides
+    } as unknown as Swap);
+
+const reverseSwap = (overrides: Partial<Swap> = {}): Swap =>
+    ({
+        id: 'swap-id-456',
+        keys: { __D: [10, 20, 30] },
+        swapTreeDetails: {
+            claimLeaf: { output: 'claim-leaf' },
+            refundLeaf: { output: 'refund-leaf' }
+        },
+        refundPubKey: 'refund-pubkey',
+        effectiveLockupAddress: 'lockup-address',
+        destinationAddress: 'destination-address',
+        preimage: { type: 'Buffer', data: [0xab, 0xcd] },
+        ...overrides
+    } as unknown as Swap);
+
+const submarineDefaults = {
+    endpoint: 'https://swaps.zeuslsp.com/api/v2',
+    claimTxDetails: { transactionHash: 'tx-hash', pubNonce: 'nonce' }
+};
+
+const reverseDefaults = {
+    transactionHex: 'tx-hex',
+    feeRate: 2,
+    minerFee: 100
+};
+
+describe('SubmarineClaimTransaction.build', () => {
+    it('builds a fully populated claim from a complete swap', () => {
+        const claim = SubmarineClaimTransaction.build({
+            swap: submarineSwap(),
+            ...submarineDefaults
+        });
+
+        expect(claim).toBeInstanceOf(SubmarineClaimTransaction);
+        expect(claim).toMatchObject({
+            endpoint: 'https://swaps.zeuslsp.com/api/v2',
+            swapId: 'swap-id-123',
+            claimLeaf: 'claim-leaf',
+            refundLeaf: 'refund-leaf',
+            privateKey: '01020304',
+            servicePubKey: 'service-pubkey',
+            transactionHash: 'tx-hash',
+            pubNonce: 'nonce'
+        });
+    });
+
+    it.each([
+        ['keys is null', { keys: null }],
+        ['__D is missing', { keys: {} }],
+        [
+            'claim leaf is missing',
+            { swapTreeDetails: { refundLeaf: { output: 'r' } } }
+        ],
+        [
+            'refund leaf is missing',
+            { swapTreeDetails: { claimLeaf: { output: 'c' } } }
+        ],
+        ['servicePubKey is unavailable', { servicePubKey: undefined }]
+    ])('returns null when %s', (_, overrides) => {
+        const claim = SubmarineClaimTransaction.build({
+            swap: submarineSwap(overrides),
+            ...submarineDefaults
+        });
+        expect(claim).toBeNull();
+    });
+});
+
+describe('ReverseClaimTransaction.build', () => {
+    it('builds a fully populated claim from a complete swap', () => {
+        const claim = ReverseClaimTransaction.build({
+            swap: reverseSwap(),
+            ...reverseDefaults
+        });
+
+        expect(claim).toBeInstanceOf(ReverseClaimTransaction);
+        expect(claim).toMatchObject({
+            endpoint: '',
+            swapId: 'swap-id-456',
+            claimLeaf: 'claim-leaf',
+            refundLeaf: 'refund-leaf',
+            privateKey: '0a141e',
+            servicePubKey: 'refund-pubkey',
+            preimageHex: 'abcd',
+            transactionHex: 'tx-hex',
+            lockupAddress: 'lockup-address',
+            destinationAddress: 'destination-address',
+            feeRate: 2,
+            minerFee: 100
+        });
+    });
+
+    // With an endpoint the native claim sends the preimage to the host
+    // in a co-signing request, and waits for it, before broadcasting
+    it('gives the native claim no endpoint, so it makes no request to the host', async () => {
+        const claim = ReverseClaimTransaction.build({
+            swap: reverseSwap({
+                endpoint: 'https://swaps.zeuslsp.com/api/v2'
+            } as any),
+            ...reverseDefaults,
+            // a caller still passing the host is ignored
+            ...({ endpoint: 'https://swaps.zeuslsp.com/api/v2' } as any)
+        });
+        expect(claim!.endpoint).toBe('');
+
+        const LncModule = {
+            buildReverseClaimTransaction: jest
+                .fn()
+                .mockResolvedValue('claimhex')
+        };
+        let swaps: any;
+        jest.isolateModules(() => {
+            jest.doMock('react-native', () => ({
+                NativeModules: { LncModule }
+            }));
+            swaps = require('../lndmobile/swaps');
+        });
+        await swaps.buildReverseClaimTransaction({
+            ...claim!,
+            network: 'mainnet'
+        });
+
+        // the endpoint is the native call's first argument
+        expect(LncModule.buildReverseClaimTransaction).toHaveBeenCalledTimes(1);
+        expect(LncModule.buildReverseClaimTransaction.mock.calls[0][0]).toBe(
+            ''
+        );
+    });
+
+    it.each([
+        ['keys is null', { keys: null }],
+        ['__D is missing', { keys: {} }],
+        [
+            'claim leaf is missing',
+            { swapTreeDetails: { refundLeaf: { output: 'r' } } }
+        ],
+        [
+            'refund leaf is missing',
+            { swapTreeDetails: { claimLeaf: { output: 'c' } } }
+        ],
+        ['refundPubKey is unavailable', { refundPubKey: undefined }],
+        ['lockupAddress is unavailable', { effectiveLockupAddress: undefined }],
+        ['destinationAddress is missing', { destinationAddress: undefined }],
+        // A rescued swap used to arrive here with no preimage at all: the
+        // claim was built with preimageHex '' and broadcast 10 times before
+        // giving up, so the host reclaimed the lockup at timeout.
+        ['preimage is missing', { preimage: undefined }],
+        [
+            'preimage is an empty buffer',
+            { preimage: { type: 'Buffer', data: [] } }
+        ]
+    ])('returns null when %s', (_, overrides) => {
+        const claim = ReverseClaimTransaction.build({
+            swap: reverseSwap(overrides),
+            ...reverseDefaults
+        });
+        expect(claim).toBeNull();
+    });
+});
+
+describe('private key deserialization (via SubmarineClaimTransaction.build)', () => {
+    const buildWith = (keys: any) =>
+        SubmarineClaimTransaction.build({
+            swap: submarineSwap({ keys }),
+            ...submarineDefaults
+        });
+
+    it('handles a plain number[] (fresh swap)', () => {
+        expect(buildWith({ __D: [1, 2, 3, 4] })?.privateKey).toBe('01020304');
+    });
+
+    it('handles a { data: number[] } shape (rehydrated swap)', () => {
+        expect(buildWith({ __D: { data: [1, 2, 3, 4] } })?.privateKey).toBe(
+            '01020304'
+        );
+    });
+
+    it('handles a JSON-round-tripped Buffer', () => {
+        const rehydrated = JSON.parse(
+            JSON.stringify(Buffer.from([0x0a, 0x0b, 0x0c, 0x0d]))
+        );
+        expect(buildWith({ __D: rehydrated })?.privateKey).toBe('0a0b0c0d');
+    });
+
+    it('handles a live ECPair, as passed by the swap screen after creation', () => {
+        const privateKey = Buffer.alloc(32, 7);
+        const keys = ECPairFactory(ecc).fromPrivateKey(privateKey);
+        expect(buildWith(keys)?.privateKey).toBe(privateKey.toString('hex'));
+    });
+
+    it('handles a live ECPair whose key is a plain Uint8Array', () => {
+        const keys = ECPairFactory(ecc).makeRandom();
+        expect(buildWith(keys)?.privateKey).toBe(
+            Buffer.from(keys.privateKey!).toString('hex')
+        );
+    });
+
+    it('handles a JSON-round-tripped Uint8Array (index-keyed object)', () => {
+        const keys = ECPairFactory(ecc).makeRandom();
+        const rehydrated = JSON.parse(JSON.stringify(keys));
+        expect(buildWith(rehydrated)?.privateKey).toBe(
+            Buffer.from(keys.privateKey!).toString('hex')
+        );
+    });
+
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+        ['no __D', {}],
+        ['__D as a string', { __D: 'oops' }],
+        ['__D as a number', { __D: 42 }],
+        ['__D object without data', { __D: { something: 'else' } }],
+        ['__D index object with a gap', { __D: { 0: 1, 2: 3 } }],
+        ['__D index object with a non-byte', { __D: { 0: 1, 1: 256 } }]
+    ])('returns null for %s keys', (_, keys) => {
+        expect(buildWith(keys)).toBeNull();
+    });
+});
+
+describe('preimage deserialization (via ReverseClaimTransaction.build)', () => {
+    const buildWith = (preimage: any) =>
+        ReverseClaimTransaction.build({
+            swap: reverseSwap({ preimage }),
+            ...reverseDefaults
+        });
+
+    it('passes a hex string through unchanged', () => {
+        expect(buildWith('0a0b0c0d')?.preimageHex).toBe('0a0b0c0d');
+    });
+
+    it('converts a Buffer to hex', () => {
+        expect(
+            buildWith(Buffer.from([0x0a, 0x0b, 0x0c, 0x0d]))?.preimageHex
+        ).toBe('0a0b0c0d');
+    });
+
+    it('converts a { data: number[] } shape to hex', () => {
+        expect(buildWith({ data: [0x0a, 0x0b, 0x0c, 0x0d] })?.preimageHex).toBe(
+            '0a0b0c0d'
+        );
+    });
+
+    it('converts a JSON-round-tripped Buffer to hex', () => {
+        const rehydrated = JSON.parse(
+            JSON.stringify(Buffer.from([0x0a, 0x0b, 0x0c, 0x0d]))
+        );
+        expect(buildWith(rehydrated)?.preimageHex).toBe('0a0b0c0d');
+    });
+
+    it.each([
+        ['null', null],
+        ['undefined', undefined],
+        ['empty string', ''],
+        ['empty buffer', Buffer.alloc(0)]
+    ])('refuses to build a claim for a %s preimage', (_, preimage) => {
+        // Previously this fell back to preimageHex '' and built a claim
+        // that could never be accepted; a reverse claim spends the lockup
+        // by revealing the preimage, so it now fails closed instead.
+        expect(buildWith(preimage)).toBeNull();
+    });
+});

@@ -1,0 +1,382 @@
+---
+name: zeus-config-and-flags
+description: Catalog of every Zeus configuration axis and the add-a-setting checklist. Load when you need to add/change/remove a user setting or flag, find where a setting lives (settings blob key, per-node vs global, nested group vs top-level), look up a default value (theme, routing fee, LSP/swap/esplora/RGS/VSS URLs, neutrino peers, invoice expiry), change a default for existing users, work in views/Settings/* or stores/SettingsStore.ts, or answer "why does a fresh install behave differently from a migrated one" (bimodalPathfinding, showMillisatoshiAmounts). Keywords: settings, defaults, updateSettings, zeus-settings-v2, certVerification, enableLSP, DropdownSetting, feature flag, deprecated setting, MOD_KEY, per-node config, embeddedLndNetwork, ldkNetwork, mutinynet.
+---
+
+# Zeus Config and Flags
+
+Every user-facing configuration axis in Zeus: where it lives, its options, its default, and the exact checklist for adding or changing a setting. Facts verified 2026-07-06 against master `c5fd094fb` (v13.1.3-alpha); the §2 LDK server rows, §3 `privacy`/`display`/LSP/`bolt12Address` tables, §4, and checklist step 6 were re-verified 2026-10-24 against master `3dc9f83e6` (v13.2.4-alpha). Defaults drift; re-verify with the commands in the final section before relying on any specific value.
+
+## When to use / When NOT to use
+
+USE this skill when you are:
+- Adding a new setting/flag, or changing an existing one (checklist below is mandatory).
+- Looking up any default value or the full option list for a settings axis.
+- Deciding whether config belongs per-node (`settings.nodes[]`) or global.
+- Debugging "my setting change wiped other settings" (shallow-merge trap) or "fresh installs behave differently from upgraded installs" (new-vs-migrated divergence).
+
+Do NOT use this skill for:
+- The keychain storage contract, the `zeus-settings-v2` blob mechanics, migration recipes, or iCloud rules → **zeus-storage-and-migrations** (that skill owns the storage layer; this one owns the catalog of what is stored).
+- Which backends support which features (`supports*()` gating) → **zeus-backends-and-capabilities**.
+- The change-approval process for storage-format changes → **zeus-change-control**. Anything that changes what is persisted (new keys, changed defaults for existing users, removed fields) requires maintainer sign-off plus a migration plan — never route around that.
+- Boot sequence / how settings are loaded at startup → **zeus-architecture-contract**.
+
+## Glossary (terms used below, defined once)
+
+| Term | Meaning |
+|---|---|
+| settings blob | One JSON object holding almost all config AND all wallet secrets, persisted in the device keychain under key `zeus-settings-v2` (see zeus-storage-and-migrations for the contract) |
+| keychain | OS secure credential store (iOS Keychain / Android Keystore), accessed via `storage/index.ts` |
+| AsyncStorage | React Native's plain, unencrypted key-value store — non-sensitive UI flags only |
+| macaroon | LND's bearer-token credential (hex-encoded here) authorizing REST API calls |
+| rune | Core Lightning's equivalent bearer-token credential |
+| LNC | Lightning Node Connect — LND remote-control protocol using a human-readable "pairing phrase" and a relay ("mailbox") server |
+| NWC | Nostr Wallet Connect (NIP-47) — wallet control over the Nostr protocol via a `nostr+walletconnect://` URL |
+| embedded node | A Lightning node running inside the app: `embedded-lnd` (LND compiled via gomobile) or `ldk-node` (LDK Node via Rust FFI) |
+| LSP | Lightning Service Provider — sells inbound channels. "Flow" is Olympus's zero-conf JIT-channel API; LSPS1/LSPS7 are standardized channel-purchase specs |
+| esplora | Blockstream-style HTTP block-explorer API used by LDK Node for chain data |
+| RGS | Rapid Gossip Sync — pre-digested Lightning network-graph snapshots for LDK |
+| VSS | Versioned Storage Service — remote encrypted storage for LDK channel state |
+| neutrino | LND's light-client chain backend (BIP157/158); "peers" are the btcd nodes it syncs from |
+| EGS / speedloader | Express Graph Sync — pre-baked graph download for embedded LND |
+| mutinynet | A custom signet (test network with 30s blocks) run by Mutiny; LDK treats it as `signet` |
+| Cashu / ecash | Chaumian ecash tokens issued by "mints"; Zeus embeds a Cashu wallet on embedded backends |
+| POS | Point of Sale mode (merchant checkout UI), standalone or Square-integrated |
+| zero-conf | Accepting a channel/payment before on-chain confirmation |
+| MOD_KEY migration | Retired one-shot settings mutation flagged by a key in legacy EncryptedStorage. Since PR #4477 the flags are only read (e.g. `'bimodal-bug-9085'`, read as `mod7` in `legacySettingsMigrations`), never written |
+| Versioned settings migration | A `priorVersion < N` block in `MigrationUtils.applySettingsMigrations`, run once per blob and recorded by the blob's `settingsVersion` stamp (`SETTINGS_VERSION` in `utils/SettingsVersion.ts`). Replaced MOD_KEY flags for settings changes (recipe owned by zeus-storage-and-migrations) |
+
+## 1) Where config lives
+
+| Location | Key(s) | What | Defined in |
+|---|---|---|---|
+| Keychain blob | `zeus-settings-v2` (`STORAGE_KEY`) | Everything in the `Settings` interface: all groups below + `nodes[]` + secrets (PINs, seeds, macaroons) | `stores/SettingsStore.ts` |
+| Keychain, separate | `zeus-units-v2` (`UNIT_KEY`) | Display units; default `'sats'` | `stores/UnitsStore.ts` |
+| Keychain, separate | `zeus-favorite-currencies` (`FAVORITE_CURRENCIES_KEY`) | Starred fiat currencies (JSON array) | `stores/SettingsStore.ts` |
+| Keychain, separate | `zeus-currency-codes` (`CURRENCY_CODES_KEY`) | Cached currency-code list | `stores/SettingsStore.ts` |
+| Keychain, separate | `zeus-activity-filters-v2` (`ACTIVITY_FILTERS_KEY`) | Activity-list filters | `stores/ActivityStore.ts` |
+| AsyncStorage | `persistentServicesEnabled` | Embedded-LND persistent background services (Android) | `views/Settings/EmbeddedNode/Advanced.tsx`, `views/PendingHTLCs.tsx` |
+| AsyncStorage | `persistentLdkNodeServicesEnabled` | LDK Node persistent background services | `views/Settings/EmbeddedNode/index.tsx` (`PERSISTENT_LDK_KEY`) |
+| AsyncStorage | `persistentNWCServicesEnabled` (`NWC_PERSISTENT_SERVICE_ENABLED`) | NWC wallet-service persistence | `stores/NostrWalletConnectStore.ts` |
+
+Rules of thumb:
+- Secrets and anything financial → the blob (keychain). Non-sensitive UI-only flags → AsyncStorage. Never put new data in legacy `react-native-encrypted-storage` (migration flags only).
+- Any NEW persisted keychain key must be registered in three registries (`utils/DataClearUtils.ts` STORAGE_KEYS, `utils/KeychainRecoveryUtils.ts` OTHER_KEYS, `MigrationUtils.keychainCloudSyncMigration` migrationKeys) or it leaks on wallet clear/recovery — full recipe in **zeus-storage-and-migrations**.
+
+Critical load semantics (verified in `SettingsStore.getSettings`, 2026-10-24): defaults live in `DEFAULT_SETTINGS` (`stores/SettingsStore.ts`, search `export const DEFAULT_SETTINGS`), and the `@observable settings` initializer is a deep copy of it. When a stored blob exists it REPLACES that object wholesale. The one exception is `MigrationUtils.applyMissingSettingsGroups` (PR #4788, issue #4776): on every load it backfills any top-level group entirely absent from the blob from `DEFAULT_SETTINGS`, with `BACKFILL_OVERRIDES` applied (currently `privacy: { clipboard: false, enableMempoolRates: false }`). A group that exists, even partially, is left alone, and there is no deep merge. Consequence: a new field inside an existing group, or a new flat top-level key, is `undefined` for every existing user until they touch its UI control. Every consumer must tolerate that (`settings?.group?.field ?? fallback`, or `||` fallbacks like `getLspConfigForNetwork` uses).
+
+## 2) Per-node axes — `settings.nodes[]` + `settings.selectedNode`
+
+Each wallet is a `Node` object (interface in `stores/SettingsStore.ts`). `selectedNode` is the array index of the active wallet. On load/switch, `updateNodeProperties` copies the selected node's fields onto flat observables (`this.host`, `this.implementation`, ...) that the rest of the app reads.
+
+| Field | Applies to | Notes |
+|---|---|---|
+| `implementation` | all | One of 7: `'embedded-lnd' \| 'ldk-node' \| 'lnd' \| 'lightning-node-connect' \| 'cln-rest' \| 'lndhub' \| 'nostr-wallet-connect'`. Falls back to `'lnd'` when unset. Picker labels in `INTERFACE_KEYS` |
+| `host`, `port`, `url` | remote REST | Node endpoint |
+| `macaroonHex` | lnd | LND REST credential |
+| `rune` | cln-rest | CLN credential |
+| `accessKey` | lndhub | LNDHub access key |
+| `certVerification` | remote REST | **Default `false`** (UI initial state and `updateNodeProperties` fallback). SECURITY: `false` → `trusty: !certVerification` in `backends/LND.ts`, i.e. TLS certificate validation is DISABLED by default for remote node connections (accepted because self-signed node certs are the norm). Turning it on requires installing the node's cert (`views/Settings/CertInstallInstructions.tsx`). The separate Tor `.onion` TLS rule is owned by zeus-backends-and-capabilities |
+| `enableTor` | remote | Route requests through Tor |
+| `pairingPhrase`, `mailboxServer`, `customMailboxServer` | lightning-node-connect | Mailbox options in `LNC_MAILBOX_KEYS` (`mailbox.terminal.lightning.today:443` \| `lnc.zeusln.app:443` \| custom) |
+| `nostrWalletConnectUrl` | nostr-wallet-connect | The NWC pairing URL (note the field name — it is NOT `nwcUrl`) |
+| `seedPhrase`, `walletPassword`, `adminMacaroon` | embedded-lnd | Wallet secrets, plaintext in the blob |
+| `embeddedLndNetwork` | embedded-lnd | Stored values are CAPITALIZED `'Mainnet'`/`'Testnet'` (code compares `=== 'Mainnet'`), while the creation picker uses lowercase `EMBEDDED_NODE_NETWORK_KEYS` values — a real casing trap. Mutinynet is filtered OUT of the picker for new embedded-lnd wallets (`WalletConfiguration.tsx` filters `k.value !== 'mutinynet'`) |
+| `lndDir` | embedded-lnd | Per-wallet data dir; new wallets get a uuid, absent → falls back to `'lnd'` |
+| `isSqlite` | embedded-lnd | Database backend: `false` = Bolt DB (default, `?? false`), `true` = SQLite. Picker: "bolt"/"sqlite" in WalletConfiguration |
+| `ldkNetwork` | ldk-node | Picker shows all of `mainnet \| testnet \| mutinynet` (lowercase). `mutinynet` maps to LDK network `signet` via `getNetworkType` in `utils/LdkNodeUtils.ts`. The `SupportedNetwork` type also includes `'signet'` and `'regtest'` but neither has UI exposure (types-only, as of 2026-07-06) |
+| `ldkNodeDir`, `ldkMnemonic`, `ldkPassphrase` | ldk-node | Data dir (`ldk-node/<uuid>`) + wallet secrets |
+| `ldkEsploraServer` | ldk-node | Default per network via `getDefaultEsploraServer` — mainnet `https://electrs.zeusln.com` |
+| `ldkRgsServer` | ldk-node | RGS format v2 endpoints (`RGS_SERVERS_MAINNET` / `RGS_SERVERS_TESTNET` in `utils/LdkNodeUtils.ts`): mainnet default `https://rgs.zeusln.com/snapshot/v2` (alternate `https://rapidsync.lightningdevkit.org/snapshot/v2`), testnet `https://rapidsync.lightningdevkit.org/testnet/v2/snapshot`, none for signet/mutinynet. The `/v2` segment sits after `snapshot` on mainnet but before it on testnet; do not normalize. Old v1 values are rewritten by `MigrationUtils.applyRgsDefaultsToV2`. Unset falls back to `getDefaultRgsServer` |
+| `ldkScorerUrl` | ldk-node | Default `https://scores.zeusln.com/latest.bin` (`DEFAULT_SCORER_URL`). `''` turns external scoring off: `updateNodeProperties` reads it with `??`, so only an unset value falls back to the default (#5154). Do not change that read to `\|\|` |
+| `ldkVssServer` | ldk-node | Default `https://vss.zeusln.com/vss` (`DEFAULT_VSS_SERVER`) |
+| `nickname`, `photo`, `dismissCustodialWarning` | all | Cosmetics + custodial-warning dismissal |
+
+Quirks:
+- LNDHub credentials (`username`, `password`, `lndhubUrl`) are read by `updateNodeProperties` via an `any` cast but are NOT declared on the `Node` interface — grep for them before assuming the interface is complete.
+- Remote nodes have NO network field; network is detected from `getinfo` at connect time. Only embedded wallets choose a network.
+- Per-node editing UI: `views/Settings/WalletConfiguration.tsx` (single 3000+ line view handling all 7 implementations); wallet list: `views/Settings/Wallets.tsx`.
+
+## 3) Global settings catalog
+
+All defaults below are `DEFAULT_SETTINGS` in `stores/SettingsStore.ts` (search `export const DEFAULT_SETTINGS`); `@observable settings` starts as a deep copy of it, and a stored blob replaces it except for the absent-group backfill described in §1. "Nested" groups are replaced wholesale by `updateSettings` (see checklist); "flat" keys sit at the blob top level.
+
+### Top-level scalars (flat)
+
+| Axis | Options | Default | UI | Stability |
+|---|---|---|---|---|
+| `pin`, `passphrase`, `duressPin`, `duressPassphrase` | strings | unset | `views/Settings/SetPin.tsx`, `SetPassword.tsx`, `SetDuressPin.tsx`, `SetDuressPassword.tsx` | production — stored PLAINTEXT in the blob (keychain is the security boundary; do not "fix" by hashing without maintainer sign-off) |
+| `scramblePin` | bool | `true` | `views/Settings/Security.tsx` | production |
+| `loginBackground` | bool | `false` | Security.tsx | production |
+| `isBiometryEnabled` / `supportedBiometryType` | bool / detected enum | `false` / `undefined` | Security.tsx | production |
+| `authenticationAttempts` | number | unset | incremented by `views/Lockscreen.tsx` on failed login | internal counter, not a user toggle |
+| `fiatEnabled` | bool | `true` | `views/Settings/Currency.tsx` | production |
+| `fiat` | 101 entries in `CURRENCY_KEYS` (99 fiat currencies plus XAU/XAG; one commented-out KWD entry inflates a naive `grep -c "key:"` to 102 — count with `grep -c '^        key:'`) | `'USD'` (`DEFAULT_FIAT`) | Currency.tsx / SelectCurrency.tsx | production |
+| `fiatRatesSource` | `'Zeus' \| 'Yadio'` (`FIAT_RATES_SOURCE_KEYS`) | `'Zeus'` | Currency.tsx | production |
+| `locale` | 33 ISO codes in `LOCALE_KEYS` | unset → English. NOTE: exported `DEFAULT_LOCALE = 'English'` is a STALE pre-ISO-migration constant; do not copy it | `views/Settings/Language.tsx` | production |
+| `selectNodeOnStartup` | bool | `false` | surfaced in `views/Settings/Display.tsx` | production |
+| `lndHubLnAuthMode` | `'BlueWallet' \| 'Alby'` (`LNDHUB_AUTH_MODES`) | unset; `views/LnurlAuth.tsx` state defaults to `'Alby'` | LnurlAuth.tsx | production |
+| `justDeletedWallet` | bool | unset | internal flag consumed by `views/Settings/Wallets.tsx` | internal |
+
+### `privacy` (nested) — UI: `views/Settings/Privacy.tsx`, `views/Settings/StealthMode.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `defaultBlockExplorer` | `mempool.space \| blockstream.info \| Custom` (`BLOCK_EXPLORER_KEYS`) + `customBlockExplorer` | `'mempool.space'` |
+| `clipboard` | bool (auto-detect clipboard contents) | `true` |
+| `lurkerMode` | bool (hide balances; `SettingsStore.toggleLurker` reveals for 3s then re-hides) | `false` |
+| `enableMempoolRates` | bool (fetch fee rates from mempool.space) | `true` |
+| `mempoolInstance` + `customMempoolInstance` | `MEMPOOL_INSTANCE_KEYS`: `electrs.zeusln.com \| mempool.space \| Custom`. Resolved by `getMempoolApiUrl` in `utils/UrlUtils.ts` for broadcasting and other Esplora API calls; an unset value means `DEFAULT_MEMPOOL_INSTANCE`, with no migration. Mainnet only: testnet and mutinynet use fixed hosts unless Custom is set | `'electrs.zeusln.com'` (`DEFAULT_MEMPOOL_INSTANCE`) / `''` |
+| `stealthMode` | bool — Android only (activity-alias app disguises) | `false` |
+| `stealthApp` | `'zeus' \| 'calculator' \| 'vpn' \| 'qrscanner' \| 'notepad'` | `'calculator'` |
+| `stealthPinLength` | number of unlock taps | `5` |
+| `stealthVpnCountry` / `stealthVpnServer` | strings (VPN-disguise unlock combo) | `'Switzerland'` / `'Geneva'` |
+
+### `display` (nested) — UI: `views/Settings/Display.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `theme` | 18 themes in `THEME_KEYS`; `RETIRED_THEMES` are moved to the default by the `SETTINGS_VERSION` 3 migration | `'kyriaki'` (`DEFAULT_THEME`) |
+| `defaultView` | `'Keypad' \| 'Balance'` (`DEFAULT_VIEW_KEYS`) | `'Keypad'` |
+| `displayNickname` | bool | `false` |
+| `bigKeypadButtons` | bool | `false` |
+| `showAllDecimalPlaces` | bool | `false` |
+| `removeDecimalSpaces` | bool | `false` |
+| `showMillisatoshiAmounts` | bool | `false` fresh — but `true` for legacy-migrated users (read-only legacy flag `millisat_amounts`, read as `mod5` in `legacySettingsMigrations`); see §5 |
+| `dateFormat` | `DATE_FORMAT_KEYS`: `default \| iso \| dmy \| mdy`. UI: `views/Settings/DateTime.tsx` (linked from Display), read by `utils/DateTimeUtils.ts` (#4951) | `'default'` |
+| `timeFormat` | `TIME_FORMAT_KEYS`: `24h \| 12h` | `'24h'` |
+| `showSeconds` | bool | `false` |
+
+### `payments` (nested) — UI: `views/Settings/PaymentsSettings.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `defaultFeeMethod` | `'fixed' \| 'percent'` | `'fixed'` — DEPRECATED (see §4) |
+| `defaultFeePercentage` | string percent | `'5.0'` — the 5% routing-fee limit. Companion rule (verified `utils/FeeUtils.ts`): amounts ≤ 1000 sats allow up to 100% fee (`calculateDefaultRoutingFee`) |
+| `defaultFeeFixed` | string sats | `'1000'` |
+| `timeoutSeconds` | string | `'60'` |
+| `preferredMempoolRate` | `fastestFee \| halfHourFee \| hourFee \| minimumFee` (`MEMPOOL_RATES_KEYS`) | `'fastestFee'` |
+| `slideToPayThreshold` | number sats — payments above it require slide-to-confirm | `10000` (`DEFAULT_SLIDE_TO_PAY_THRESHOLD`) |
+| `enableDonations` / `defaultDonationPercentage` | bool / number | `false` / `5` |
+
+### `invoices` (nested) — UI: `views/Settings/InvoicesSettings.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `addressType` | on-chain address type code | `'0'` |
+| `memo`, `receiverName` | strings | `''` |
+| `expiry` + `timePeriod` + `expirySeconds` | display value + `TIME_PERIOD_KEYS` unit + canonical seconds | `'1'` / `'Hours'` / `'3600'`. This TRIPLET must stay mutually consistent. `MigrationUtils.applyInvoiceExpiryDisplay` repaired drift once per blob in the `priorVersion < 1` block of `applySettingsMigrations`, which runs on both load paths ("3600 hours" bug, #4149); it does not re-run on later loads. Never update one field alone |
+| `routeHints` | bool | `false` |
+| `ampInvoice` | bool (AMP = LND's Atomic Multi-Path invoices) | `false` |
+| `blindedPaths` | bool (receiver-privacy routes) | `false` |
+| `showCustomPreimageField` | bool | `false` |
+| `displayAmountOnInvoice` | bool | `false` — DEPRECATED |
+| `defaultInvoiceType` | `'unified' \| 'lightning'` (`DEFAULT_INVOICE_TYPE_KEYS`) | `'lightning'` |
+
+### `channels` (nested) — UI: `views/Settings/ChannelsSettings.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `min_confs` | optional number (`min_confs?: number`): confirmations required on the funding inputs. Unset falls back to 1. `0` is a real value: channel opens may spend unconfirmed funds (`spend_unconfirmed: min_confs === 0` in `views/OpenChannel.tsx`), and fund max counts the unconfirmed balance. See the notes below | `1` inline; unset after a cleared field |
+| `privateChannel` | bool (unannounced channel) | `true` |
+| `scidAlias` | bool (short-channel-id alias, needed for private-channel invoices) | `true` |
+| `simpleTaprootChannel` | bool (experimental taproot channel type) | `false` |
+
+`min_confs` rules (since #4841):
+
+- The field is shown in `views/Settings/ChannelsSettings.tsx` and `views/OpenChannel.tsx` only when `BackendUtils.supportsChannelOpenMinConfs()` is true: LND, embedded LND, LNC, CLN. It is hidden on LDK Node (its open calls take no min confs), LndHub and NWC. `spend_unconfirmed` is also ignored for fund max where the flag is false.
+- Text input goes through `OpenChannelUtils.parseMinConfs`: an empty or non-integer entry returns `undefined` (unset), so clearing the field never stores `0`. The open request sends `min_confs ?? 1`.
+- Read it with `??`, never `||`. `settings.channels.min_confs || 1` turned a saved `0` back into `1` before #4841.
+- Blobs that stored `0` from a cleared field before #4841 were not migrated. Those users now get `0` applied (opens may spend unconfirmed funds). This was a release-note decision, not an oversight.
+
+The three toggles are also read with `??` and their defaults (`privateChannel ?? true`, `scidAlias ?? true`, `simpleTaprootChannel ?? false`). A `!== null` check lets `undefined` through, which reads as falsy: the opposite of the `true` defaults.
+
+### Embedded-node group — FLAT top-level keys — UI: `views/Settings/EmbeddedNode/*`
+
+| Axis | Options | Default |
+|---|---|---|
+| `automaticDisasterRecoveryBackup` | bool (channel-backup upload) | `true` |
+| `expressGraphSync` | bool (EGS download) | `false` |
+| `resetExpressGraphSyncOnStartup` | bool | `false` |
+| `bimodalPathfinding` | bool (LND bimodal payment-probability model) | `true` fresh — but forced `false` for legacy-migrated users (read-only legacy flag `bimodal-bug-9085`, read as `mod7` in `legacySettingsMigrations`, lnd issue #9085); see §5 |
+| `graphSyncPromptNeverAsk` / `graphSyncPromptIgnoreOnce` | bool | `false` / `false` |
+| `dontAllowOtherPeers` | bool (restrict neutrino to listed peers) | `false` |
+| `neutrinoPeersMainnet` | string[] | `DEFAULT_NEUTRINO_PEERS_MAINNET` (5 peers: `btcd1.lnolymp.us`, `btcd2.lnolymp.us`, `btcd-mainnet.lightning.computer`, `node.eldamar.icu`, `noad.sathoarder.com`); regional alternates in `SECONDARY_NEUTRINO_PEERS_MAINNET` |
+| `neutrinoPeersTestnet` | string[] | 3 peers (`testnet.lnolymp.us`, `btcd-testnet.lightning.computer`, `testnet.blixtwallet.com`) |
+| `zeroConfPeers` | string[] pubkeys allowed to open zero-conf channels | `[]` |
+| `rescan`, `compactDb`, `recovery` | bool one-shot startup flags | `false` |
+| `initialLoad` | bool | `true` |
+| `embeddedTor` | bool (run embedded LND over Tor) | `false` |
+| `feeEstimator` + `customFeeEstimator` | `FEE_ESTIMATOR_KEYS` (lightning.computer \| strike.me \| Custom) | `https://nodes.lightning.computer/fees/v1/btc-fee-estimates.json` (`DEFAULT_FEE_ESTIMATOR`) |
+| `speedloader` + `customSpeedloader` | `SPEEDLOADER_KEYS` (ZEUS \| Blixt \| Custom) | `https://egs.lnze.us/` (`DEFAULT_SPEEDLOADER`) |
+
+### LSP group — FLAT top-level keys — UI: `views/Settings/LSP.tsx`, `views/Settings/LSPServicesList.tsx`
+
+Per-network TRIPLETS (mainnet/testnet/mutinynet). The canonical resolver is `getLspConfigForNetwork(settings, network)` in `stores/SettingsStore.ts` — it accepts a network string or NodeInfo-style flags, and treats `'signet'` as testnet. Always use it; never read the triplet fields directly.
+
+| Axis | Default |
+|---|---|
+| `enableLSP` | `true` |
+| `lspMainnet` / `lspTestnet` / `lspMutinynet` (Flow hosts, `DEFAULT_LSP_*`) | `https://flow.zeuslsp.com` / `https://flow.testnet.zeuslsp.com` / `https://flow.mutinynet.zeuslsp.com`. Stored values equal to the old `lnolymp.us` defaults are rewritten by `MigrationUtils.applyOlympusHostsToZeusLsp`; custom hosts are left alone |
+| `lspAccessKey` | `''` |
+| `requestSimpleTaproot` | `true` |
+| `lsps1RestMainnet` / `...Testnet` / `...Mutinynet` | `https://lsps1.zeuslsp.com` / `https://lsps1.testnet.zeuslsp.com` / `https://lsps1.mutinynet.zeuslsp.com` (same migration) |
+| `lsps1PubkeyMainnet` / `...Testnet` / `...Mutinynet` | Olympus node pubkeys (see `DEFAULT_LSPS1_PUBKEY_*` consts) |
+| `lsps1HostMainnet` / `...Testnet` / `...Mutinynet` | `45.79.192.236:9735` / `139.144.22.237:9735` / `45.79.201.241:9735` |
+| `lsps1Token` | `''` |
+| `lsps1ShowPurchaseButton` | unset — DEPRECATED |
+
+### `swaps` (nested) — UI: `views/Swaps/Settings.tsx` (note: under views/Swaps/, not views/Settings/)
+
+| Axis | Options | Default |
+|---|---|---|
+| `hostMainnet` | `SWAP_HOST_KEYS_MAINNET`: SATS Routing, Coinos, Custom | `https://satsrouting.exchange/v2` (`DEFAULT_SWAP_HOST_MAINNET`) |
+| `hostTestnet` | `SWAP_HOST_KEYS_TESTNET`: Boltz, Custom | `https://api.testnet.boltz.exchange/v2` — **dead**, see below |
+| `customHost` | string | `''` |
+| `proEnabled` | bool — unlocks `pro: true` hosts (Custom only) | `false` |
+
+Boltz and SwapMarket were retired from the mainnet roster in Sept 2026: Boltz suspended
+its swap service indefinitely on 2026-08-03 and took its infrastructure offline, and
+SwapMarket's API is gated behind a shared secret only its own frontend holds (401 from
+ZEUS). Both are listed in `RETIRED_SWAP_HOSTS_MAINNET_V2`, and
+`MigrationUtils.applyRetiredSwapHosts` moves anyone pinned to them back to the default under
+the `SETTINGS_VERSION` 2 gate. Retirements are one list per settings version — the v1 list
+(Eldamar) is frozen, so a later retirement takes a new list and a new version rather than
+extending an old one. `proEnabled` is left as-is by the migration; it is shared across both
+networks. The testnet default is also dead and has no working replacement — no
+Boltz-compatible testnet provider exists publicly — so `SWAP_HOST_KEYS_TESTNET` is
+knowingly left pointing at it.
+
+### `lightningAddress` (nested) — UI: `views/Cashu/LightningAddress/LightningAddressSettings.tsx` (Cashu) and `views/LightningAddress/NWCAddressSettings.tsx` (NWC); `views/LightningAddress/LightningAddressSettings.tsx` only offers switch/delete for a retired Zaplocker address
+
+| Axis | Options | Default |
+|---|---|---|
+| `enabled` | bool (ZEUS Pay address) | `false` |
+| `automaticallyAccept` | bool | `true` |
+| `automaticallyAcceptAttestationLevel` | `0 \| 1 \| 2` | `2` — DEPRECATED (Zaplocker, nothing reads it) |
+| `automaticallyRequestOlympusChannels` | bool | `false` — DEPRECATED |
+| `routeHints` | bool | `false` — DEPRECATED (Zaplocker, nothing reads it) |
+| `allowComments` | bool | `true` |
+| `zapReceiptsEnabled` | bool (Nostr zap receipts) | `true` |
+| `nostrPrivateKey` | string | `''` — DEPRECATED (Zaplocker, nothing reads it) |
+| `nostrRelays` | string[] | `DEFAULT_NOSTR_RELAYS` (8 relays; the older 3-relay list survives as `DEFAULT_NOSTR_RELAYS_2023` for migration) — DEPRECATED (Zaplocker, only the mod8 migration touches it) |
+| `notifications` | `0 \| 1 \| 2` (`NOTIFICATIONS_PREF_KEYS`: disabled / push / nostr) | `0` |
+| `mintUrl` | string (Cashu-type address mint) | `''` |
+| `posEnabled` | bool — ZEUS Pay+ web POS | `false` (newer, treat as experimental) |
+
+### `bolt12Address` (nested) — UI: `views/Settings/Bolt12Address.tsx`
+
+`localPart` (string, default `''`): username for a BOLT12 offer-based address (CLN/LDK backends). `offer` (optional string, no default): the BOLT12 offer string for that address, saved on creation; for addresses created before it was persisted, `views/Settings/Bolt12Address.tsx` looks it up from the node's offers by label and saves it.
+
+### `ecash` (nested) — UI: `views/Settings/EcashSettings.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `enableCashu` | bool | `false` |
+| `enableMultiMint` | bool (NUT-15 multi-mint payments) | `false` |
+| `automaticallySweep` | bool (sweep ecash to LN balance) | `false` |
+| `sweepThresholdSats` | number | `10000` |
+| `initialMintUrls` | string[] | unset (optional) |
+
+Cashu is only available on embedded backends — gating rules live in **zeus-backends-and-capabilities**.
+
+### `pos` (nested) — UI: `views/Settings/PointOfSale.tsx`
+
+| Axis | Options | Default |
+|---|---|---|
+| `posEnabled` | `'disabled' \| 'square' \| 'standalone'` (`PosEnabled` enum / `POS_ENABLED_KEYS`) | `'disabled'` |
+| `squareEnabled` | bool | `false` — DEPRECATED (migrated into `posEnabled`) |
+| `squareAccessToken` / `squareLocationId` / `squareDevMode` | Square API config | `''` / `''` / `false` |
+| `merchantName`, `taxPercentage` | strings | `''` |
+| `confirmationPreference` | `'0conf' \| '1conf' \| 'lnOnly'` (`POS_CONF_PREF_KEYS`) | `'lnOnly'` |
+| `disableTips` | bool | `false` |
+| `showKeypad` | bool | `true` |
+| `enablePrinter` | bool | `false` |
+| `defaultView` | `'Products' \| 'POS Keypad'` (`DEFAULT_VIEW_KEYS_POS`) | `'Products'` |
+
+### `networking` (nested) — UI: `views/Settings/Networking.tsx`
+
+Single axis: `disableOfflineCheck` (bool, default `false`) — skips the connectivity probe before requests.
+
+### Not a setting: developer mode
+
+There is NO developer-mode toggle. Developer tools are gated purely by `supportsDevTools()` in `utils/BackendUtils.ts` (`isLNDBased() || this.call('supportsDevTools')` — LND-based backends, plus any backend that implements `supportsDevTools`, currently LndHub and CLNRest). Don't invent a settings flag for it.
+
+## 4) Deprecated-but-retained flags
+
+All nine are marked `// deprecated` in `stores/SettingsStore.ts` (four of them `// deprecated (Zaplocker)`, left after Zaplocker address code was removed in #4933) and MUST stay in the type + defaults:
+
+| Flag | Group | Why it can't be casually deleted |
+|---|---|---|
+| `defaultFeeMethod` | payments | Still read as a fallback by `views/Settings/PaymentsSettings.tsx` (`feeLimitMethod`); present in every existing blob |
+| `displayAmountOnInvoice` | invoices | Present in existing blobs; type removal breaks migration code paths |
+| `squareEnabled` | pos | `MigrationUtils.legacySettingsMigrations` still reads it to migrate old installs to `posEnabled` (and its test fixtures reference it) |
+| `automaticallyRequestOlympusChannels` | lightningAddress | Required (non-optional) field of `LightningAddressSettings`, present in existing blobs. Nothing writes it any more except the `DEFAULT_SETTINGS` default |
+| `automaticallyAcceptAttestationLevel` | lightningAddress | Zaplocker; nothing reads it. Required field, present in existing blobs |
+| `routeHints` | lightningAddress | Zaplocker; nothing reads it. Required field |
+| `nostrPrivateKey` | lightningAddress | Zaplocker; nothing reads it. Required field, may hold a key in existing blobs |
+| `nostrRelays` | lightningAddress | Zaplocker. Required field; only the legacy relay-list migration in `MigrationUtils.legacySettingsMigrations` touches it |
+| `lsps1ShowPurchaseButton` | LSP (flat) | Present in existing blobs; optional field |
+
+General rule: removing a persisted field is a storage-format change. Old blobs keep the field forever; migration code and its tests reference it; and TypeScript on those paths breaks if the type disappears. Removal requires the gated process in **zeus-change-control** plus a migration plan per **zeus-storage-and-migrations**.
+
+## 5) New-vs-migrated divergences (document yours if you create one)
+
+Because the MOD_KEY blocks in `MigrationUtils.legacySettingsMigrations` run only for users upgrading from the legacy `zeus-settings` blob, some settings intentionally differ between fresh installs and migrated installs. Since PR #4477 those flags are read but never written; versioned migrations in `applySettingsMigrations` run on both load paths, and fresh installs start stamped at `SETTINGS_VERSION` (`DEFAULT_SETTINGS.settingsVersion`) so they skip them:
+
+| Setting | Fresh install | Legacy-migrated | Cause |
+|---|---|---|---|
+| `bimodalPathfinding` | `true` (inline default) | `false` | MOD_KEY `bimodal-bug-9085` disables it for existing users while lnd issue #9085 stands |
+| `display.showMillisatoshiAmounts` | `false` (inline default) | `true` | MOD_KEY `millisat_amounts` opted existing users in |
+
+If your change creates such a divergence, it must be stated in the PR description and added to this table.
+
+## 6) ADD-A-SETTING CHECKLIST
+
+Follow every step; skipping any one has caused real bugs (data loss via shallow merge, "3600 hours" display corruption, leaked keys).
+
+1. **Choose the home.**
+   - Per-wallet behavior → new field on the `Node` interface (`stores/SettingsStore.ts`).
+   - Global, thematically grouped → the matching nested group interface (`PrivacySettings`, `PaymentsSettings`, ...).
+   - Global, embedded-node/LSP-style → flat top-level key on `Settings`.
+   - Non-sensitive UI-only flag that shouldn't live in the secrets blob → AsyncStorage (see §1 examples).
+2. **Type it** in `stores/SettingsStore.ts`. Prefer optional (`field?:`) — existing blobs won't have it (see §1 load semantics).
+3. **Add the default** in `DEFAULT_SETTINGS` (search `export const DEFAULT_SETTINGS` in `stores/SettingsStore.ts`). Existing users get it only if its whole top-level group is absent from their blob (`applyMissingSettingsGroups`); a field added to an existing group, or a new flat key, stays `undefined` for them, so every reader still needs a fallback.
+4. **If it's an enumerated axis**, add an exported `*_KEYS` array (key/value/translateKey objects) next to the other pickers so DropdownSetting UIs and tests can consume it.
+5. **Build the UI** in the matching `views/Settings/*.tsx` (or per-node in `WalletConfiguration.tsx`). When persisting, use the shallow-merge-safe pattern — `SettingsStore.updateSettings` merges ONLY the top level, so nested groups are replaced wholesale:
+   ```ts
+   // switch or dropdown: take the value from onValueChange
+   await updateSettingsGroup('payments', { myNewField: value });
+   // text input that writes per keystroke; flushPendingSettings() on unmount
+   updateSettingsGroupDebounced('payments', { myNewField: text });
+   ```
+   `updateSettingsGroup` merges into the group inside the write queue. Spreading a snapshot taken at render time (`...settings.payments`) reverts a sibling field written by an earlier queued call (#4841, #4903), and `check-settings-writes.test.ts` fails on it. Do not disable the control with `settingsUpdateInProgress`. Flat top-level keys (`updateSettings({ enableLSP: false })`) are safe as they are.
+6. **Locale strings**: add English copy to `locales/en.json` ONLY (the other 36 locale files are Transifex-managed; rule owned by **zeus-change-control**). Reference via `localeString('views.Settings.<...>')`.
+7. **Changing an existing default for existing users?** That is a storage-format change: bump `SETTINGS_VERSION` (`utils/SettingsVersion.ts`) and add a value-conditional mutation in a new `priorVersion < N` block of `MigrationUtils.applySettingsMigrations`, like `applyRgsDefaultsToV2` or `applyRetiredThemes`. That function runs on both load paths, so no flag, no `setSettings` call, and no edit to `legacySettingsMigrations` is needed. Recipe and rules in **zeus-storage-and-migrations**. Maintainer sign-off required.
+8. **Creating a fresh-vs-migrated divergence?** Document it (§5).
+9. **New separate keychain key** (not in the blob)? Register it in the three registries (§1) — recipe in **zeus-storage-and-migrations**.
+10. **Verify**: `yarn verify` (test + prettier + tsc + lint) and fill in the PR template's backend-testing matrix — details in **zeus-validation-and-qa** / **zeus-change-control**.
+
+## Provenance and maintenance
+
+Facts verified 2026-07-06 against master `c5fd094fb` (v13.1.3-alpha); the sections listed in the header were re-verified 2026-10-24 against master `3dc9f83e6` (v13.2.4-alpha), adding `utils/UrlUtils.ts` and `utils/DateTimeUtils.ts`. Sources read: `stores/SettingsStore.ts`, `utils/MigrationUtils.ts`, `utils/LdkNodeUtils.ts`, `utils/FeeUtils.ts`, `utils/BackendUtils.ts`, `backends/LND.ts`, `stores/UnitsStore.ts`, `stores/ActivityStore.ts`, `stores/NostrWalletConnectStore.ts`, and `views/Settings/*`. The glossary migration rows, §1 load semantics, §3 intro and invoices expiry row, §5 intro, checklist steps 3 and 7, the migration wording in the §3 `showMillisatoshiAmounts` and `bimodalPathfinding` rows, and the two re-verification rows on defaults location and MOD_KEY list re-verified 2026-10-24 against master `3dc9f83e6`. Defaults are volatile; re-verify before citing:
+
+| Volatile fact | Re-verification command |
+|---|---|
+| Defaults block location + every default value | `grep -n 'export const DEFAULT_SETTINGS' stores/SettingsStore.ts` then read the object |
+| Blob key / out-of-blob keys | `grep -rn "STORAGE_KEY\|UNIT_KEY\|FAVORITE_CURRENCIES_KEY\|CURRENCY_CODES_KEY\|ACTIVITY_FILTERS_KEY = " stores/` |
+| AsyncStorage flag names | `grep -rn "persistentServicesEnabled\|persistentLdkNodeServicesEnabled\|persistentNWCServicesEnabled" stores views` |
+| 7 implementations + picker labels | `grep -n "Implementations =" -A 8 stores/SettingsStore.ts && grep -n "INTERFACE_KEYS" -A 12 stores/SettingsStore.ts` |
+| certVerification default + TLS implication | `grep -n "certVerification: false" views/Settings/WalletConfiguration.tsx && grep -n "trusty" backends/LND.ts` |
+| Theme count + default | `sed -n '/THEME_KEYS/,/^];/p' stores/SettingsStore.ts \| grep -c "key:"` and `grep -n "DEFAULT_THEME" stores/SettingsStore.ts` |
+| Locale count | `sed -n '/LOCALE_KEYS = /,/^];/p' stores/SettingsStore.ts \| grep -c "key:"` and `ls locales/*.json \| wc -l` |
+| Routing-fee default + ≤1000-sat rule | `grep -n "defaultFeePercentage\|DEFAULT_ROUTING_FEE_PERCENT" stores/SettingsStore.ts utils/FeeUtils.ts` |
+| LSP/LSPS1 triplets + signet→testnet | `grep -n "DEFAULT_LSP\|DEFAULT_LSPS1\|signet" stores/SettingsStore.ts` |
+| Swap hosts | `grep -n "SWAP_HOST_KEYS\|DEFAULT_SWAP_HOST" stores/SettingsStore.ts` |
+| LDK server defaults + mutinynet→signet | `grep -n "DEFAULT_VSS_SERVER\|DEFAULT_SCORER_URL\|rgs.zeusln\|electrs.zeusln\|case 'mutinynet'" utils/LdkNodeUtils.ts` |
+| Neutrino peer lists | `grep -n "DEFAULT_NEUTRINO_PEERS" -A 8 stores/SettingsStore.ts` |
+| Deprecated flags still present | `grep -n "deprecated" stores/SettingsStore.ts` |
+| MOD_KEY list (divergences) and version gates | `grep -n "EncryptedStorage.getItem('" utils/MigrationUtils.ts` (read-only legacy and v1 flags) and `grep -n 'priorVersion <' utils/MigrationUtils.ts` |
+| Mutinynet filtered from embedded-lnd picker | `grep -n "mutinynet" views/Settings/WalletConfiguration.tsx` |
+| embeddedLndNetwork capitalization | `grep -rn "embeddedLndNetwork === 'Mainnet'" views/ \| head -3` |
+| No dev-mode toggle | `grep -n "supportsDevTools" utils/BackendUtils.ts` |

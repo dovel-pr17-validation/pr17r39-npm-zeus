@@ -1,0 +1,455 @@
+import * as React from 'react';
+import forEach from 'lodash/forEach';
+import {
+    StyleSheet,
+    ScrollView,
+    Text,
+    TouchableOpacity,
+    View
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import { Row } from '../components/layout/Row';
+import Amount from '../components/Amount';
+import Button from '../components/Button';
+import Header from '../components/Header';
+import KeyValue from '../components/KeyValue';
+import Screen from '../components/Screen';
+
+import BackendUtils from '../utils/BackendUtils';
+import PrivacyUtils from '../utils/PrivacyUtils';
+import Transaction from '../models/Transaction';
+import UrlUtils from '../utils/UrlUtils';
+
+import NodeInfoStore from '../stores/NodeInfoStore';
+import ModalStore from '../stores/ModalStore';
+import TransactionsStore from '../stores/TransactionsStore';
+
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+
+import CaretRight from '../assets/images/SVG/Caret Right.svg';
+import EditNotes from '../assets/images/SVG/Pen.svg';
+
+interface TransactionProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    NodeInfoStore: NodeInfoStore;
+    ModalStore: ModalStore;
+    TransactionsStore: TransactionsStore;
+    route: Route<'Transaction', { transaction: Transaction }>;
+}
+
+interface TransactionState {
+    storedNote: string;
+}
+
+@inject('NodeInfoStore', 'TransactionsStore', 'ModalStore')
+@observer
+export default class TransactionView extends React.Component<
+    TransactionProps,
+    TransactionState
+> {
+    state = {
+        storedNote: ''
+    };
+    async componentDidMount() {
+        const { navigation, route } = this.props;
+        const transaction = route.params?.transaction;
+        navigation.addListener('focus', () => {
+            this.props.TransactionsStore.resetBroadcast();
+            const note = transaction.getNote;
+            this.setState({ storedNote: note });
+        });
+    }
+
+    handlePendingPress = () => {
+        this.props.ModalStore.toggleInfoModal({
+            title: localeString('views.Wallet.pendingBalanceIcon.title'),
+            text: [
+                localeString(
+                    'views.Wallet.pendingBalanceIcon.explainerOnchain'
+                ),
+                localeString(
+                    'views.Wallet.pendingBalanceIcon.explainerOnchainLine2'
+                )
+            ],
+            buttons: [
+                {
+                    title: localeString('general.learnMore'),
+                    callback: () =>
+                        UrlUtils.goToUrl(
+                            'https://docs.zeusln.app/for-users/using-zeus/pending-balances'
+                        )
+                }
+            ]
+        });
+    };
+
+    render() {
+        const { NodeInfoStore, navigation, route } = this.props;
+        const transaction = route.params?.transaction;
+        const { storedNote } = this.state;
+        const { testnet } = NodeInfoStore;
+
+        const {
+            tx,
+            isConfirmed,
+            block_hash,
+            getBlockHeight,
+            getNumConfirmations,
+            time_stamp,
+            destAddresses,
+            getFee,
+            getFeePercentage,
+            getOutpoint,
+            raw_tx_hex,
+            getNoteKey
+        } = transaction;
+        const amount = transaction.getAmount;
+        const date = time_stamp && new Date(Number(time_stamp) * 1000);
+        const addresses: Array<any> = [];
+
+        destAddresses.length > 1
+            ? `${localeString('views.Transaction.destAddresses')}:`
+            : `${localeString('views.Transaction.destAddress')}:`;
+
+        forEach(destAddresses, (address: any, key: string) =>
+            addresses.push(
+                <KeyValue
+                    keyValue={
+                        destAddresses.length > 1
+                            ? `${localeString(
+                                  'views.Transaction.destAddresses'
+                              )} #${Number(key) + 1}`
+                            : localeString('views.Transaction.destAddress')
+                    }
+                    value={
+                        <TouchableOpacity
+                            key={`${address}-${key}`}
+                            onPress={() =>
+                                UrlUtils.goToBlockExplorerAddress(
+                                    address,
+                                    testnet
+                                )
+                            }
+                        >
+                            <Text
+                                style={{
+                                    ...styles.valueWithLink,
+                                    color: themeColor('highlight')
+                                }}
+                            >
+                                {`${
+                                    typeof address === 'string' &&
+                                    PrivacyUtils.sensitiveValue({
+                                        input: address
+                                    })
+                                }`}
+                            </Text>
+                        </TouchableOpacity>
+                    }
+                    key={key}
+                    sensitive
+                />
+            )
+        );
+        const EditNotesButton = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    navigation.navigate('AddNotes', { noteKey: getNoteKey })
+                }
+            >
+                <EditNotes
+                    style={{ alignSelf: 'center' }}
+                    fill={themeColor('text')}
+                />
+            </TouchableOpacity>
+        );
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Transaction.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={<EditNotesButton />}
+                    navigation={navigation}
+                />
+                <View style={styles.center}>
+                    <Amount
+                        sats={amount}
+                        debit={Number(amount) <= 0}
+                        credit={Number(amount) > 0}
+                        sensitive
+                        jumboText
+                        toggleable
+                        pending={!isConfirmed}
+                        onPendingPress={this.handlePendingPress}
+                    />
+                </View>
+
+                <ScrollView
+                    style={styles.content}
+                    keyboardShouldPersistTaps="handled"
+                >
+                    {getFee ? (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Transaction.totalFees'
+                            )}
+                            value={
+                                <Row>
+                                    <Amount
+                                        sats={getFee || 0}
+                                        debit
+                                        toggleable
+                                        sensitive
+                                        forceMsats
+                                    />
+                                    {getFeePercentage && (
+                                        <Text
+                                            style={{
+                                                fontFamily:
+                                                    'PPNeueMontreal-Book',
+                                                color: themeColor('text')
+                                            }}
+                                        >
+                                            {` (${getFeePercentage})`}
+                                        </Text>
+                                    )}
+                                </Row>
+                            }
+                        />
+                    ) : null}
+
+                    <KeyValue
+                        keyValue={localeString(
+                            'views.Transaction.transactionHash'
+                        )}
+                        value={
+                            <TouchableOpacity
+                                onPress={() =>
+                                    UrlUtils.goToBlockExplorerTXID(tx, testnet)
+                                }
+                            >
+                                <Text
+                                    style={{
+                                        ...styles.valueWithLink,
+                                        color: themeColor('highlight')
+                                    }}
+                                >
+                                    {`${
+                                        typeof tx === 'string' &&
+                                        PrivacyUtils.sensitiveValue({
+                                            input: tx
+                                        })
+                                    }`}
+                                </Text>
+                            </TouchableOpacity>
+                        }
+                    />
+
+                    {!!block_hash && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Transaction.blockHash'
+                            )}
+                            value={
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        UrlUtils.goToBlockExplorerBlockHash(
+                                            block_hash,
+                                            testnet
+                                        )
+                                    }
+                                >
+                                    <Text
+                                        style={{
+                                            ...styles.valueWithLink,
+                                            color: themeColor('highlight')
+                                        }}
+                                    >
+                                        {`${
+                                            typeof block_hash === 'string' &&
+                                            PrivacyUtils.sensitiveValue({
+                                                input: block_hash
+                                            })
+                                        }`}
+                                    </Text>
+                                </TouchableOpacity>
+                            }
+                        />
+                    )}
+
+                    {!!getBlockHeight && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Transaction.blockHeight'
+                            )}
+                            value={
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        UrlUtils.goToBlockExplorerBlockHeight(
+                                            getBlockHeight.toString(),
+                                            testnet
+                                        )
+                                    }
+                                >
+                                    <Text
+                                        style={{
+                                            ...styles.valueWithLink,
+                                            color: themeColor('highlight')
+                                        }}
+                                    >
+                                        {`${
+                                            typeof getBlockHeight ===
+                                                'string' &&
+                                            PrivacyUtils.sensitiveValue({
+                                                input: getBlockHeight.toString(),
+                                                fixedLength: 5,
+                                                numberSet: true
+                                            })
+                                        }`}
+                                    </Text>
+                                </TouchableOpacity>
+                            }
+                        />
+                    )}
+
+                    <KeyValue
+                        keyValue={localeString('views.Transaction.numConf')}
+                        value={getNumConfirmations}
+                        color={getNumConfirmations > 0 ? 'green' : 'red'}
+                        sensitive
+                    />
+
+                    <KeyValue
+                        keyValue={localeString('general.status')}
+                        value={transaction.getStatusDisplay}
+                        color={isConfirmed ? 'green' : 'red'}
+                    />
+
+                    {!!date && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Transaction.timestamp'
+                            )}
+                            value={date.toString()}
+                            sensitive
+                        />
+                    )}
+
+                    {!!destAddresses && (
+                        <React.Fragment>{addresses}</React.Fragment>
+                    )}
+
+                    {raw_tx_hex && (
+                        <>
+                            <TouchableOpacity
+                                onPress={() =>
+                                    navigation.navigate('RawTxHex', {
+                                        value: raw_tx_hex
+                                    })
+                                }
+                            >
+                                <View
+                                    style={{
+                                        marginTop: 10,
+                                        marginBottom: 10
+                                    }}
+                                >
+                                    <Row justify="space-between">
+                                        <View style={{ flex: 1 }}>
+                                            <KeyValue
+                                                keyValue={localeString(
+                                                    'views.Transaction.rawTxHex'
+                                                )}
+                                            />
+                                        </View>
+                                        <CaretRight
+                                            fill={themeColor('text')}
+                                            width="20"
+                                            height="20"
+                                        />
+                                    </Row>
+                                </View>
+                            </TouchableOpacity>
+                        </>
+                    )}
+
+                    {storedNote && (
+                        <KeyValue
+                            keyValue={localeString('general.note')}
+                            value={storedNote}
+                            sensitive
+                            showCopyIcon
+                            mempoolLink={() =>
+                                navigation.navigate('AddNotes', {
+                                    noteKey: getNoteKey
+                                })
+                            }
+                        />
+                    )}
+                </ScrollView>
+                <View style={{ bottom: 15 }}>
+                    {!isConfirmed && BackendUtils.supportsBumpFee() && (
+                        <Button
+                            title={localeString('views.BumpFee.title')}
+                            onPress={() =>
+                                navigation.navigate('BumpFee', {
+                                    outpoint: getOutpoint
+                                })
+                            }
+                            noUppercase
+                            containerStyle={{ marginTop: 20 }}
+                        />
+                    )}
+
+                    {getNoteKey && (
+                        <Button
+                            title={
+                                storedNote
+                                    ? localeString(
+                                          'views.SendingLightning.UpdateNote'
+                                      )
+                                    : localeString(
+                                          'views.SendingLightning.AddANote'
+                                      )
+                            }
+                            onPress={() =>
+                                navigation.navigate('AddNotes', {
+                                    noteKey: getNoteKey
+                                })
+                            }
+                            containerStyle={{ marginTop: 20 }}
+                            noUppercase
+                        />
+                    )}
+                </View>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    content: {
+        paddingLeft: 20,
+        paddingRight: 20
+    },
+    center: {
+        alignItems: 'center',
+        paddingTop: 15,
+        paddingBottom: 15
+    },
+    valueWithLink: {
+        paddingBottom: 5,
+        fontFamily: 'PPNeueMontreal-Book'
+    }
+});

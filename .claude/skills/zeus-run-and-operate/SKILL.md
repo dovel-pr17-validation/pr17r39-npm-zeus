@@ -1,0 +1,212 @@
+---
+name: zeus-run-and-operate
+description: Load when you need to RUN Zeus — start Metro / yarn android / yarn ios, decide whether to restart Metro or rebuild the native app, connect a dev node (Polar, Android emulator 10.0.2.2, macaroon/rune/pairing-phrase/NWC credentials, mutinynet), or perform release operations — ./build.sh reproducible Android Docker build, verify a release APK hash, per-ABI versionCode, PGP-signed commits, "Version bump:" convention, workflow_dispatch-only CI builds, iOS Xcode workspace and its ShareQR/NWCWidget extension targets. Symptoms — "app won't reflect my change", "connection refused from emulator", "how do I verify the APK", "how do releases work".
+---
+
+# Zeus: Run and Operate
+
+Runbook for running the app in development, connecting it to a Lightning node, and performing release/reproducible-build operations. Verified 2026-07-06 against master `c5fd094fb` (v13.1.3-alpha). Sections 3 (Outputs, versionCode, CI workflows) and 5 re-verified 2026-10-24 against master `3dc9f83e6` (v13.2.4-alpha).
+
+## When to use / When NOT to use
+
+USE this skill when you are:
+- Starting the app in dev (Metro, emulator, simulator, physical device).
+- Deciding "restart Metro or rebuild the native app?" after a change.
+- Connecting Zeus to a node in dev (Polar, testnet, mutinynet) or picking which of the 7 backend types to configure.
+- Building or verifying a release APK, or answering questions about the release process (versioning, signing, tags).
+
+Do NOT use it for these — load the named sibling instead:
+
+| Need | Sibling skill |
+|---|---|
+| Recreating the dev environment from scratch, postinstall chain, native binary fetching, vendoring | zeus-build-and-env |
+| Per-backend quirks, `supports*` capability gating, adding an RPC | zeus-backends-and-capabilities |
+| App misbehaves at runtime (crashes, hangs, wrong data) | zeus-debugging-playbook |
+| `yarn verify`, tests, CI check anatomy | zeus-validation-and-qa |
+| PR/commit/review rules, what changes are gated | zeus-change-control |
+| Settings axes and their defaults | zeus-config-and-flags |
+
+This skill assumes dependencies are already installed (`yarn install` succeeded, including its postinstall chain). If `yarn install` itself fails or native binaries are missing, that is zeus-build-and-env territory.
+
+## 1) Dev run anatomy
+
+Term definitions (once): **Metro** is React Native's JavaScript bundler/dev server — it serves your TS/JS code to the app over HTTP and hot-swaps it ("Fast Refresh"). The **native app** (Java/Kotlin/Swift/ObjC/Rust/Go code plus the React Native runtime) is compiled separately by Gradle (Android) or Xcode (iOS) and only changes when you rebuild it.
+
+Commands (all verified in `package.json` scripts):
+
+```bash
+yarn start        # start Metro (react-native start)
+yarn android      # build + install + launch on Android emulator/device (react-native run-android)
+yarn ios          # build + install + launch on iOS simulator (react-native run-ios)
+yarn ra           # alias for yarn android
+yarn ri           # alias for yarn ios
+```
+
+Notes:
+- `yarn android`/`yarn ios` auto-start Metro if it is not running; running `yarn start` in its own terminal first gives you a persistent log window (README's recommended flow).
+- iOS can also be run from Xcode: open `ios/zeus.xcworkspace` (the WORKSPACE, not `zeus.xcodeproj` — CocoaPods requires the workspace) and hit Run. See section 4.
+- Helper scripts: `yarn gradlew <task>` (runs `./gradlew` inside `android/`), `yarn android:clean` (deletes `android/app/.cxx`, `android/build`, then `gradlew clean`) for corrupted-native-build situations.
+- Faster Android debug builds: the debug build type honors `-PreactNativeDebugArchitectures=arm64-v8a` (Gradle property read in `android/app/build.gradle`) to compile only one ABI.
+
+### Restart Metro vs rebuild native — decision table
+
+| You changed... | Action |
+|---|---|
+| `.ts`/`.tsx` app code, `locales/en.json` | Nothing — Fast Refresh picks it up. Shake device / Cmd+R to force reload |
+| `metro.config.js`, `babel.config.js` | Restart Metro: `yarn start --reset-cache` |
+| Added a pure-JS npm dependency | `yarn install`, then restart Metro |
+| Added/updated a dependency with native code, or anything in `android/`, `ios/`, `patches/`, `fetch-libraries-versions.json`, `zeus_modules/` native parts | **Rebuild native**: `yarn install` (re-runs the postinstall patch/fetch chain — see zeus-build-and-env), then `yarn android` / `cd ios && pod install && cd ..` + `yarn ios` |
+| `proto/*.proto` | `yarn gen-proto`, then reload |
+
+Rule of thumb: if the change lives outside the JS bundle (native module, patch, binary, Gradle/Podfile config), Metro cannot deliver it — rebuild. Mysterious "my change does nothing" symptoms after touching native deps are almost always a missing rebuild.
+
+## 2) Connecting a node in dev
+
+CONTRIBUTING.md recommends [Polar](https://github.com/jamaljsr/polar) for a quick local Lightning dev environment (spins up bitcoind + LND/CLN nodes in Docker with a GUI that shows each node's connection credentials).
+
+**Android emulator networking (top dev trap):** the emulator's `127.0.0.1` is the emulator itself, not your machine. When configuring a node in dev on the Android emulator, the Host field MUST be `10.0.2.2` (the emulator's alias for the host machine). Stated in CONTRIBUTING.md. iOS simulator shares the host network, so `127.0.0.1` works there.
+
+Create wallets in-app: Menu → Settings-equivalent wallet list → add wallet (`views/Settings/WalletConfiguration.tsx`). The implementation dropdown offers exactly these 7 (from `INTERFACE_KEYS` in `stores/SettingsStore.ts`):
+
+| Implementation (`value`) | UI label | Type | Credentials you need |
+|---|---|---|---|
+| `ldk-node` | LDK Node | On-device | None — mnemonic generated in-app (network + optional esplora/RGS/VSS server overrides) |
+| `embedded-lnd` | Embedded LND | On-device | None — seed generated in-app (network choice; optional recovery seed + channel-backup base64) |
+| `lnd` | LND (REST) | Remote | Host, port, macaroon in **hex** (a macaroon is LND's bearer-token auth credential; convert with `xxd -ps -u -c 1000 admin.macaroon`, per docs/RemoteConnections.md — Polar shows the hex directly) |
+| `lightning-node-connect` | LND (Lightning Node Connect) | Remote | LNC pairing phrase (word phrase issued by litd/Terminal) + mailbox server (default `mailbox.terminal.lightning.today:443`; `lnc.zeusln.app:443` and custom also offered) |
+| `cln-rest` | Core Lightning (CLNRest) | Remote | Host, port, rune (CLN's auth token format, replaces macaroons) |
+| `nostr-wallet-connect` | Nostr Wallet Connect | Remote | A single `nostr+walletconnect://` connection URL from an NWC-capable wallet/service |
+| `lndhub` | LNDHub | Remote (custodial) | LNDHub server URL + username + password, or paste an `lndhub://user:pass@url` URI; can also create a new account on the server |
+
+Remote configs also carry per-node `certVerification` and `enableTor` toggles. For per-backend behavior differences and `supports*` capability gating, load zeus-backends-and-capabilities — do not assume a feature exists on all 7.
+
+### Regtest device rig (`tools/regtest-rig`)
+
+For scripted Android device tests, `tools/regtest-rig/` replaces a hand-built Polar setup. All commands run from that directory; `tools/regtest-rig/README.md` has prerequisites, the script reference and traps.
+
+- **What it runs.** Base: bitcoind and lnd `alice`, `bob`, `carol` in Docker (bob opens 10M-sat channels to alice and carol). Profiles, enabled with `bin/up --profiles <list>` or `PROFILES` in `.env`: `lsp` (stub Olympus Flow LSP host process), `cashu` (cdk-mintd 0.18.1 fakewallet), `nwc` (nostr-rs-relay), `ldk` (electrs esplora for LDK Node regtest), or `all`.
+- **Isolation.** Ports are `PORT_BASE` (default 24600) plus fixed offsets on 127.0.0.1. The app always loads Metro as `localhost:8081`, which `adb reverse` maps to `METRO_PORT`, so another Metro on host 8081 does not interfere. The emulator runs on its own adb server (`ADB_SERVER_PORT`, default 5137) with console port `EMU_PORT` (default 5640).
+- **Which checkout is served.** `ZEUS_DIR` defaults to the checkout containing the rig; `bin/metro start --dir <path>` serves another worktree with the same native build.
+- **Connecting.** `bin/zeus add-lnd alice --select` adds alice as an LND REST wallet at `https://localhost:<port>` with `certVerification: true` (the rig CA is installed as a user CA by `bin/avd install-ca`). After `bin/down` + `bin/up` the nodes have new identities; rerun it.
+
+**Master baseline on the same native build.** To compare a PR against master without a second Gradle build:
+
+1. Keep the emulator, APK and stack running. Run `bin/app terminate` first: with Fast Refresh, a live app hot-loads whatever Metro serves next.
+2. `bin/metro stop && bin/metro start --dir <master checkout>`, where `<master checkout>` is a worktree at upstream/master with `node_modules` installed.
+3. `bin/metro check '<string only the PR adds>'` must print 0 occurrences for master and more than 0 for the PR checkout. This proves which bundle is served.
+4. `bin/app restart --node`, repeat the case, then switch back the same way.
+
+This works only when the APK's native inputs match both checkouts: `git diff --stat <apk-commit> <head> -- android ios package.json yarn.lock zeus_modules patches` must be empty.
+
+### Embedded wallet networks
+
+Both on-device implementations pick a network at creation (`EMBEDDED_NODE_NETWORK_KEYS`): `mainnet`, `testnet`, `mutinynet`. **Mutinynet** is a custom public Signet test network (Zeus points its esplora default at `https://mutinynet.com/api`) — inside LDK Node it is mapped to network type `signet` (`getNetworkType` in `utils/LdkNodeUtils.ts`). Caveat verified in `WalletConfiguration.tsx`: the network dropdown for NEW embedded-lnd wallets filters out `mutinynet`; only `ldk-node` offers all three. Remote nodes have no network setting — the network is detected from the node itself.
+
+## 3) Release operations (Android)
+
+Everything in this section verified by reading `build.sh`, `android/app/build.gradle`, `android/gradle.properties`, `.github/workflows/build-android.yml`, and `docs/ReproducibleBuilds.md`. The build itself is verified by source read, not executed here.
+
+### Reproducible build via ./build.sh
+
+`./build.sh` (repo root) runs the whole Android release build inside Docker — requires only Docker, no local Android SDK:
+
+```bash
+./build.sh                        # interactive terminal
+./build.sh --no-tty               # CI / non-interactive / any agent session
+./build.sh --low-memory           # build on a machine with ~4GB RAM
+./build.sh --gradle-cache DIR     # share one Gradle cache across checkouts
+```
+
+**Two failure modes here are environmental, not build bugs. Both look like build bugs.**
+
+1. **No TTY.** `build.sh` defaults to `docker run -it`, so without `--no-tty` it dies immediately with *"the input device is not a TTY"*. Any non-interactive context needs the flag: CI, `nohup`, and every agent session.
+2. **Not enough RAM.** `android/gradle.properties` requests `org.gradle.jvmargs=-Xmx8192m -XX:MaxMetaspaceSize=4096m`. Where that is not available the Gradle daemon is OOM-killed and Gradle reports **"daemon disappeared unexpectedly"**. This surfaces *after* `yarn install` and codegen have both succeeded, so it reads as a compile failure; check free memory before debugging the build. `--low-memory` caps the heap at ~2.2GB, uses one worker and in-process Kotlin compilation; a v13.2.1 build on a 3.8GB / 2-core box took **~51 minutes** end to end this way (Gradle's own timer reported 43m) and reproduced the published hashes exactly.
+
+`--low-memory` passes its overrides on the gradlew command line, which outranks every `gradle.properties`, so **the source tree stays pristine** (necessary when building a signed tag for verification) and nothing is written to the Gradle cache directory, meaning the setting can never go silently sticky across builds. It deliberately does not touch `org.gradle.parallel`.
+
+What it does (all in `build.sh`):
+- Docker image pinned **by sha256 digest**: `reactnativecommunity/react-native-android@sha256:d4b8ea0...` (comment says tag 21.1). Digest pinning = byte-identical toolchain for every builder.
+- Exports `SOURCE_DATE_EPOCH` (default `0`, overridable via env) so embedded timestamps are deterministic.
+- Mounts the repo at `/olympus/zeus`, runs `yarn install --frozen-lockfile`, then `./gradlew generateCodegenArtifactsFromSchema && ./gradlew app:assembleRelease`.
+- Renames `app-*-release-unsigned.apk` → `zeus-*.apk` and prints `sha256sum` for each to stdout (hashes are printed, not written to a file).
+- **Disk:** the Gradle cache is `.gradle-cache` *inside the repo* (`GRADLE_USER_HOME`), so every checkout pays for its own: ~6GB of cache, ~5GB of `node_modules` and ~7GB of Android build output, about **18GB per built checkout**, against a 5.6GB builder image shared between them. `--gradle-cache DIR` points them at one shared cache. This matters most under agent worktrees, where checkouts multiply quietly.
+
+Reproducibility support in the Gradle config: `org.gradle.parallel=false` in `android/gradle.properties` (comment: parallel execution causes non-deterministic file ordering) and `reproducibleFileOrder = true` / `preserveFileTimestamps = false` on all Zip tasks in `android/app/build.gradle`.
+
+### Outputs
+
+4 APKs land in `android/app/build/outputs/apk/release/` (paths confirmed by the artifact steps in `.github/workflows/build-android.yml`):
+
+`zeus-armeabi-v7a.apk`, `zeus-arm64-v8a.apk`, `zeus-x86_64.apk`, `zeus-universal.apk`
+
+The 32-bit x86 ABI was dropped in `25d8ff806` ("build: drop the 32-bit x86 Android ABI"), so there is no `zeus-x86.apk`.
+
+All **unsigned**: the release build type's `signingConfig` line is commented out in `android/app/build.gradle`. APK = Android package file; ABI = CPU architecture a binary targets; the "universal" APK bundles all three ABIs and is the one distributed on the website/GitHub releases.
+
+### Per-ABI versionCode
+
+From `android/app/build.gradle` (`versionCodeOverride`): each ABI split gets `versionCode = base * 1000 + {armeabi-v7a: 1, arm64-v8a: 3, x86_64: 4}`; the universal APK keeps the base. Suffix `2` belonged to the dropped x86 ABI and is retired: never reuse or renumber the suffixes, or Play sees a lower versionCode for an ABI than one already published. The base (`versionCode` in `defaultConfig`) is a counter, not derived from the version string: it goes up by 1 on each new base version's first bump (133 at v13.2.1-alpha1, 134 at v13.2.2-alpha, 135 at v13.2.3-alpha1, 136 at v13.2.4-alpha) and stays put through that line's beta/rc bumps. At v13.2.4-alpha: armeabi-v7a 136001, arm64-v8a 136003, x86_64 136004, universal 136.
+
+### How a user verifies a release
+
+Per `docs/ReproducibleBuilds.md`:
+1. `git clone --depth 1 --branch vX.Y.Z https://github.com/ZeusLN/zeus.git && cd zeus`
+2. `./build.sh` — compare the printed sha256 of `zeus-universal.apk` against the hash on the [GitHub releases page](https://github.com/ZeusLN/zeus/releases).
+3. Against the officially distributed (signed) APK, unpack both and diff (`diffoscope`, `apksigcopier`, or `diff --brief --recursive`): the ONLY expected differences are the signing certificates.
+4. To install your own build you must sign it yourself (`apksigner` + your own keystore, procedure in the same doc) and uninstall the store version first — certificates won't match, and reinstalling loses local connection details.
+
+### CI workflows are manual-only
+
+`.github/workflows/build-android.yml` (runs `bash ./build.sh --no-tty` on ubuntu, Node 24.x, uploads the 4 APKs as artifacts, 5-day retention) and `.github/workflows/dependency-scan.yml` (GuardDog + npm-scan) are both `workflow_dispatch:`-only; they take a branch input and never run on push/PR. PR CI is the 4 verify checks (Test, Lint, Prettier, Typescript Check; see zeus-validation-and-qa). Two more workflows run automatically but check nothing: `coverage-comment.yml` runs on `workflow_run` after a successful `Test` run for a pull request and posts or updates the coverage comment on the PR, and `telegram.yml` posts master pushes, issue events and published releases to the project Telegram group.
+
+### PGP signing
+
+Commits and releases are signed with the key published in `PGP.txt` (repo root): RSA-4096, fingerprint `96C225207F2137E278C31CF7AAC48DE8AB8DEE84` (short key ID `AAC48DE8AB8DEE84`), UIDs "Zeus LN <zeusln@tutanota.com>", "ZEUS Support <support@zeusln.com>", and "ZEUS Security <security@zeusln.com>", currently expiring 2027-10-21. Verify a commit: `git log --show-signature -1 <hash>`. Note: git tags are **lightweight** (they point straight at commits — `git tag -v` fails with "cannot verify a non-tag object"), with one historical annotated exception (`v0.10.2-rc2`); signature verification therefore happens on the tagged commit, not the tag object.
+
+### What is OUT of this repo (do not look for it here)
+
+- **Release APK signing keys / keystore.** `MYAPP_RELEASE_STORE_FILE` etc. appear as optional Gradle properties but the release build type does not use them; official signing happens outside the repo.
+- **Store upload pipeline** (Google Play, App Store, zeusln.com hosting) — no workflow or script in-repo performs uploads.
+- **Who can dispatch** `build-android.yml` — GitHub org permission, not visible in-repo.
+- **iOS release pipeline** — entirely out-of-repo (see section 4).
+
+## 4) iOS operations
+
+- **No reproducible builds for iOS** — `docs/ReproducibleBuilds.md` explicitly says Android only.
+- Run/build via Xcode: open `ios/zeus.xcworkspace`, select the `zeus` scheme, hit Run (after `cd ios && pod install`).
+- Targets in `ios/zeus.xcodeproj` you WILL encounter (don't be surprised when Xcode asks about signing for each):
+  - `zeus` — the app.
+  - `ShareQR` — a **share extension** (app-extension product type): lets users share an image from another app into Zeus; it scans it for a QR code, writes the result into app group `group.com.zeusln.zeus`, and opens `zeusln://share` (`ios/ShareQR/ShareViewController.swift`).
+  - `NWCWidget` — a **widget extension** hosting the NWC Live Activity (ActivityKit lock-screen/Dynamic Island UI for the Nostr Wallet Connect background service; `ios/NWCWidget/`).
+  - `zeus-tvOS` — present in the project file (React Native template leftover); not a distributed product.
+- Extension targets need their own provisioning when building on-device; on simulator they build without special setup.
+
+## 5) Operational conventions
+
+- **Version bump commits**: subject is exactly `Version bump: vX.Y.Z[-suffix]` (e.g. `Version bump: v13.2.4-alpha`, `7bf873828`, the latest bump on master at `3dc9f83e6`). The maximal file set a bump commit touches is 4: `package.json` `version`, `android/app/build.gradle` `versionName` (+ `versionCode` when incremented), `ios/zeus.xcodeproj/project.pbxproj` `MARKETING_VERSION` (all build configs), and the version list in `.github/ISSUE_TEMPLATE/bug_report.yml`; but not every bump touches all 4. Observed at `c5fd094fb`: the pbxproj and bug_report.yml entries only change when the suffix-less base version changes (i.e. on the post-release `-alpha` bump, e.g. `c5fd094fb`, and `7bf873828`, which touched all 4); beta/rc/final bumps typically touch only `package.json` + `build.gradle` (e.g. `a2dc04ab8` v13.1.2, `8b45b4111` v13.1.1-beta1; 2 files each).
+- **Cadence** (observed in `git log --grep='Version bump'`): after a release, master is bumped to the next `-alpha`; a release line then walks `-alpha → -beta1… → -rc1… → final` (e.g. v13.1.0-alpha → beta1 → beta2 → rc1 → v13.1.0). Since v13.2.0 the alpha is often numbered too (`v13.2.0-alpha1`, `v13.2.1-alpha1`, `v13.2.3-alpha1`), though not always (`v13.2.2-alpha`, `v13.2.4-alpha`). Master effectively always sits on an `-alpha` (or in-flight beta/rc) version.
+- **Tags**: one tag per shipped version (`v13.1.2` etc., 269 tags at time of writing), lightweight with one historical annotated exception (`v0.10.2-rc2`), usually pointing at the version-bump commit — but not always (`v13.1.1` points at a non-bump commit, and final-release bump commits may sit on release branches rather than master). Signing lives on the commit (PGP key above), not the tag.
+- Release-time discipline (revert-first near releases, mandatory 2-platform manual testing) is owned by zeus-change-control — read it before touching anything during a release window.
+
+## Provenance and maintenance
+
+Facts verified 2026-07-06 against master `c5fd094fb` (v13.1.3-alpha, versionCode 131); section 3 outputs/versionCode/CI and section 5 re-verified 2026-10-24 against master `3dc9f83e6` (v13.2.4-alpha, versionCode 136). `./build.sh` execution itself verified by source read (build.sh + build-android.yml), not executed. Re-verification one-liners for volatile facts:
+
+| Fact | Re-verify with |
+|---|---|
+| yarn scripts (`start`/`android`/`ios`/`ra`/`ri`, `android:clean`, `gen-proto`) | `python3 -c "import json;print(json.load(open('package.json'))['scripts'])"` |
+| Docker image digest, SOURCE_DATE_EPOCH default, `--no-tty` | `head -30 build.sh` |
+| `org.gradle.parallel=false` | `grep parallel android/gradle.properties` |
+| Unsigned release + per-ABI versionCode map + reproducible Zip settings | `grep -n 'signingConfig\|versionCodeOverride\|versionCodes\|reproducibleFileOrder' android/app/build.gradle` |
+| Current versionCode/versionName | `grep -n 'versionCode \|versionName' android/app/build.gradle` |
+| 4 APK names/paths | `grep 'path:' .github/workflows/build-android.yml` |
+| Workflows dispatch-only | `grep -A2 '^on:' .github/workflows/build-android.yml .github/workflows/dependency-scan.yml` |
+| All workflows and their triggers | `grep -n -A3 '^on:' .github/workflows/*.yml` |
+| 7 implementations + labels | `grep -n -A14 'INTERFACE_KEYS' stores/SettingsStore.ts \| head -25` |
+| Embedded networks + mutinynet filter | `grep -n 'EMBEDDED_NODE_NETWORK_KEYS\|mutinynet' stores/SettingsStore.ts views/Settings/WalletConfiguration.tsx utils/LdkNodeUtils.ts` |
+| Android emulator host 10.0.2.2 / Polar | `grep -n '10.0.2.2\|Polar' CONTRIBUTING.md` |
+| PGP key/fingerprint/expiry | `gpg --show-keys PGP.txt` |
+| Version-bump convention + cadence | `git log --oneline -15 --grep='Version bump'` |
+| Tags lightweight | `git cat-file -t v13.1.2` (prints `commit`) |
+| LNC mailbox defaults | `grep -n -A8 'LNC_MAILBOX_KEYS' stores/SettingsStore.ts` |
+| iOS extension targets | `grep -B2 'app-extension' ios/zeus.xcodeproj/project.pbxproj` |

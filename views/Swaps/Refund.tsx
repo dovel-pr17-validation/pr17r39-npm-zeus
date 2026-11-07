@@ -1,0 +1,509 @@
+import * as React from 'react';
+import { ScrollView, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+
+import lndMobile from '../../lndmobile/LndMobileInjection';
+const { buildRefundTransaction } = lndMobile.swaps;
+
+import Button from '../../components/Button';
+
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import OnchainFeeInput from '../../components/OnchainFeeInput';
+import Screen from '../../components/Screen';
+import Switch from '../../components/Switch';
+import Text from '../../components/Text';
+import Accordion from '../../components/Accordion';
+import AddressInput from '../../components/AddressInput';
+import {
+    ErrorMessage,
+    SuccessMessage
+} from '../../components/SuccessErrorMessage';
+import { Row } from '../../components/layout/Row';
+
+import AddressUtils from '../../utils/AddressUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import { localeString, pascalToHumanReadable } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { numberWithCommas } from '../../utils/UnitsUtils';
+import {
+    fetchBlockHeight,
+    nativeSwapEndpoint,
+    refundFailureAction,
+    RefundFailureAction,
+    swapNetworkName
+} from '../../utils/SwapUtils';
+
+import SwapStore from '../../stores/SwapStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+
+import NodeInfo from '../../models/NodeInfo';
+import Swap from '../../models/Swap';
+
+interface RefundSwapProps {
+    navigation: any;
+    route: Route<
+        'RefundSwap',
+        {
+            swapData: Swap;
+            scannedAddress?: string;
+        }
+    >;
+    SwapStore?: SwapStore;
+    NodeInfoStore?: NodeInfoStore;
+    InvoicesStore?: InvoicesStore;
+}
+
+interface RefundSwapState {
+    destinationAddress: string;
+    fee: string;
+    error: string;
+    swapData: Swap;
+    loading: boolean;
+    refundStatus: string;
+    uncooperative: boolean;
+    fetchingAddress: boolean;
+}
+
+@inject('SwapStore', 'NodeInfoStore', 'InvoicesStore')
+@observer
+export default class RefundSwap extends React.Component<
+    RefundSwapProps,
+    RefundSwapState
+> {
+    state = {
+        destinationAddress: '',
+        fee: '',
+        error: '',
+        loading: false,
+        swapData: this.props.route.params.swapData,
+        refundStatus: '',
+        uncooperative: false,
+        fetchingAddress: false
+    };
+
+    private scrollViewRef = React.createRef<ScrollView>();
+
+    // Built natively, broadcast through the user's mempool instance (then
+    // the swap host) rather than by native code
+    broadcastRefund = async (
+        swapData: Swap,
+        fee: any,
+        destinationAddress: string,
+        cooperative: boolean
+    ): Promise<string> => {
+        const txHex = await buildRefundTransaction({
+            endpoint: nativeSwapEndpoint(swapData.endpoint),
+            swapId: swapData.id,
+            claimLeaf: swapData?.swapTreeDetails.claimLeaf.output,
+            refundLeaf: swapData?.swapTreeDetails.refundLeaf.output,
+            transactionHex: swapData.lockupTransaction?.hex,
+            privateKey: swapData.refundPrivateKey!,
+            servicePubKey: swapData.servicePubKey!,
+            feeRate: Number(fee),
+            timeoutBlockHeight: Number(swapData.timeoutBlockHeight),
+            destinationAddress,
+            lockupAddress: swapData.effectiveLockupAddress!,
+            cooperative,
+            network: swapNetworkName(this.props.NodeInfoStore!.nodeInfo)
+        });
+        return this.props.SwapStore!.broadcastSwapTransaction(
+            txHex,
+            swapData.endpoint
+        );
+    };
+
+    latestBlockHeight = (): Promise<number> =>
+        fetchBlockHeight(
+            async () =>
+                new NodeInfo(await BackendUtils.getMyNodeInfo())
+                    .currentBlockHeight
+        );
+
+    refundErrorText = (
+        action: RefundFailureAction,
+        cooperative: boolean,
+        timeoutBlockHeight: number
+    ): string | undefined => {
+        if (action.type !== 'wait-for-timeout') return;
+
+        const block = numberWithCommas(timeoutBlockHeight);
+        const wait =
+            action.blocksRemaining !== undefined
+                ? localeString('views.Swaps.uncooperativeRefundAfterBlocks')
+                      .replace('{{block}}', block)
+                      .replace(
+                          '{{blocks}}',
+                          numberWithCommas(action.blocksRemaining)
+                      )
+                : localeString(
+                      'views.Swaps.uncooperativeRefundAfterBlock'
+                  ).replace('{{block}}', block);
+
+        // The switch is already on after an uncooperative attempt
+        if (!cooperative) return wait;
+        return [
+            localeString('views.Swaps.refundNotCosigned'),
+            wait,
+            localeString('views.Swaps.turnOnUncooperativeRefund')
+        ].join(' ');
+    };
+
+    createRefundTransaction = async (
+        swapData: Swap,
+        fee: any,
+        destinationAddress: string
+    ): Promise<void> => {
+        const { SwapStore } = this.props;
+        const cooperative = !this.state.uncooperative;
+        const timeoutBlockHeight = Number(swapData.timeoutBlockHeight);
+        let errorText: string | undefined;
+
+        try {
+            let txid: string;
+            try {
+                txid = await this.broadcastRefund(
+                    swapData,
+                    fee,
+                    destinationAddress,
+                    cooperative
+                );
+            } catch (error: any) {
+                const action = refundFailureAction({
+                    cooperative,
+                    errorMessage: error?.message,
+                    currentBlockHeight: await this.latestBlockHeight(),
+                    timeoutBlockHeight
+                });
+                if (action.type !== 'retry-uncooperative') {
+                    errorText = this.refundErrorText(
+                        action,
+                        cooperative,
+                        timeoutBlockHeight
+                    );
+                    throw error;
+                }
+
+                console.log(
+                    'Cooperative refund not co-signed after the timeout, retrying uncooperatively:',
+                    error
+                );
+                this.setState({ uncooperative: true });
+                txid = await this.broadcastRefund(
+                    swapData,
+                    fee,
+                    destinationAddress,
+                    false
+                );
+            }
+
+            await SwapStore?.updateSwapOnRefund(swapData.id, txid);
+
+            this.setState({
+                loading: false,
+                refundStatus: `Refund transaction created successfully. TXID: ${txid}`,
+                destinationAddress: ''
+            });
+
+            console.log('Refund transaction created successfully. TXID:', txid);
+        } catch (error: any) {
+            this.setState({
+                loading: false,
+                error: errorText || error.message
+            });
+            console.error('Error creating refund transaction:', error);
+            throw error;
+        }
+    };
+
+    componentDidUpdate(prevProps: Readonly<RefundSwapProps>) {
+        const { route, navigation } = this.props;
+        const scannedAddress = route.params?.scannedAddress;
+
+        if (
+            scannedAddress &&
+            scannedAddress !== prevProps.route.params?.scannedAddress
+        ) {
+            this.setState({ destinationAddress: scannedAddress, error: '' });
+
+            navigation.setParams({ scannedAddress: undefined });
+        }
+    }
+
+    render() {
+        const { navigation, SwapStore, InvoicesStore } = this.props;
+        const {
+            fee,
+            destinationAddress,
+            swapData,
+            error,
+            loading,
+            refundStatus,
+            uncooperative,
+            fetchingAddress
+        } = this.state;
+
+        const rawDetails = {
+            endpoint: nativeSwapEndpoint(swapData.endpoint),
+            swapId: swapData.id,
+            claimLeaf: swapData?.swapTreeDetails.claimLeaf.output,
+            refundLeaf: swapData?.swapTreeDetails.refundLeaf.output,
+            transactionHex: swapData.lockupTransaction?.hex,
+            servicePubKey: swapData.servicePubKey,
+            feeRate: Number(fee),
+            timeoutBlockHeight: Number(swapData.timeoutBlockHeight),
+            destinationAddress,
+            lockupAddress: swapData.effectiveLockupAddress,
+            cooperative: !uncooperative,
+            network: swapNetworkName(this.props.NodeInfoStore!.nodeInfo)
+        };
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Swaps.refundSwap'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        loading ? (
+                            // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                            <View style={{ marginTop: -6 }}>
+                                <LoadingIndicator size={32} />
+                            </View>
+                        ) : (
+                            <></>
+                        )
+                    }
+                    navigation={this.props.navigation}
+                />
+                <ScrollView
+                    ref={this.scrollViewRef}
+                    style={{ flex: 1, paddingHorizontal: 20 }}
+                >
+                    {error && (
+                        <View style={{ marginBottom: 10 }}>
+                            <ErrorMessage message={error} />
+                        </View>
+                    )}
+                    {refundStatus && (
+                        <View style={{ marginBottom: 10 }}>
+                            <SuccessMessage message={refundStatus} />
+                        </View>
+                    )}
+
+                    <Text style={{ color: themeColor('secondaryText') }}>
+                        {localeString('views.Transaction.destAddress')}
+                    </Text>
+
+                    <AddressInput
+                        value={destinationAddress}
+                        onChangeText={async (text: string) => {
+                            this.setState({
+                                destinationAddress: text,
+                                error: ''
+                            });
+                        }}
+                        onScan={() =>
+                            this.props.navigation.navigate(
+                                'RefundSwapQRScanner'
+                            )
+                        }
+                        placeholder={fetchingAddress ? '' : 'bc1...'}
+                        loading={fetchingAddress}
+                    />
+                    <View
+                        style={{
+                            marginVertical: 5
+                        }}
+                    >
+                        {BackendUtils.supportsOnchainSends() && (
+                            <Button
+                                onPress={async () => {
+                                    this.setState({
+                                        destinationAddress: '',
+                                        fetchingAddress: true
+                                    });
+                                    try {
+                                        if (InvoicesStore) {
+                                            await InvoicesStore.createUnifiedInvoice(
+                                                {
+                                                    memo: '',
+                                                    value: '0',
+                                                    expirySeconds: '3600'
+                                                }
+                                            );
+                                            if (InvoicesStore.onChainAddress) {
+                                                this.setState({
+                                                    destinationAddress:
+                                                        InvoicesStore.onChainAddress,
+                                                    error: '',
+                                                    fetchingAddress: false
+                                                });
+                                            } else {
+                                                this.setState({
+                                                    error: localeString(
+                                                        'views.Swaps.generateOnchainAddressFailed'
+                                                    ),
+                                                    fetchingAddress: false
+                                                });
+                                            }
+                                        }
+
+                                        this.setState({
+                                            fetchingAddress: false
+                                        });
+                                    } catch (e: any) {
+                                        console.error(
+                                            'Error generating invoice:',
+                                            e
+                                        );
+                                        this.setState({
+                                            error: localeString(
+                                                'views.Swaps.generateInvoiceFailed'
+                                            ),
+                                            fetchingAddress: false
+                                        });
+                                    }
+                                }}
+                                title={localeString(
+                                    'views.Swaps.generateOnchainAddress'
+                                )}
+                                disabled={fetchingAddress}
+                            />
+                        )}
+                    </View>
+                    <Text
+                        style={{
+                            color: themeColor('secondaryText'),
+                            marginTop: 10
+                        }}
+                    >
+                        {localeString('views.Send.feeSatsVbyte')}
+                    </Text>
+                    <OnchainFeeInput
+                        fee={fee}
+                        onChangeFee={(text: string) =>
+                            this.setState({ fee: text, error: '' })
+                        }
+                        navigation={navigation}
+                    />
+                    <Row>
+                        <Text
+                            style={{
+                                color: themeColor('secondaryText'),
+                                marginTop: 4
+                            }}
+                            infoModalText={localeString('views.Swaps.infoText')}
+                        >
+                            {localeString('views.Swaps.uncooperative')}
+                        </Text>
+                        <View
+                            style={{
+                                flex: 1,
+                                flexDirection: 'row',
+                                justifyContent: 'flex-end',
+                                marginTop: 4
+                            }}
+                        >
+                            <Switch
+                                value={uncooperative}
+                                onValueChange={async () => {
+                                    this.setState({
+                                        uncooperative: !uncooperative
+                                    });
+                                }}
+                            />
+                        </View>
+                    </Row>
+
+                    <Accordion
+                        id="refund-raw-details"
+                        title="Raw details"
+                        headerLayout="form"
+                        embedded
+                        scrollRef={this.scrollViewRef}
+                        headerStyle={{
+                            marginTop: 10,
+                            marginBottom: 10
+                        }}
+                        renderFormTitle={() => (
+                            <KeyValue
+                                keyValue={'Raw details'}
+                                color={themeColor('secondaryText')}
+                            />
+                        )}
+                    >
+                        <>
+                            {Object.entries(rawDetails).map(([key, value]) => {
+                                if (!value) return;
+                                return (
+                                    <KeyValue
+                                        key={key}
+                                        keyValue={pascalToHumanReadable(key)}
+                                        value={value.toString()}
+                                        showCopyIcon
+                                    />
+                                );
+                            })}
+                        </>
+                    </Accordion>
+                </ScrollView>
+
+                <View style={{ marginBottom: 15 }}>
+                    <Button
+                        title={localeString('views.Swaps.initiateRefund')}
+                        onPress={async () => {
+                            this.setState({
+                                loading: true,
+                                error: '',
+                                refundStatus: ''
+                            });
+
+                            if (!swapData.lockupTransaction) {
+                                swapData.lockupTransaction =
+                                    await SwapStore?.getLockupTransaction(
+                                        swapData.id,
+                                        swapData.endpoint
+                                    );
+                            }
+
+                            try {
+                                await this.createRefundTransaction(
+                                    swapData,
+                                    fee,
+                                    destinationAddress
+                                );
+
+                                console.log(
+                                    'Refund transaction created successfully.'
+                                );
+                            } catch (e) {
+                                console.error('Error in refund process:', e);
+                            } finally {
+                                this.setState({ loading: false });
+                            }
+                        }}
+                        containerStyle={{ marginTop: 20 }}
+                        secondary
+                        disabled={
+                            !AddressUtils.isAddressForNodeNetwork(
+                                destinationAddress,
+                                this.props.NodeInfoStore!.nodeInfo
+                            ) ||
+                            this.state.loading ||
+                            fetchingAddress
+                        }
+                    />
+                </View>
+            </Screen>
+        );
+    }
+}

@@ -1,0 +1,527 @@
+import * as React from 'react';
+import {
+    BackHandler,
+    Dimensions,
+    NativeEventSubscription,
+    Text,
+    View
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+import { loadDonationLnurl } from '../../utils/DonationUtils';
+
+import LnurlPaySuccess from '../LnurlPay/Success';
+
+import Button from '../../components/Button';
+import Screen from '../../components/Screen';
+import { Row } from '../../components/layout/Row';
+import PaymentSuccessView from '../../components/PaymentSuccessView';
+import PaymentErrorView from '../../components/PaymentErrorView';
+import DonationInfoModal from '../../components/DonationInfoModal';
+import DonationGiftIcon from '../../components/DonationGiftIcon';
+import SendingLoadingView from '../../components/SendingLoadingView';
+import { sendingStyles } from '../../components/sendingStyles';
+
+import CashuStore from '../../stores/CashuStore';
+import ContactStore from '../../stores/ContactStore';
+import LnurlPayStore from '../../stores/LnurlPayStore';
+
+import ContactUtils from '../../utils/ContactUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { runWhenIdle } from '../../utils/SchedulingUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+import Storage from '../../storage';
+
+import Wordmark from '../../assets/images/SVG/wordmark-black.svg';
+
+import Header from '../../components/Header';
+import PaymentDetailsSheet from '../../components/PaymentDetailsSheet';
+
+interface CashuSendingLightningProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    CashuStore: CashuStore;
+    ContactStore: ContactStore;
+    LnurlPayStore: LnurlPayStore;
+    route: Route<
+        'CashuSendingLightning',
+        {
+            donationAmount?: string;
+            paymentAmount?: string;
+            paymentRequest?: string;
+        }
+    >;
+}
+
+interface CashuSendingLightningState {
+    storedNotes: string;
+    wasSuccessful: boolean;
+    paymentType: string;
+    payingDonation: boolean;
+    showDonationInfo: boolean;
+    donationHandled: boolean;
+    donationPreimage: string;
+    amountDonated: number | null;
+    showPaymentDetails: boolean;
+}
+
+@inject('CashuStore', 'ContactStore', 'LnurlPayStore')
+@observer
+export default class CashuSendingLightning extends React.Component<
+    CashuSendingLightningProps,
+    CashuSendingLightningState
+> {
+    private backPressSubscription: NativeEventSubscription;
+
+    private focusListener: (() => void) | undefined;
+
+    private cancelPaymentKickoff: (() => void) | undefined;
+
+    // One attempt per screen: CashuStore.paymentSuccess is shared with
+    // later payments made while this screen stays mounted.
+    private donationAttempted = false;
+
+    constructor(props: CashuSendingLightningProps) {
+        super(props);
+        this.state = {
+            storedNotes: '',
+            payingDonation: false,
+            showDonationInfo: false,
+            donationHandled: false,
+            donationPreimage: '',
+            amountDonated: null,
+            wasSuccessful: false,
+            paymentType: 'main',
+            showPaymentDetails: false
+        };
+    }
+
+    componentDidMount() {
+        const { CashuStore, navigation, route } = this.props;
+        const { paymentAmount, paymentRequest } = route.params || {};
+
+        // Reset payment state and start the payment once the JS thread is
+        // free, so the melt does not jank the navigation transition. The
+        // short timeout keeps the wait bounded on a busy thread; the kickoff
+        // is cancelled on unmount so a screen the user has already left never
+        // starts a payment.
+        CashuStore.resetPaymentState();
+        this.cancelPaymentKickoff = runWhenIdle(
+            () =>
+                CashuStore.payLnInvoiceFromEcash({
+                    amount: paymentAmount,
+                    paymentRequest
+                }),
+            500
+        );
+
+        this.focusListener = navigation.addListener('focus', () => {
+            const noteKey = CashuStore.noteKey;
+            if (!noteKey) {
+                this.setState({ storedNotes: '' });
+                return;
+            }
+            Storage.getItem(noteKey)
+                .then((storedNotes) => {
+                    this.setState({ storedNotes: storedNotes || '' });
+                })
+                .catch((error) => {
+                    console.error('Error retrieving notes:', error);
+                });
+        });
+
+        this.backPressSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            this.handleBackPress.bind(this)
+        );
+    }
+
+    componentDidUpdate() {
+        const { CashuStore, route } = this.props;
+        const { donationAmount } = route.params;
+
+        const wasSuccessful = this.successfullySent(CashuStore);
+
+        if (wasSuccessful && !this.state.wasSuccessful) {
+            this.setState({ wasSuccessful: true });
+        } else if (!wasSuccessful && this.state.wasSuccessful) {
+            this.setState({ wasSuccessful: false });
+        }
+
+        // donationAmount is only set when CashuPaymentRequest resolved a
+        // donation to send, against the same balance check it showed the
+        // user. Deciding again here could send one that was never counted.
+        if (
+            wasSuccessful &&
+            !this.state.wasSuccessful &&
+            donationAmount &&
+            !this.donationAttempted
+        ) {
+            this.donationAttempted = true;
+            this.handleDonationPayment(donationAmount);
+        }
+    }
+
+    handleDonationPayment = async (donationAmount: string) => {
+        const { CashuStore } = this.props;
+        this.setState({ payingDonation: true, paymentType: 'donation' });
+
+        try {
+            const paymentRequest = await loadDonationLnurl(donationAmount);
+            if (!paymentRequest) {
+                this.setState({ payingDonation: false });
+                return;
+            }
+
+            if (__DEV__) {
+                console.log(
+                    'Initiating donation payment with amount:',
+                    donationAmount
+                );
+            }
+            const isDonationPayment = true;
+            await CashuStore.getPayReq(paymentRequest, isDonationPayment);
+
+            const donationPayment = await CashuStore.payLnInvoiceFromEcash({
+                amount: donationAmount.toString(),
+                paymentRequest,
+                isDonationPayment
+            });
+
+            const payment = Array.isArray(donationPayment)
+                ? donationPayment[0]
+                : donationPayment;
+
+            const donationState = (
+                payment?.meltResponse?.quote?.state ||
+                payment?.meltResponse?.state
+            )
+                ?.toString()
+                ?.toUpperCase();
+            const donationPaid =
+                !!payment?.payment_preimage || donationState === 'PAID';
+
+            if (!payment || !donationPaid) {
+                console.log('Donation payment failed.');
+                this.setState({ donationHandled: false });
+                return;
+            }
+
+            const amountDonated = payment?.amount;
+            const paymentPreimage = payment?.payment_preimage;
+
+            this.setState({
+                donationHandled: true,
+                amountDonated: parseFloat(amountDonated?.toString() || '0'),
+                donationPreimage: paymentPreimage || ''
+            });
+        } catch (error) {
+            console.error('Failed to pay donation invoice:', error);
+            this.setState({ donationHandled: false });
+        } finally {
+            this.setState({ payingDonation: false });
+        }
+    };
+
+    private handleBackPress(): boolean {
+        const { CashuStore, navigation } = this.props;
+        if (!CashuStore.error && this.successfullySent(CashuStore)) {
+            navigation.popTo('Wallet');
+            return true;
+        }
+        return false;
+    }
+
+    componentWillUnmount(): void {
+        this.cancelPaymentKickoff?.();
+        if (this.focusListener) {
+            this.focusListener();
+        }
+        this.backPressSubscription?.remove();
+    }
+
+    private successfullySent(cashuStore: CashuStore): boolean {
+        return !!cashuStore.paymentSuccess;
+    }
+
+    render() {
+        const { CashuStore, ContactStore, LnurlPayStore, navigation, route } =
+            this.props;
+        const amountFromRoute = Number(route.params?.paymentAmount);
+        const {
+            loading,
+            paymentError,
+            paymentSuccess,
+            error_msg,
+            payReq,
+            paymentPreimage,
+            paymentErrorMsg,
+            noteKey,
+            paymentDuration,
+            paymentFee
+        } = CashuStore;
+        const payment_hash = payReq && payReq.payment_hash;
+        const paymentAmount =
+            amountFromRoute > 0 ? amountFromRoute : payReq?.getRequestAmount;
+        const {
+            storedNotes,
+            donationHandled,
+            paymentType,
+            payingDonation,
+            showPaymentDetails
+        } = this.state;
+
+        // the address was looked up for one LNURL-pay invoice; don't show
+        // it as the recipient of a different payment
+        const lightningAddress =
+            payment_hash && payment_hash === LnurlPayStore.paymentHash
+                ? LnurlPayStore.lightningAddress
+                : undefined;
+        const matchedContact = ContactUtils.findContactByLightningAddress(
+            lightningAddress,
+            ContactStore?.contacts
+        );
+
+        const success = this.successfullySent(CashuStore);
+        const windowSize = Dimensions.get('window');
+
+        // Show loading animation until we have a result (success or error)
+        const showLoading = !paymentSuccess && !paymentError;
+
+        if (showLoading) {
+            return (
+                <Screen>
+                    <SendingLoadingView />
+                </Screen>
+            );
+        }
+
+        return (
+            <Screen>
+                {!loading && <Header />}
+                <DonationInfoModal
+                    isOpen={this.state.showDonationInfo}
+                    onClose={() => this.setState({ showDonationInfo: false })}
+                    donationHandled={donationHandled}
+                    amountDonated={this.state.amountDonated}
+                    donationPreimage={this.state.donationPreimage}
+                />
+                {paymentType === 'donation' && (
+                    <DonationGiftIcon
+                        payingDonation={payingDonation}
+                        donationHandled={donationHandled}
+                        onPress={() =>
+                            this.setState({ showDonationInfo: true })
+                        }
+                    />
+                )}
+                {!loading && (
+                    <>
+                        <View
+                            style={{
+                                ...sendingStyles.content,
+                                paddingTop: windowSize.height * 0.05
+                            }}
+                        >
+                            {!paymentError && (
+                                <Wordmark
+                                    height={windowSize.width * 0.25}
+                                    width={windowSize.width}
+                                    fill={themeColor('highlight')}
+                                />
+                            )}
+                            {!paymentError && (
+                                <PaymentSuccessView
+                                    paymentAmount={paymentAmount}
+                                    feeAmount={paymentFee}
+                                    paymentDuration={paymentDuration}
+                                />
+                            )}
+                            {(!!paymentError || !!paymentErrorMsg) && (
+                                <PaymentErrorView
+                                    errorMessage={paymentErrorMsg || error_msg}
+                                />
+                            )}
+                            {!paymentError &&
+                                payment_hash === LnurlPayStore.paymentHash &&
+                                LnurlPayStore.successAction &&
+                                // the preimage is only needed to decrypt
+                                // LUD-10 aes success actions
+                                (LnurlPayStore.successAction.tag !== 'aes' ||
+                                    !!paymentPreimage) && (
+                                    <View style={{ width: '90%' }}>
+                                        <LnurlPaySuccess
+                                            color="white"
+                                            domain={LnurlPayStore.domain}
+                                            successAction={
+                                                LnurlPayStore.successAction
+                                            }
+                                            preimage={paymentPreimage || ''}
+                                            scrollable={true}
+                                            maxHeight={windowSize.height * 0.15}
+                                        />
+                                    </View>
+                                )}
+                        </View>
+
+                        {!!success && !paymentError && !paymentErrorMsg && (
+                            <PaymentDetailsSheet
+                                isOpen={showPaymentDetails}
+                                onOpen={() =>
+                                    this.setState({
+                                        showPaymentDetails: true
+                                    })
+                                }
+                                onClose={() =>
+                                    this.setState({
+                                        showPaymentDetails: false
+                                    })
+                                }
+                                paymentAmount={paymentAmount}
+                                feeAmount={paymentFee}
+                                paymentDuration={paymentDuration}
+                                memo={payReq?.getMemo}
+                                contact={matchedContact}
+                                lightningAddress={lightningAddress}
+                                paymentHash={payment_hash}
+                                paymentPreimage={paymentPreimage}
+                                navigation={navigation}
+                            />
+                        )}
+
+                        <Row
+                            align="flex-end"
+                            style={{
+                                marginTop: 10,
+                                marginBottom: 15,
+                                alignSelf: 'center'
+                            }}
+                        >
+                            {noteKey && !paymentError && !paymentErrorMsg && (
+                                <Button
+                                    title={
+                                        storedNotes
+                                            ? localeString(
+                                                  'views.SendingLightning.UpdateNote'
+                                              )
+                                            : localeString(
+                                                  'views.SendingLightning.AddANote'
+                                              )
+                                    }
+                                    onPress={() =>
+                                        navigation.navigate('AddNotes', {
+                                            noteKey
+                                        })
+                                    }
+                                    secondary
+                                    buttonStyle={{ height: 40, width: '100%' }}
+                                    containerStyle={{
+                                        maxWidth: '100%'
+                                    }}
+                                />
+                            )}
+                        </Row>
+
+                        <SafeAreaView edges={['bottom']}>
+                            <View
+                                style={[
+                                    sendingStyles.buttons,
+                                    !noteKey && { marginTop: 14 }
+                                ]}
+                            >
+                                {(paymentErrorMsg ==
+                                    'FAILURE_REASON_NO_ROUTE' ||
+                                    paymentErrorMsg ==
+                                        localeString(
+                                            'error.failureReasonNoRoute'
+                                        )) && (
+                                    <Text
+                                        style={{
+                                            textAlign: 'center',
+                                            color: 'white',
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            padding: 20,
+                                            fontSize: 14
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.SendingLightning.lowFeeLimitMessage'
+                                        )}
+                                    </Text>
+                                )}
+                                {(!!paymentErrorMsg || !!paymentError) && (
+                                    <>
+                                        <Button
+                                            title={localeString(
+                                                'views.SendingLightning.tryAgain'
+                                            )}
+                                            icon={{
+                                                name: 'rotate-ccw',
+                                                type: 'feather',
+                                                size: 25
+                                            }}
+                                            onPress={() => navigation.goBack()}
+                                            buttonStyle={{
+                                                backgroundColor: 'white',
+                                                height: 40
+                                            }}
+                                            containerStyle={{
+                                                width: '100%',
+                                                margin: 3
+                                            }}
+                                        />
+                                        <Button
+                                            title={localeString(
+                                                'views.Settings.Ecash.cashuTroubleshooting'
+                                            )}
+                                            icon={{
+                                                name: 'life-buoy',
+                                                type: 'feather',
+                                                size: 25
+                                            }}
+                                            onPress={() => {
+                                                UrlUtils.goToUrl(
+                                                    'https://docs.zeusln.app/cashu#i-get-an-error-saying-outputs-have-already-been-signed-before-or-already-spent-what-should-i-do'
+                                                );
+                                            }}
+                                            containerStyle={{
+                                                width: '100%',
+                                                margin: 3
+                                            }}
+                                            secondary
+                                        />
+                                    </>
+                                )}
+
+                                <Button
+                                    title={localeString(
+                                        'views.SendingLightning.goToWallet'
+                                    )}
+                                    icon={{
+                                        name: 'list',
+                                        size: 25,
+                                        color: themeColor('background')
+                                    }}
+                                    onPress={() => {
+                                        navigation.popTo('Wallet');
+                                    }}
+                                    buttonStyle={{ height: 40 }}
+                                    titleStyle={{
+                                        color: themeColor('background')
+                                    }}
+                                    containerStyle={{
+                                        width: '100%',
+                                        margin: 3
+                                    }}
+                                />
+                            </View>
+                        </SafeAreaView>
+                    </>
+                )}
+            </Screen>
+        );
+    }
+}

@@ -1,0 +1,920 @@
+import { settingsStore, nodeInfoStore } from '../stores/Stores';
+import Invoice from '../models/Invoice';
+import TransactionRequest from '../models/TransactionRequest';
+import OpenChannelRequest from '../models/OpenChannelRequest';
+import VersionUtils from '../utils/VersionUtils';
+import Base64Utils from '../utils/Base64Utils';
+import { sha256Bytes, sha256Hex } from '../utils/HashingUtils';
+import BigNumber from 'bignumber.js';
+import {
+    getBalance,
+    getChainTransactions,
+    getOffchainBalance,
+    getUTXOs as getChainUTXOs,
+    listPeers,
+    listClosedChannels,
+    listPeerChannels
+} from './CoreLightningRequestHandler';
+import { feeLimitSatsToMaxRoutingFeeMsat } from '../utils/AmountUtils';
+import { localeString } from '../utils/LocaleUtils';
+import ReactNativeBlobUtil from 'react-native-blob-util';
+import {
+    doTorRequest,
+    isOnionHttpsUrl,
+    RequestMethod
+} from '../utils/TorUtils';
+import Bolt11Utils from '../utils/Bolt11Utils';
+import { inFlightRequestKey } from '../utils/InFlightRequestUtils';
+
+const calls = new Map<string, Promise<any>>();
+
+// CLN's feerate takes an integer before the perkb suffix. Float math turns
+// 2.01 sat/vB into 2009.9999999999998perkb, so multiply with BigNumber and
+// round to a whole sat/kB. Number() first keeps the old output for a
+// missing or empty rate, which BigNumber would throw on.
+export const satPerVbyteToPerkb = (
+    satPerVbyte: string | number | null | undefined
+): string =>
+    `${new BigNumber(Number(satPerVbyte))
+        .times(1000)
+        .integerValue(BigNumber.ROUND_HALF_UP)
+        .toFixed()}perkb`;
+
+export default class CLNRest {
+    private defaultTimeout: number = 30000;
+    getHeaders = (rune: string): any => {
+        return {
+            Rune: rune
+        };
+    };
+
+    supports = (
+        minVersion: string,
+        eosVersion?: string,
+        minApiVersion?: string
+    ) => {
+        const { nodeInfo } = nodeInfoStore;
+        const { version, api_version } = nodeInfo;
+        const { isSupportedVersion } = VersionUtils;
+        if (minApiVersion) {
+            return (
+                isSupportedVersion(version, minVersion, eosVersion) &&
+                isSupportedVersion(api_version, minApiVersion)
+            );
+        }
+        return isSupportedVersion(version, minVersion, eosVersion);
+    };
+
+    clearCachedCalls = () => calls.clear();
+
+    restReq = async (
+        headers: Headers | any,
+        url: string,
+        method: any,
+        data?: any,
+        certVerification: boolean = false,
+        useTor?: boolean,
+        timeout?: number
+    ) => {
+        const id = inFlightRequestKey(headers, url, data);
+        if (calls.has(id)) {
+            return calls.get(id);
+        }
+        // API is a bit of a mess but
+        // If tor enabled in setting, start up the daemon here
+        if (useTor === true) {
+            calls.set(
+                id,
+                doTorRequest(
+                    url,
+                    method as RequestMethod,
+                    JSON.stringify(data),
+                    headers,
+                    // .onion-over-Tor: bypass TLS validation (the .onion
+                    // address authenticates at the Tor layer, upstream
+                    // self-signed certs can't match anyway).
+                    // Clearnet-over-Tor: keep strict TLS because exit
+                    // nodes can MITM.
+                    isOnionHttpsUrl(url),
+                    // undefined keeps doTorRequest's own default; only
+                    // request-scoped deadlines (payments) override it
+                    timeout
+                )
+                    .then((response: any) => {
+                        calls.delete(id);
+                        return response;
+                    })
+                    .catch((error: any) => {
+                        // evict rejected requests too, otherwise every
+                        // subsequent identical call gets the same cached
+                        // rejection until the next reconnect clears the map
+                        calls.delete(id);
+                        throw error;
+                    })
+            );
+        } else {
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(
+                    () => reject(new Error('Request timeout')),
+                    timeout || this.defaultTimeout
+                );
+            });
+
+            const fetchPromise = ReactNativeBlobUtil.config({
+                trusty: !certVerification,
+                // never replay the macaroon / rune headers to a redirect target
+                followRedirect: false,
+                // RNBlobUtil's native default is 60s; without this a
+                // payment request holding the connection open longer than
+                // that dies natively no matter what the race below allows
+                timeout: timeout || this.defaultTimeout
+            })
+                .fetch(method, url, headers, data ? JSON.stringify(data) : data)
+                .then((response: any) => {
+                    calls.delete(id);
+                    if (response.info().status < 300) {
+                        // handle ws responses
+                        if (response.data.includes('\n')) {
+                            const split = response.data.split('\n');
+                            const length = split.length;
+                            // last instance is empty
+                            return JSON.parse(split[length - 2]);
+                        }
+                        return response.json();
+                    } else {
+                        let errorInfo: any;
+                        try {
+                            errorInfo = response.json();
+                        } catch (e) {
+                            // not JSON: fall back to the raw body below
+                        }
+                        const errorMessage = [
+                            errorInfo?.error?.message,
+                            errorInfo?.message,
+                            errorInfo?.error
+                        ].find(
+                            (message: any) =>
+                                typeof message === 'string' && message
+                        );
+                        if (errorMessage) {
+                            throw new Error(errorMessage);
+                        } else if (
+                            response.data &&
+                            typeof response.data === 'string'
+                        ) {
+                            throw new Error(response.data);
+                        } else {
+                            throw new Error(
+                                localeString(
+                                    'backends.LND.restReq.connectionError'
+                                )
+                            );
+                        }
+                    }
+                });
+
+            const racePromise = Promise.race([
+                fetchPromise,
+                timeoutPromise
+            ]).catch((error) => {
+                calls.delete(id);
+                throw error;
+            });
+
+            calls.set(id, racePromise);
+        }
+
+        return await calls.get(id);
+    };
+
+    request = (
+        route: string,
+        method: string,
+        data?: any,
+        params?: any,
+        timeout?: number
+    ) => {
+        const { host, port, rune, certVerification, enableTor } = settingsStore;
+
+        if (params) {
+            route = `${route}?${Object.keys(params)
+                .map((key: string) => key + '=' + params[key])
+                .join('&')}`;
+        }
+
+        const headers: any = this.getHeaders(rune);
+        headers['Content-Type'] = 'application/json';
+
+        const url = this.getURL(host, port, route);
+
+        return this.restReq(
+            headers,
+            url,
+            method,
+            data,
+            certVerification,
+            enableTor,
+            timeout
+        );
+    };
+
+    getURL = (
+        host: string,
+        port: string | number,
+        route: string,
+        ws?: boolean
+    ) => {
+        const hostPath = host.includes('://') ? host : `https://${host}`;
+        let baseUrl = `${hostPath}${port ? ':' + port : ''}`;
+
+        if (ws) {
+            // see LND.getURL: anchored so a host containing "http" is not
+            // mangled. Unreachable today (no caller passes ws), kept in
+            // sync so reviving it cannot revive the bug.
+            baseUrl = baseUrl.replace(/^https/, 'wss').replace(/^http/, 'ws');
+        }
+
+        if (baseUrl[baseUrl.length - 1] === '/') {
+            baseUrl = baseUrl.slice(0, -1);
+        }
+
+        return `${baseUrl}${route}`;
+    };
+
+    postRequest = (route: string, data?: any, timeout?: number) =>
+        this.request(route, 'post', data, null, timeout);
+
+    getClosedChannels = async () => {
+        const channels = await this.postRequest('/v1/listclosedchannels');
+        return listClosedChannels(channels);
+    };
+
+    getNode = (data: any) =>
+        this.postRequest('/v1/listnodes', { id: data.id }).then((res) => {
+            return res;
+        });
+    getTransactions = async () => await getChainTransactions();
+    getChannels = async () => {
+        const channels = await this.postRequest('/v1/listpeerchannels');
+        return await listPeerChannels(channels);
+    };
+    listPeers = async () => {
+        const data = await this.postRequest('/v1/listpeers');
+        return (await listPeers(data)).peersWithAliases;
+    };
+    disconnectPeer = async (pubkey: string) => {
+        try {
+            await this.postRequest('/v1/disconnect', {
+                id: pubkey,
+                force: true
+            });
+            return true;
+        } catch (error) {
+            console.error(`Error disconnecting peer ${pubkey}:`, error);
+            return null;
+        }
+    };
+    getChannelInfo = (shortChanId: string) => {
+        const data = this.postRequest('/v1/listchannels', {
+            short_channel_id: shortChanId
+        });
+        return data;
+    };
+    getBlockchainBalance = () =>
+        this.postRequest('/v1/listfunds').then((res) => {
+            return getBalance(res);
+        });
+    getLightningBalance = () =>
+        this.postRequest('/v1/listfunds').then((res) => {
+            return getOffchainBalance(res);
+        });
+    sendCoins = (data: TransactionRequest) => {
+        let request: any;
+        if (data.utxos) {
+            request = {
+                destination: data.addr,
+                feerate: satPerVbyteToPerkb(data.sat_per_vbyte),
+                satoshi: data.amount,
+                utxos: data.utxos
+            };
+        } else {
+            request = {
+                destination: data.addr,
+                feerate: satPerVbyteToPerkb(data.sat_per_vbyte),
+                satoshi: data.amount
+            };
+        }
+        return this.postRequest('/v1/withdraw', request);
+    };
+    getMyNodeInfo = () => this.postRequest('/v1/getinfo');
+    // listinvoices filters natively by payment hash, and unlike the SQL query
+    // used by getInvoices it is not restricted to paid invoices
+    lookupInvoice = (data: any) =>
+        this.postRequest('/v1/listinvoices', {
+            payment_hash: data.r_hash
+        }).then((response: any) => {
+            const invoice = response?.invoices?.[0];
+            if (!invoice) {
+                throw new Error(
+                    localeString(
+                        'stores.NostrWalletConnectStore.error.invoiceNotFound'
+                    )
+                );
+            }
+            return invoice;
+        });
+    // Poll lookupInvoice for the watched payment hash instead of scanning
+    // the invoice list: getInvoices includes unpaid invoices, so on busy
+    // nodes the watched invoice can be pushed out of the window before
+    // it is paid. rHash arrives hex encoded from the Receive view. A paid
+    // invoice is the signal, with no amount check: CLN does not mark a
+    // fixed-amount invoice paid for less
+    watchInvoicePaid = (
+        { rHash }: { rHash: string },
+        onPaid: (payload: {
+            amountSat: number;
+            tx?: string;
+            preimage?: string;
+        }) => void
+    ): (() => void) => {
+        const interval = setInterval(() => {
+            this.lookupInvoice({ r_hash: rHash })
+                .then((result: any) => {
+                    const invoice = new Invoice(result);
+                    const amountPaid = invoice.getAmount;
+                    if (invoice.isPaid && Number(amountPaid) !== 0) {
+                        clearInterval(interval);
+                        onPaid({
+                            amountSat: Number(amountPaid),
+                            tx: invoice.getPaymentRequest
+                        });
+                    }
+                })
+                .catch(() => {
+                    // invoice not found or node unreachable;
+                    // retry on the next tick
+                });
+        }, 5000);
+        return () => clearInterval(interval);
+    };
+    getInvoices = (data?: any) =>
+        this.postRequest('/v1/sql', {
+            query: `SELECT label, bolt11, bolt12, payment_hash, amount_msat, status, amount_received_msat, paid_at, payment_preimage, description, expires_at FROM invoices ORDER BY created_index DESC LIMIT ${
+                data?.limit ? data.limit : 150
+            };`
+        }).then((data: any) => {
+            const invoiceList: any[] = [];
+            data.rows.forEach((invoice: any) => {
+                const bolt11 = invoice[1];
+                let creation_date: string | undefined;
+                if (bolt11) {
+                    try {
+                        creation_date = String(
+                            Bolt11Utils.decode(bolt11).timestamp
+                        );
+                    } catch (_e) {
+                        // ignore decode errors; paid_at still sorts paid invoices
+                    }
+                }
+                invoiceList.push({
+                    label: invoice[0],
+                    bolt11,
+                    payment_hash: invoice[3],
+                    amount_msat: invoice[4],
+                    status: invoice[5],
+                    amount_received_msat: invoice[6],
+                    paid_at: invoice[7],
+                    payment_preimage: invoice[8],
+                    description: invoice[9],
+                    expires_at: invoice[10],
+                    bolt12: invoice[2],
+                    creation_date
+                });
+            });
+
+            return {
+                invoices: invoiceList
+            };
+        });
+    createInvoice = (data: any) =>
+        this.postRequest('/v1/invoice', {
+            description: data.memo,
+            label: 'zeus.' + Math.random() * 1000000,
+            amount_msat: data.value != 0 ? Number(data.value) * 1000 : 'any',
+            expiry: Number(data.expiry_seconds),
+            exposeprivatechannels: true
+        });
+
+    // A payment group can mix part statuses: an MPP retry leaves the failed
+    // parts beside the pending ones. Rank complete over pending over failed
+    // so a group still in flight is not reported as failed. amount_msat
+    // and amount_sent_msat both count every part that has not failed, so
+    // an in-flight payment shows its amount and the fee stays consistent
+    // while some parts are complete and others pending.
+    getPayments = () =>
+        this.postRequest('/v1/sql', {
+            query: "select sp.payment_hash, sp.groupid, case when sum(sp.status = 'complete') > 0 then 'complete' when sum(sp.status = 'pending') > 0 then 'pending' else 'failed' end as status, min(sp.destination) as destination, min(sp.created_at) as created_at, min(sp.description) as description, min(sp.bolt11) as bolt11, min(sp.bolt12) as bolt12, sum(case when sp.status != 'failed' then sp.amount_sent_msat else null end) as amount_sent_msat, sum(case when sp.status != 'failed' then sp.amount_msat else 0 end) as amount_msat, max(sp.payment_preimage) as preimage from sendpays sp group by sp.payment_hash, sp.groupid order by created_index desc limit 150"
+        }).then((data: any) => {
+            const paymentList: any[] = [];
+            data.rows.forEach((pay: any) => {
+                paymentList.push({
+                    payment_hash: pay[0],
+                    groupid: pay[1],
+                    status: pay[2],
+                    destination: pay[3],
+                    created_at: pay[4],
+                    description: pay[5],
+                    bolt11: pay[6],
+                    bolt12: pay[7],
+                    amount_sent_msat: pay[8],
+                    amount_msat: pay[9],
+                    preimage: pay[10]
+                });
+            });
+
+            return {
+                payments: paymentList
+            };
+        });
+
+    getNewAddress = (data: any) => {
+        let addresstype: string | undefined;
+
+        switch (data.type) {
+            case '0':
+                addresstype = 'bech32';
+                break;
+            case '4':
+                addresstype = 'p2tr';
+                break;
+            default:
+                addresstype = undefined;
+        }
+
+        const params = addresstype ? { addresstype } : {};
+        const res = this.postRequest('/v1/newaddr', params);
+        return res;
+    };
+
+    openChannelSync = (data: OpenChannelRequest) => {
+        let request: any;
+        const feeRate = satPerVbyteToPerkb(data.sat_per_vbyte || 0);
+
+        request = {
+            id: data.id,
+            amount: data.fundMax ? 'all' : data.satoshis,
+            feerate: feeRate,
+            announce: !data.privateChannel ? true : false,
+            minconf: data.min_confs
+        };
+
+        if (data.utxos && data.utxos.length > 0) request.utxos = data.utxos;
+
+        return this.postRequest('/v1/fundchannel', request);
+    };
+    connectPeer = (data: any) => {
+        const [host, port] = data.addr.host.split(':');
+        const body: any = { id: data.addr.pubkey };
+        if (host) {
+            body.host = host;
+            body.port = parseInt(port);
+        }
+        return this.postRequest('/v1/connect', body);
+    };
+    decodePaymentRequest = (urlParams?: Array<string>) =>
+        this.postRequest('/v1/decode', {
+            string: urlParams && urlParams[0]
+        });
+
+    // xpay and xkeysend only accept an absolute fee cap (maxfee), not
+    // maxfeepercent. fee_limit_sat is the source of truth: FeeLimit
+    // already emits the percent-derived sat amount as fee_limit_sat in
+    // percent mode, so the cap always matches what the fee UI displays.
+    // A limit of 0 is a real cap of zero. Returning undefined leaves the
+    // cap to xpay's default of max(5000msat, 1%).
+    private getMaxFeeMsat = (data: any) =>
+        feeLimitSatsToMaxRoutingFeeMsat(data.fee_limit_sat);
+
+    // xpay and xkeysend results omit status and payment_hash: synthesize
+    // both so handlePayment success detection and payment note keys
+    // (note-<payment_hash>) keep working. hash = SHA256(preimage), and
+    // xpay only resolves on success (failures reject via the HTTP error
+    // path), so status is always complete here.
+    private formatXpayResult = (result: any) => {
+        const formatted: any = { ...result, status: 'complete' };
+        if (result?.payment_preimage) {
+            formatted.payment_hash = sha256Hex(
+                Base64Utils.hexToBytes(result.payment_preimage)
+            );
+        }
+        return formatted;
+    };
+
+    // cln blocks on /v1/pay, /v1/xpay, /v1/keysend, and /v1/xkeysend for
+    // up to retry_for seconds, so the request timeout needs headroom past
+    // that deadline or the definitive response is discarded as a generic
+    // transport timeout. Mirror LND's payLightningInvoice: race the call
+    // against the payment-timed-out shape so a slow payment surfaces as
+    // "may be in transit, check Activity" instead of a retryable-looking
+    // error (dangerous on keysend, where a retry double-sends).
+    // formatResult runs on the real response only, inside the race, so
+    // the timed-out shape is never marked status complete.
+    private payWithTimeout = (
+        route: string,
+        request: any,
+        data: any,
+        formatResult?: (result: any) => any
+    ) => {
+        const timeoutSeconds = Number(data.timeout_seconds) || 60;
+
+        const forcedTimeout = async (time_ms: number, response: any) => {
+            await new Promise((res) => setTimeout(res, time_ms));
+            return response;
+        };
+
+        let call = this.postRequest(
+            route,
+            request,
+            (timeoutSeconds + 5) * 1000
+        );
+        if (formatResult) call = call.then(formatResult);
+
+        return Promise.race([
+            forcedTimeout((timeoutSeconds + 1) * 1000, {
+                payment_error: localeString(
+                    'views.SendingLightning.paymentTimedOut'
+                )
+            }),
+            call
+        ]);
+    };
+
+    payLightningInvoice = async (data: any) => {
+        const maxfee = this.getMaxFeeMsat(data);
+
+        // pay is deprecated in CLN v26.06 and removed in v27.03; use xpay
+        // (available since v24.11) when the node has it
+        if (!this.supports('v24.11')) {
+            const legacyRequest: any = {
+                bolt11: data.payment_request,
+                amount_msat: Number(data.amt && data.amt * 1000),
+                retry_for: data.timeout_seconds
+            };
+            // pay takes either a percent cap or an absolute maxfee, not
+            // both. maxfee predates clnrest itself, so no version gate.
+            // Prefer fee_limit_sat so the cap matches the fee UI, same
+            // as the xpay path.
+            if (maxfee !== undefined) {
+                legacyRequest.maxfee = maxfee;
+            } else if (data.max_fee_percent) {
+                legacyRequest.maxfeepercent = data.max_fee_percent;
+            }
+            return this.payWithTimeout('/v1/pay', legacyRequest, data);
+        }
+
+        const request: any = {
+            invstring: data.payment_request,
+            retry_for: data.timeout_seconds
+        };
+        if (data.amt) request.amount_msat = Number(data.amt) * 1000;
+        if (maxfee !== undefined) request.maxfee = maxfee;
+
+        return this.payWithTimeout(
+            '/v1/xpay',
+            request,
+            data,
+            this.formatXpayResult
+        );
+    };
+    sendKeysend = async (data: any) => {
+        const maxfee = this.getMaxFeeMsat(data);
+
+        // keysend is deprecated in CLN v26.06 and removed in v27.03; use
+        // xkeysend (introduced alongside the deprecation in v26.06) when
+        // the node has it
+        if (!this.supports('v26.06')) {
+            const legacyRequest: any = {
+                destination: data.pubkey,
+                amount_msat: Number(data.amt && data.amt * 1000),
+                retry_for: data.timeout_seconds
+            };
+            // keysend takes either a percent cap or an absolute maxfee,
+            // not both, and only gained maxfee in v24.11: on older nodes
+            // express the fixed cap as the equivalent percent of the
+            // keysend amount (capped at CLN's 100% param limit). CLN
+            // reads the percent to whole ppm and floors the budget, so
+            // round up to 4 decimals to keep the cap at or above the
+            // fixed limit. Prefer fee_limit_sat so the cap matches the fee
+            // UI, same as pay, xpay and xkeysend: in percent mode it holds
+            // the rounded-up sat amount the UI shows, and the raw percent
+            // would cap below it.
+            if (maxfee !== undefined && this.supports('v24.11')) {
+                legacyRequest.maxfee = maxfee;
+            } else if (maxfee !== undefined && data.amt) {
+                legacyRequest.maxfeepercent = BigNumber.min(
+                    new BigNumber(data.fee_limit_sat)
+                        .times(100)
+                        .dividedBy(data.amt)
+                        .decimalPlaces(4, BigNumber.ROUND_CEIL),
+                    100
+                ).toNumber();
+            } else if (data.max_fee_percent) {
+                legacyRequest.maxfeepercent = data.max_fee_percent;
+            }
+            // With maxfeepercent, keysend raises any budget below
+            // exemptfee (default 5000 msat) to exemptfee. Send 0 so the
+            // percent is the whole cap. Not allowed alongside maxfee,
+            // which already sets the exemption to 0.
+            if (legacyRequest.maxfeepercent !== undefined) {
+                legacyRequest.exemptfee = 0;
+            }
+            return this.payWithTimeout('/v1/keysend', legacyRequest, data);
+        }
+
+        const request: any = {
+            destination: data.pubkey,
+            amount_msat: Number(data.amt && data.amt * 1000),
+            retry_for: data.timeout_seconds
+        };
+        if (maxfee !== undefined) request.maxfee = maxfee;
+
+        return this.payWithTimeout(
+            '/v1/xkeysend',
+            request,
+            data,
+            this.formatXpayResult
+        );
+    };
+    closeChannel = (urlParams?: Array<string>) => {
+        const request = {
+            id: urlParams && urlParams[0],
+            unilateraltimeout: urlParams && urlParams[1] ? 2 : 0
+        };
+        return this.postRequest('/v1/close', request);
+    };
+    getFees = () =>
+        this.postRequest('/v1/getinfo').then((res: any) => ({
+            total_fee_sum: res.fees_collected_msat / 1000
+        }));
+    setFees = (data: any) =>
+        this.postRequest('/v1/setchannel', {
+            id: data.global ? 'all' : data.channelId,
+            feebase: data.base_fee_msat,
+            feeppm: data.fee_rate
+        });
+    getUTXOs = async () => await getChainUTXOs();
+    signMessage = (message: string) =>
+        this.postRequest('/v1/signmessage', {
+            message
+        });
+    verifyMessage = (data: any) =>
+        this.postRequest('/v1/checkmessage', {
+            message: data.msg,
+            zbase: data.signature
+        });
+    lnurlAuth = async (r_hash: string) => {
+        const signed = await this.signMessage(r_hash);
+        return {
+            signature: sha256Bytes(
+                Base64Utils.stringToUint8Array(signed.signature)
+            )
+        };
+    };
+
+    getForwardingHistory = (
+        _hours?: number,
+        _chanIdIn?: string,
+        _chanIdOut?: string
+    ) => {
+        const data = this.postRequest('/v1/listforwards', {
+            status: 'settled',
+            limit: 10000000,
+            index: 'created'
+        });
+        return data;
+    };
+
+    // BOLT 12 / Offers
+    listOffers = () =>
+        this.postRequest('/v1/listoffers', { active_only: true });
+    createWithdrawalRequest = ({
+        amount,
+        description
+    }: {
+        amount: string;
+        description: string;
+    }) => {
+        return this.postRequest('/v1/invoicerequest', {
+            // invoicerequest reads a bare number as msat
+            amount: Number(amount) * 1000,
+            description
+        });
+    };
+    redeemWithdrawalRequest = ({
+        invreq,
+        label
+    }: {
+        invreq: string;
+        label: string;
+    }) => {
+        return this.postRequest('/v1/sendinvoice', {
+            invreq,
+            label
+        });
+    };
+    createOffer = ({
+        description,
+        label,
+        singleUse
+    }: {
+        description?: string;
+        label?: string;
+        singleUse?: boolean;
+    }) =>
+        this.postRequest('/v1/offer', {
+            amount: 'any',
+            description,
+            label,
+            single_use: singleUse || false
+        });
+    disableOffer = ({ offer_id }: { offer_id: string }) =>
+        this.postRequest('/v1/disableoffer', { offer_id });
+    fetchInvoiceFromOffer = async (
+        bolt12: string,
+        amountSatoshis: string,
+        timeoutSeconds?: number | string,
+        // Accepted for signature parity with the ldk-node backend, which pays
+        // inside this call and so must apply the fee limit itself. CLN only
+        // fetches the invoice here; the payment goes through PaymentRequest,
+        // which applies the user's fee limit downstream.
+        _feeLimitSat?: number | string
+    ) => {
+        return await this.postRequest('/v1/fetchinvoice', {
+            offer: bolt12,
+            amount_msat: Number(amountSatoshis) * 1000,
+            timeout: timeoutSeconds ? Number(timeoutSeconds) : 60
+        });
+    };
+    getRoutes = ({
+        source,
+        destination,
+        amount_msat,
+        layers,
+        maxfee_msat,
+        final_cltv
+    }: {
+        source: string;
+        destination: string;
+        amount_msat: number;
+        layers?: string[];
+        maxfee_msat?: number;
+        final_cltv?: number;
+    }) => {
+        return this.postRequest(
+            '/v1/getroutes',
+            {
+                source,
+                destination,
+                amount_msat,
+                layers,
+                maxfee_msat,
+                final_cltv
+            },
+            30000
+        );
+    };
+    askReneCreateLayer = ({ layer }: { layer: string }) => {
+        return this.postRequest('/v1/askrene-create-layer', { layer }, 30000);
+    };
+    askReneUpdateChannel = ({
+        short_channel_id_dir,
+        layer,
+        enabled = false
+    }: {
+        short_channel_id_dir: string;
+        layer: string;
+        enabled?: boolean;
+    }) => {
+        return this.postRequest(
+            '/v1/askrene-update-channel',
+            {
+                short_channel_id_dir,
+                layer,
+                enabled
+            },
+            30000
+        );
+    };
+    askReneRemoveLayer = ({ layer }: { layer: string }) => {
+        return this.postRequest('/v1/askrene-remove-layer', { layer }, 30000);
+    };
+    sendPay = ({
+        route,
+        payment_hash,
+        payment_secret,
+        bolt11
+    }: {
+        route: any[];
+        payment_hash: string;
+        payment_secret?: string;
+        bolt11?: string;
+    }) => {
+        const params: any = {
+            route,
+            payment_hash
+        };
+
+        if (payment_secret) {
+            params.payment_secret = payment_secret;
+        }
+
+        if (bolt11) {
+            params.bolt11 = bolt11;
+        }
+
+        return this.postRequest('/v1/sendpay', params, 30000);
+    };
+    waitSendPay = ({
+        payment_hash,
+        timeout
+    }: {
+        payment_hash: string;
+        timeout?: number;
+    }) => {
+        const params: any = {
+            payment_hash
+        };
+
+        if (timeout) {
+            params.timeout = timeout;
+        }
+
+        return this.postRequest('/v1/waitsendpay', params, 120000);
+    };
+
+    supportsPeers = () => true;
+    supportsMessageSigning = () => true;
+    supportsMessageVerification = () => true;
+    requiresVerifyPubkey = () => false;
+    supportsAddressMessageSigning = () => false;
+    supportsLnurlAuth = () => true;
+    supportsOnchainBalance = () => true;
+    supportsOnchainSends = () => true;
+    supportsOnchainReceiving = () => true;
+    // listfunds cannot attribute unconfirmed outputs to self-transfers
+    supportsUnconfirmedTransactionOrigin = () => false;
+    supportsLightningSends = () => true;
+    supportsKeysend = () => true;
+    // follow-up: /v1/listpays accepts payment_hash and could support this
+    supportsPaymentLookup = () => false;
+    supportsChannelManagement = () => true;
+    supportsCircularRebalancing = () => true;
+    supportsForceClose = () => false;
+    supportsPendingChannels = () => false;
+    supportsClosedChannels = () => true;
+    supportsMPP = () => false;
+    supportsAMP = () => false;
+    supportsCoinControl = () => true;
+    supportsChannelCoinControl = () => true;
+    supportsHopPicking = () => false;
+    supportsWithdrawalRequests = () => true;
+    supportsAccounts = () => false;
+    supportsRouting = () => true;
+    supportsNodeInfo = () => true;
+    singleFeesEarnedTotal = () => false;
+    supportsAddressTypeSelection = () => true;
+    supportsNestedSegWit = () => false;
+    supportsTaproot = () => true;
+    supportsBumpFee = () => false;
+    supportsOnchainSendFeeRate = () => true;
+    supportsChannelOpenFeeRate = () => true;
+    supportsChannelOpenMinConfs = () => true;
+    supportsFlowLSP = () => false;
+    supportsNetworkInfo = () => false;
+    supportsSimpleTaprootChannels = () => false;
+    supportsCustomPreimages = () => false;
+    supportsSweep = () => true;
+    supportsOnchainSendMax = () => true;
+    supportsChannelMemo = () => false;
+    supportsOnchainBatching = () => false;
+    supportsChannelBatching = () => false;
+    supportsChannelFundMax = () => true;
+    supportsLSPScustomMessage = () => false;
+    supportsLSPS1rest = () => true;
+    supportsBolt11BlindedRoutes = () => false;
+    supportsAddressesWithDerivationPaths = () => false;
+    supportsOffers = () => true;
+    // fetchinvoice hands back the invoice for the PaymentRequest screen to
+    // review and pay; the offer itself is never paid directly
+    supportsOffersDirectPay = () => false;
+    supportsListingOffers = () => true;
+    supportsBolt12Address = () => true;
+    supportsCustomFeeLimit = () => true;
+    isLNDBased = () => false;
+    supportsForwardingHistory = () => true;
+    supportInboundFees = () => false;
+    supportsDevTools = () => true;
+    supportsCashuWallet = () => false;
+    supportsSettingInvoiceExpiration = () => true;
+    supportsNostrWalletConnectService = () => true;
+}

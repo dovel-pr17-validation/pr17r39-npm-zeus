@@ -1,0 +1,615 @@
+// Mock CashuDevKit to avoid native module dependency in tests
+jest.mock('../cashu-cdk', () => ({
+    __esModule: true,
+    default: {
+        isAvailable: () => false,
+        isValidToken: jest.fn(),
+        decodeToken: jest.fn()
+    }
+}));
+
+import CashuDevKit from '../cashu-cdk';
+import CashuUtils, {
+    cashuTokenPrefixes,
+    CashuSeedOrigin,
+    classifyCashuSeedOrigin,
+    isMeltPaid,
+    isMeltSettledUnpaid,
+    meltOutcome,
+    meltQuoteOutcome,
+    normalizeMeltState,
+    resolveLockTarget
+} from './CashuUtils';
+
+const mockIsValidToken = CashuDevKit.isValidToken as jest.Mock;
+const mockDecodeToken = CashuDevKit.decodeToken as jest.Mock;
+
+// Hardcoded test tokens — no cashu-ts dependency
+const cashuAToken =
+    'cashuAeyJ0b2tlbiI6IFt7InByb29mcyI6IFtdLCAibWludCI6ICJodHRwczovL21pbnQuZXhhbXBsZS5jb20ifV19';
+const cashuBToken =
+    'cashuBo2FteBhodHRwczovL21pbnQuZXhhbXBsZS5jb21hdWNzYXRhdIGiYWlIAK0mjU0fWCZhcIGjYWEBYXN4QGFjYzEyNDM1ZTdiODQ4NGMzY2YxODUwMTQ5MjE4YWY5MGY3MTZhNTJiZjRhNWVkMzQ3ZTQ4ZWNjMTNmNzczODhhY1ghAkRTgxmeSF1cvtOymmQr7lh5N1q556Yg4R5IukgkIfPP';
+
+describe('CashuUtils', () => {
+    describe('extractTokenString', () => {
+        it('returns empty string for null/undefined/empty input', () => {
+            expect(CashuUtils.extractTokenString('')).toBe('');
+            expect(CashuUtils.extractTokenString(null as any)).toBe('');
+            expect(CashuUtils.extractTokenString(undefined as any)).toBe('');
+        });
+
+        it('returns cashuA token as-is when no prefix', () => {
+            const result = CashuUtils.extractTokenString(cashuAToken);
+            expect(result).toBe(cashuAToken);
+            expect(result.startsWith('cashuA')).toBe(true);
+        });
+
+        it('returns cashuB token as-is when no prefix', () => {
+            const result = CashuUtils.extractTokenString(cashuBToken);
+            expect(result).toBe(cashuBToken);
+            expect(result.startsWith('cashuB')).toBe(true);
+        });
+
+        it('extracts cashuA token from URL prefixes', () => {
+            for (const prefix of cashuTokenPrefixes) {
+                const input = `${prefix}${cashuAToken}`;
+                const result = CashuUtils.extractTokenString(input);
+                expect(result).toBe(cashuAToken);
+            }
+        });
+
+        it('extracts cashuB token from URL prefixes', () => {
+            for (const prefix of cashuTokenPrefixes) {
+                const input = `${prefix}${cashuBToken}`;
+                const result = CashuUtils.extractTokenString(input);
+                expect(result).toBe(cashuBToken);
+            }
+        });
+
+        it('extracts cashuA token embedded in arbitrary text', () => {
+            const input = `some garbage before ${cashuAToken} and after`;
+            const result = CashuUtils.extractTokenString(input);
+            expect(result.startsWith('cashuA')).toBe(true);
+        });
+
+        it('extracts cashuB token embedded in arbitrary text', () => {
+            const input = `some garbage before ${cashuBToken} and after`;
+            const result = CashuUtils.extractTokenString(input);
+            expect(result.startsWith('cashuB')).toBe(true);
+        });
+
+        it('trims whitespace', () => {
+            expect(CashuUtils.extractTokenString(`  ${cashuAToken}  `)).toBe(
+                cashuAToken
+            );
+            expect(CashuUtils.extractTokenString(`  ${cashuBToken}  `)).toBe(
+                cashuBToken
+            );
+        });
+
+        it('picks the earliest cashu prefix when both are present', () => {
+            // cashuA appears first
+            const inputAFirst = `${cashuAToken} ${cashuBToken}`;
+            expect(
+                CashuUtils.extractTokenString(inputAFirst).startsWith('cashuA')
+            ).toBe(true);
+
+            // cashuB appears first
+            const inputBFirst = `${cashuBToken} ${cashuAToken}`;
+            expect(
+                CashuUtils.extractTokenString(inputBFirst).startsWith('cashuB')
+            ).toBe(true);
+        });
+    });
+
+    describe('isValidCashuToken', () => {
+        it('validates cashuA tokens', () => {
+            expect(CashuUtils.isValidCashuToken(cashuAToken)).toBe(true);
+        });
+
+        it('validates cashuB tokens', () => {
+            expect(CashuUtils.isValidCashuToken(cashuBToken)).toBe(true);
+        });
+
+        it('validates cashuA tokens with URL prefix', () => {
+            expect(CashuUtils.isValidCashuToken(`cashu:${cashuAToken}`)).toBe(
+                true
+            );
+        });
+
+        it('validates cashuB tokens with URL prefix', () => {
+            expect(CashuUtils.isValidCashuToken(`cashu:${cashuBToken}`)).toBe(
+                true
+            );
+        });
+
+        it('rejects tokens without cashuA/cashuB prefix', () => {
+            expect(CashuUtils.isValidCashuToken('')).toBe(false);
+            expect(CashuUtils.isValidCashuToken('notavalidtoken')).toBe(false);
+        });
+
+        it('accepts tokens with a sufficient base64-shaped payload', () => {
+            expect(CashuUtils.isValidCashuToken('cashuAinvalidpayload')).toBe(
+                true
+            );
+            expect(CashuUtils.isValidCashuToken('cashuBinvalidpayload')).toBe(
+                true
+            );
+        });
+
+        it('accepts standard-base64 tokens with +, /, and = padding', () => {
+            // v3 wallets that use btoa() emit standard base64 with padding
+            expect(CashuUtils.isValidCashuToken('cashuAeyJ0b2tlbi8rIn0=')).toBe(
+                true
+            );
+            expect(
+                CashuUtils.isValidCashuToken('cashuAa+b/c=d+e/f=g+h/i==')
+            ).toBe(true);
+        });
+
+        it('rejects tokens whose payload is too short after the prefix', () => {
+            expect(CashuUtils.isValidCashuToken('cashuA')).toBe(false);
+            expect(CashuUtils.isValidCashuToken('cashuB')).toBe(false);
+            expect(CashuUtils.isValidCashuToken('cashuAshort')).toBe(false);
+            expect(CashuUtils.isValidCashuToken('cashuBshort')).toBe(false);
+        });
+
+        it('rejects tokens with non-base64 characters after the prefix', () => {
+            expect(CashuUtils.isValidCashuToken('cashuA!!!!!!!!!!')).toBe(
+                false
+            );
+            expect(
+                CashuUtils.isValidCashuToken('cashuB?invalid=value&more')
+            ).toBe(false);
+            expect(CashuUtils.isValidCashuToken('cashuAfrica')).toBe(false);
+        });
+
+        it('extracts and validates token even with trailing URL noise', () => {
+            // Web wrappers sometimes append &memo=... after the token; the
+            // extractor must trim that off so the shape check still passes.
+            const valid =
+                'cashuAeyJ0b2tlbiI6IFt7InByb29mcyI6IFtdLCAibWludCI6ICJodHRwczovL21pbnQuZXhhbXBsZS5jb20ifV19';
+            expect(
+                CashuUtils.isValidCashuToken(
+                    `https://wallet.cashu.me/?token=${valid}&memo=hello`
+                )
+            ).toBe(true);
+        });
+
+        it('rejects null/undefined', () => {
+            expect(CashuUtils.isValidCashuToken(null as any)).toBe(false);
+            expect(CashuUtils.isValidCashuToken(undefined as any)).toBe(false);
+        });
+    });
+
+    describe('isValidCashuTokenAsync', () => {
+        beforeEach(() => {
+            mockIsValidToken.mockReset();
+        });
+
+        it('delegates to CDK for deep validation', async () => {
+            mockIsValidToken.mockResolvedValue(true);
+            expect(await CashuUtils.isValidCashuTokenAsync(cashuAToken)).toBe(
+                true
+            );
+            expect(mockIsValidToken).toHaveBeenCalledWith(cashuAToken);
+        });
+
+        it('rejects invalid payload via CDK', async () => {
+            mockIsValidToken.mockResolvedValue(false);
+            expect(
+                await CashuUtils.isValidCashuTokenAsync('cashuAinvalidpayload')
+            ).toBe(false);
+        });
+
+        it('returns false for empty/null input', async () => {
+            expect(await CashuUtils.isValidCashuTokenAsync('')).toBe(false);
+            expect(await CashuUtils.isValidCashuTokenAsync(null as any)).toBe(
+                false
+            );
+        });
+    });
+
+    describe('decodeCashuTokenAsync', () => {
+        beforeEach(() => {
+            mockDecodeToken.mockReset();
+        });
+
+        it('decodes cashuA token via CDK', async () => {
+            mockDecodeToken.mockResolvedValue({
+                value: 1,
+                mint_url: 'https://mint.example.com',
+                encoded: cashuAToken,
+                proofs: [
+                    {
+                        amount: 1,
+                        secret: 'abc',
+                        c: 'def',
+                        keyset_id: '00ad268d4d1f5826'
+                    }
+                ]
+            });
+            const decoded = await CashuUtils.decodeCashuTokenAsync(cashuAToken);
+            expect(decoded.mint_url).toBe('https://mint.example.com');
+            expect(decoded.proofs).toHaveLength(1);
+            expect(decoded.proofs[0].amount).toBe(1);
+            expect(mockDecodeToken).toHaveBeenCalledWith(cashuAToken);
+        });
+
+        it('decodes cashuB token via CDK', async () => {
+            mockDecodeToken.mockResolvedValue({
+                value: 1,
+                mint_url: 'https://mint.example.com',
+                encoded: cashuBToken,
+                proofs: [
+                    {
+                        amount: 1,
+                        secret: 'abc',
+                        c: 'def',
+                        keyset_id: '00ad268d4d1f5826'
+                    }
+                ]
+            });
+            const decoded = await CashuUtils.decodeCashuTokenAsync(cashuBToken);
+            expect(decoded.mint_url).toBe('https://mint.example.com');
+            expect(decoded.proofs).toHaveLength(1);
+            expect(decoded.proofs[0].amount).toBe(1);
+        });
+
+        it('rejects on invalid token', async () => {
+            mockDecodeToken.mockRejectedValue(new Error('Invalid token'));
+            await expect(
+                CashuUtils.decodeCashuTokenAsync('invalidtoken')
+            ).rejects.toThrow('Invalid token');
+        });
+    });
+
+    describe('sumProofsValue', () => {
+        it('sums proof amounts', () => {
+            expect(
+                CashuUtils.sumProofsValue([
+                    { amount: 1 },
+                    { amount: 2 },
+                    { amount: 4 }
+                ])
+            ).toBe(7);
+        });
+
+        it('sums string proof amounts as numbers', () => {
+            expect(
+                CashuUtils.sumProofsValue([
+                    { amount: '64' },
+                    { amount: '32' },
+                    { amount: '4' }
+                ])
+            ).toBe(100);
+        });
+
+        it('returns 0 for empty/null', () => {
+            expect(CashuUtils.sumProofsValue([])).toBe(0);
+            expect(CashuUtils.sumProofsValue(null)).toBe(0);
+            expect(CashuUtils.sumProofsValue(undefined)).toBe(0);
+        });
+    });
+
+    describe('P2PK helpers', () => {
+        // Use a far-future locktime so the token is still considered locked
+        const futureLocktime = Math.floor(Date.now() / 1000) + 86400 * 365;
+        const p2pkSecret = JSON.stringify([
+            'P2PK',
+            {
+                nonce: 'abc123',
+                data: '02abcdef1234567890',
+                tags: [['locktime', futureLocktime]]
+            }
+        ]);
+
+        it('detects P2PK locked tokens', () => {
+            expect(
+                CashuUtils.isTokenP2PKLocked({
+                    proofs: [{ secret: p2pkSecret }]
+                })
+            ).toBe(true);
+        });
+
+        it('returns false for non-P2PK tokens', () => {
+            expect(
+                CashuUtils.isTokenP2PKLocked({
+                    proofs: [{ secret: 'plainSecret' }]
+                })
+            ).toBe(false);
+        });
+
+        it('extracts P2PK pubkey from secret', () => {
+            expect(CashuUtils.getP2PKPubkeySecret(p2pkSecret)).toBe(
+                '02abcdef1234567890'
+            );
+        });
+
+        it('returns undefined for non-P2PK secret', () => {
+            expect(
+                CashuUtils.getP2PKPubkeySecret('plainSecret')
+            ).toBeUndefined();
+        });
+
+        it('extracts locktime from P2PK secret', () => {
+            expect(CashuUtils.getP2PKLocktime(p2pkSecret)).toBe(futureLocktime);
+        });
+
+        it('returns undefined locktime for non-P2PK secret', () => {
+            expect(CashuUtils.getP2PKLocktime('plainSecret')).toBeUndefined();
+        });
+
+        it('returns undefined for malformed JSON', () => {
+            expect(CashuUtils.getP2PKPubkeySecret('{bad json')).toBeUndefined();
+        });
+
+        it('rejects deeply nested secrets', () => {
+            const deep = '[[[[[[[[[[["P2PK",{"data":"key"}]]]]]]]]]]]';
+            expect(CashuUtils.getP2PKPubkeySecret(deep)).toBeUndefined();
+        });
+
+        it('rejects oversized secrets', () => {
+            const big = 'x'.repeat(3000);
+            expect(CashuUtils.getP2PKPubkeySecret(big)).toBeUndefined();
+        });
+    });
+
+    describe('isTokenLockedError', () => {
+        it('detects CDK\'s older "witness is missing" wording', () => {
+            expect(
+                CashuUtils.isTokenLockedError(
+                    new Error('Witness is missing signatures required for P2PK')
+                )
+            ).toBe(true);
+        });
+
+        it('detects CDK\'s newer "signatures not provided" wording', () => {
+            expect(
+                CashuUtils.isTokenLockedError(
+                    new Error(
+                        'Witness signatures not provided. P2PK signatures are required but not provided'
+                    )
+                )
+            ).toBe(true);
+        });
+
+        it('is case-insensitive', () => {
+            expect(
+                CashuUtils.isTokenLockedError(
+                    new Error('witness SIGNATURE missing for P2PK')
+                )
+            ).toBe(true);
+        });
+
+        it('detects CDK 0.18\'s "Signature missing or invalid" wording, which carries no "p2pk" substring', () => {
+            expect(
+                CashuUtils.isTokenLockedError(
+                    new Error('Signature missing or invalid')
+                )
+            ).toBe(true);
+        });
+
+        it('returns false for unrelated errors', () => {
+            expect(
+                CashuUtils.isTokenLockedError(new Error('Token already spent'))
+            ).toBe(false);
+            expect(
+                CashuUtils.isTokenLockedError(new Error('Network error'))
+            ).toBe(false);
+        });
+
+        it('returns false for non-error values', () => {
+            expect(CashuUtils.isTokenLockedError(undefined)).toBe(false);
+            expect(CashuUtils.isTokenLockedError(null)).toBe(false);
+            expect(CashuUtils.isTokenLockedError('a plain string')).toBe(false);
+            expect(CashuUtils.isTokenLockedError({})).toBe(false);
+        });
+    });
+
+    describe('classifyCashuSeedOrigin', () => {
+        const ldk12 =
+            'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+        const derived12 =
+            'legal winner thank year wave sausage worth useful legal winner thank yellow';
+        const lnd24 = Array(23).fill('abandon').concat('art');
+
+        it('flags a 12-word LDK wallet whose cashu seed is the wallet seed', () => {
+            expect(
+                classifyCashuSeedOrigin(ldk12.split(' '), ldk12, undefined)
+            ).toBe(CashuSeedOrigin.WalletSeed);
+        });
+
+        it('tolerates irregular whitespace in the wallet mnemonic', () => {
+            expect(
+                classifyCashuSeedOrigin(
+                    ldk12.split(' '),
+                    `  ${ldk12.replace(/ /g, '   ')}  `,
+                    undefined
+                )
+            ).toBe(CashuSeedOrigin.WalletSeed);
+        });
+
+        it('treats a distinct seed on an LDK wallet as derived', () => {
+            expect(
+                classifyCashuSeedOrigin(derived12.split(' '), ldk12, undefined)
+            ).toBe(CashuSeedOrigin.DerivedFromWalletSeed);
+        });
+
+        it('treats a seed on an LND wallet as derived', () => {
+            expect(
+                classifyCashuSeedOrigin(derived12.split(' '), undefined, lnd24)
+            ).toBe(CashuSeedOrigin.DerivedFromWalletSeed);
+        });
+
+        it('treats a seed with no wallet seed to derive from as independent', () => {
+            // remote nodes: generated by getCDKMnemonic, only copy
+            expect(
+                classifyCashuSeedOrigin(derived12.split(' '), undefined, [])
+            ).toBe(CashuSeedOrigin.Independent);
+            expect(
+                classifyCashuSeedOrigin(
+                    derived12.split(' '),
+                    undefined,
+                    undefined
+                )
+            ).toBe(CashuSeedOrigin.Independent);
+        });
+
+        it('never reports WalletSeed without a cashu seed to compare', () => {
+            expect(classifyCashuSeedOrigin(undefined, ldk12, undefined)).toBe(
+                CashuSeedOrigin.DerivedFromWalletSeed
+            );
+            expect(classifyCashuSeedOrigin([], ldk12, undefined)).toBe(
+                CashuSeedOrigin.DerivedFromWalletSeed
+            );
+        });
+    });
+});
+
+describe('resolveLockTarget', () => {
+    const locked = { pubkey: '02abc', contactName: 'Alice' };
+
+    it('drops the contact when the lock is removed (#4637)', () => {
+        // Lock Settings' Back used to send pubkey: '' without contactName, so
+        // the name survived and reopened Lock Settings with a chip but no pubkey
+        expect(resolveLockTarget({ pubkey: '' }, locked)).toEqual({
+            pubkey: '',
+            contactName: ''
+        });
+    });
+
+    it('keeps the existing lock when no lock fields are sent', () => {
+        expect(resolveLockTarget({}, locked)).toEqual(locked);
+    });
+
+    it('uses the contact sent with a newly saved lock', () => {
+        expect(
+            resolveLockTarget({ pubkey: '03def', contactName: 'Bob' }, locked)
+        ).toEqual({ pubkey: '03def', contactName: 'Bob' });
+    });
+
+    it('drops the old contact name when the pubkey changes without one', () => {
+        expect(resolveLockTarget({ pubkey: '03def' }, locked)).toEqual({
+            pubkey: '03def',
+            contactName: ''
+        });
+    });
+
+    it('keeps the contact name when the same pubkey is re-sent without one', () => {
+        expect(resolveLockTarget({ pubkey: '02abc' }, locked)).toEqual(locked);
+    });
+
+    it('clears a stale contact name left without a pubkey', () => {
+        expect(
+            resolveLockTarget({}, { pubkey: '', contactName: 'Alice' })
+        ).toEqual({ pubkey: '', contactName: '' });
+    });
+});
+
+describe('melt state', () => {
+    describe('normalizeMeltState', () => {
+        it('uppercases the state it was given', () => {
+            expect(normalizeMeltState('Paid')).toBe('PAID');
+            expect(normalizeMeltState('Pending')).toBe('PENDING');
+        });
+
+        it('falls back to the next candidate when one is missing', () => {
+            expect(normalizeMeltState(undefined, 'Unpaid')).toBe('UNPAID');
+            expect(normalizeMeltState('', 'Pending')).toBe('PENDING');
+        });
+
+        it('prefers the first non-empty candidate', () => {
+            expect(normalizeMeltState('Pending', 'Paid')).toBe('PENDING');
+        });
+
+        it('leaves a missing state unknown', () => {
+            expect(normalizeMeltState()).toBe('');
+            expect(normalizeMeltState(undefined, null, '')).toBe('');
+        });
+    });
+
+    describe('isMeltPaid', () => {
+        it('accepts a Paid melt', () => {
+            expect(isMeltPaid('Paid')).toBe(true);
+        });
+
+        // The mint has not settled the invoice in any of these states, so a
+        // melt resolving with one must never be reported as a paid invoice
+        it.each(['Pending', 'Unpaid', 'Issued', 'Failed'])(
+            'rejects a %s melt',
+            (state) => {
+                expect(isMeltPaid(state)).toBe(false);
+            }
+        );
+
+        it('rejects a melt with no state at all', () => {
+            expect(isMeltPaid(undefined)).toBe(false);
+        });
+    });
+
+    describe('meltOutcome', () => {
+        it('reads a paid melt as paid', () => {
+            expect(meltOutcome('Paid')).toBe('paid');
+        });
+
+        // The mint is finished with these and did not pay: the ecash is the
+        // wallet's again and nothing can change later
+        it.each(['Unpaid', 'Failed', 'Expired'])(
+            'reads a %s melt as settled unpaid',
+            (state) => {
+                expect(isMeltSettledUnpaid(state)).toBe(true);
+                expect(meltOutcome(state)).toBe('unpaid');
+            }
+        );
+
+        it('reads a pending melt as in flight', () => {
+            expect(isMeltSettledUnpaid('Pending')).toBe(false);
+            expect(meltOutcome('Pending')).toBe('inFlight');
+        });
+
+        // Dropping an unknown state would lose a payment that may still
+        // settle, the same mistake as reporting it paid, in the other
+        // direction
+        it('reads an unknown or absent state as in flight', () => {
+            expect(meltOutcome('Issued')).toBe('inFlight');
+            expect(meltOutcome(undefined)).toBe('inFlight');
+            expect(meltOutcome('')).toBe('inFlight');
+        });
+    });
+
+    describe('meltQuoteOutcome', () => {
+        // CDK returns its local copy of a quote while a melt saga holds it,
+        // and that copy stays Unpaid until the saga finishes
+        it('reads an Unpaid quote a saga still holds as in flight', () => {
+            expect(
+                meltQuoteOutcome({
+                    state: 'Unpaid',
+                    used_by_operation: 'op-1'
+                })
+            ).toBe('inFlight');
+        });
+
+        it('reads an Unpaid quote no saga holds as unpaid', () => {
+            expect(meltQuoteOutcome({ state: 'Unpaid' })).toBe('unpaid');
+            expect(
+                meltQuoteOutcome({ state: 'Unpaid', used_by_operation: null })
+            ).toBe('unpaid');
+        });
+
+        it('reads a Paid quote as paid', () => {
+            expect(
+                meltQuoteOutcome({ state: 'Paid', used_by_operation: 'op-1' })
+            ).toBe('paid');
+            expect(meltQuoteOutcome({ state: 'Paid' })).toBe('paid');
+        });
+
+        it('reads a Pending quote as in flight', () => {
+            expect(meltQuoteOutcome({ state: 'Pending' })).toBe('inFlight');
+        });
+
+        it('reads a missing quote as in flight', () => {
+            expect(meltQuoteOutcome(undefined)).toBe('inFlight');
+        });
+    });
+});

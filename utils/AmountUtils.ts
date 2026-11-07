@@ -1,0 +1,519 @@
+import BigNumber from 'bignumber.js';
+
+import { settingsStore, fiatStore, unitsStore } from '../stores/Stores';
+import {
+    numberWithCommas,
+    numberWithDecimals,
+    SATS_PER_BTC
+} from './UnitsUtils';
+import type { Units } from './UnitsUtils';
+import FeeUtils from './FeeUtils';
+import { localeString } from './LocaleUtils';
+
+export interface AmountDisplayResult {
+    displayAmount: string;
+    shouldShowRounding: boolean;
+}
+
+export interface ValueDisplayProps {
+    amount: string;
+    unit: Units;
+    symbol?: string;
+    negative?: boolean;
+    plural?: boolean;
+    rtl?: boolean;
+    space?: boolean;
+    error?: string;
+    separatorSwap?: boolean;
+}
+
+/**
+ * Processes satoshi amounts for display, respecting the hideMsats setting
+ * and optional rounding behavior.
+ *
+ * @param amount - The amount to process (as string or number)
+ * @param roundAmount - Whether to apply rounding logic (default: false)
+ * @param forceMsats - Force showing millisatoshi decimals regardless of setting (e.g. for fees)
+ * @returns Object containing the display amount and whether to show rounding indicator
+ */
+export function processSatsAmount(
+    amount: string | number,
+    roundAmount: boolean = false,
+    forceMsats: boolean = false
+): AmountDisplayResult {
+    const amountStr = amount.toString();
+    const hideMsats = forceMsats ? false : shouldHideMillisatoshiAmounts();
+
+    // Remove commas from the amount string for processing
+    const cleanAmountStr = amountStr.replace(/,/g, '');
+
+    // Always check for decimals when hideMsats is enabled
+    const [, decimalPart] = cleanAmountStr.split('.');
+    const hasDecimals = decimalPart && Number(decimalPart) > 0;
+
+    // Determine if we should round based on hideMsats setting or explicit roundAmount
+    // When hideMsats is false (showMillisatoshiAmounts is true), never round (respect the setting)
+    // When hideMsats is true (showMillisatoshiAmounts is false), always round decimals
+    // Only apply explicit roundAmount when hideMsats is true
+    const shouldRound =
+        hasDecimals && (hideMsats || (roundAmount && hideMsats));
+
+    let displayAmount: string;
+
+    if (shouldRound) {
+        // Round the number and format with commas
+        const roundedNumber = Math.round(Number(cleanAmountStr));
+        displayAmount = numberWithCommas(roundedNumber);
+    } else {
+        // Format the original amount with commas
+        displayAmount = numberWithCommas(cleanAmountStr);
+    }
+
+    // Only show rounding indicator when explicitly requested via roundAmount prop
+    const shouldShowRounding = Boolean(shouldRound && roundAmount);
+
+    return {
+        displayAmount,
+        shouldShowRounding
+    };
+}
+
+/**
+ * Checks if the hideMsats setting is enabled
+ * @returns true if millisatoshi amounts should be hidden
+ */
+export function shouldHideMillisatoshiAmounts(): boolean {
+    return !settingsStore?.settings?.display?.showMillisatoshiAmounts;
+}
+
+/**
+ * Gets the fiat entry from fiatStore for a given currency code
+ * @param currencyCode - The currency code to look up (e.g., 'USD', 'EUR')
+ * @returns The fiat entry object or undefined if not found
+ */
+function getFiatEntry(currencyCode: string): any | undefined {
+    if (!fiatStore.fiatRates || !currencyCode) {
+        return undefined;
+    }
+    return fiatStore.fiatRates.find(
+        (entry: any) => entry.code === currencyCode
+    );
+}
+
+/**
+ * Converts satoshi amounts to unformatted display values based on the current unit setting
+ * @param sats - The amount in satoshis (string or number)
+ * @param fixedUnits - Optional unit override ('sats', 'BTC', or 'fiat')
+ * @returns Object containing the amount string, unit, and display properties
+ */
+export function getUnformattedAmount({
+    sats = 0,
+    fixedUnits
+}: {
+    sats?: string | number;
+    fixedUnits?: string;
+}): ValueDisplayProps {
+    const { settings } = settingsStore;
+    const { fiat, display } = settings;
+    const showAllDecimalPlaces: boolean =
+        (display && display.showAllDecimalPlaces) || false;
+    const effectiveUnits = fixedUnits || unitsStore.units;
+
+    const satsNumber = Number(sats);
+    const negative = satsNumber < 0;
+    const absValueSats = Math.abs(satsNumber);
+
+    if (effectiveUnits === 'BTC') {
+        return {
+            amount: FeeUtils.toFixed(
+                absValueSats / SATS_PER_BTC,
+                showAllDecimalPlaces
+            ),
+            unit: 'BTC',
+            negative,
+            space: false
+        };
+    } else if (effectiveUnits === 'sats') {
+        return {
+            amount: absValueSats.toString(),
+            unit: 'sats',
+            negative,
+            plural: !(satsNumber === 1 || satsNumber === -1)
+        };
+    } else {
+        const currency = fiat;
+
+        // TODO: is this the right place to catch this?
+        if (!currency) {
+            return {
+                amount: localeString('general.disabled'),
+                unit: 'fiat',
+                symbol: '$',
+                error: localeString('general.fiatRateNotAvailable')
+            };
+        }
+
+        if (fiatStore.fiatRates) {
+            const fiatEntry = getFiatEntry(fiat);
+
+            if (!fiatEntry?.rate) {
+                return {
+                    amount: localeString('general.disabled'),
+                    unit: 'fiat',
+                    error: localeString('general.fiatRateNotAvailable')
+                };
+            }
+
+            const rate = (fiatEntry && fiatEntry.rate) || 0;
+            const { symbol, space, rtl, decimalPlaces, separatorSwap } =
+                fiatStore.getSymbol();
+
+            const decimals = decimalPlaces !== undefined ? decimalPlaces : 2;
+
+            const amount = (
+                FeeUtils.toFixed(absValueSats / SATS_PER_BTC) * rate
+            ).toFixed(decimals);
+
+            return {
+                amount,
+                unit: 'fiat',
+                symbol,
+                negative,
+                plural: false,
+                rtl,
+                space,
+                separatorSwap
+            };
+        } else {
+            return {
+                amount: localeString('general.disabled'),
+                unit: 'fiat',
+                error: localeString('general.errorFetchingFiatRates')
+            };
+        }
+    }
+}
+
+export interface RawAmount {
+    amount: string;
+    // Set when the unit is fiat but there is no rate to convert with. The
+    // amount is then in sats, and the input has to be pinned to sats, or
+    // getSatAmount would read it back as fiat.
+    forceUnit?: 'sats';
+    // Why the fiat conversion failed, to show next to the input.
+    error?: string;
+}
+
+/**
+ * Converts satoshis to the raw, unformatted amount in the active unit, fit
+ * for editable inputs like AmountInput's `amount` prop. That prop is parsed
+ * back into satoshis with getSatAmount, so it must never receive a
+ * display-formatted string from getAmountFromSats (e.g. '12,618 sats'), nor
+ * the 'Disabled' placeholder getUnformattedAmount returns when a fiat
+ * conversion fails. In that case the amount is returned in sats instead,
+ * with `forceUnit: 'sats'` and the reason in `error`.
+ * @param sats - The amount in satoshis (string or number)
+ * @param fixedUnits - Optional unit override ('sats', 'BTC', or 'fiat')
+ * @returns Raw amount like "0.00012618", "12618", or "6.31"
+ */
+export function getRawAmountFromSats(
+    sats: string | number,
+    fixedUnits?: string
+): RawAmount {
+    const { amount, error } = getUnformattedAmount({ sats, fixedUnits });
+    if (error) {
+        return {
+            amount: getUnformattedAmount({ sats, fixedUnits: 'sats' }).amount,
+            forceUnit: 'sats',
+            error
+        };
+    }
+    return { amount };
+}
+
+/**
+ * Converts satoshi amounts to formatted display strings
+ * @param value - The amount in satoshis (string or number)
+ * @param fixedUnits - Optional unit override ('sats', 'BTC', or 'fiat')
+ * @returns Formatted string like "₿0.5", "1,000 sats", or "$50.00"
+ */
+export function getAmountFromSats(
+    value: string | number = 0,
+    fixedUnits?: string
+): string | undefined {
+    const { settings } = settingsStore;
+    const { fiat } = settings;
+    const units = fixedUnits || unitsStore.units;
+
+    const [wholeSats] = value.toString().split('.');
+    if (units === 'BTC') {
+        // handle negative values
+        const valueToProcess = (wholeSats && wholeSats.toString()) || '0';
+        if (valueToProcess.includes('-')) {
+            const processedValue = valueToProcess.split('-')[1];
+            return `-₿${FeeUtils.toFixed(
+                Number(processedValue) / SATS_PER_BTC
+            )}`;
+        }
+
+        return `₿${FeeUtils.toFixed(Number(wholeSats || 0) / SATS_PER_BTC)}`;
+    } else if (units === 'sats') {
+        const sats = `${numberWithCommas(wholeSats || value) || 0} ${
+            Number(value) === 1 || Number(value) === -1 ? 'sat' : 'sats'
+        }`;
+        return sats;
+    } else if (units === 'fiat' && fiat) {
+        if (fiatStore.fiatRates) {
+            const fiatEntry = getFiatEntry(fiat);
+            if (!fiatEntry) {
+                return localeString('general.notAvailable');
+            }
+            const { code } = fiatEntry;
+            const rate = (fiatEntry && fiatEntry.rate) || 0;
+            const { symbol, space, rtl, separatorSwap } =
+                fiatStore.symbolLookup(code);
+
+            const amount = (
+                FeeUtils.toFixed(Number(wholeSats || 0) / SATS_PER_BTC) * rate
+            ).toFixed(2);
+
+            const formattedAmount = separatorSwap
+                ? numberWithDecimals(amount)
+                : numberWithCommas(amount);
+
+            if (rtl) {
+                return `${formattedAmount}${space ? ' ' : ''}${symbol}`;
+            } else {
+                return `${symbol}${space ? ' ' : ''}${formattedAmount}`;
+            }
+        } else {
+            return localeString('general.notAvailable');
+        }
+    }
+}
+
+/**
+ * Formats amounts for display (expects BTC value directly for BTC unit, not sats)
+ * @param value - The amount (string or number). For BTC unit, this should be in BTC, not sats.
+ * @param fixedUnits - Optional unit override ('sats', 'BTC', or 'fiat')
+ * @returns Formatted string like "₿0.5", "1,000 sats", or "$50.00"
+ */
+export function getFormattedAmount(
+    value: string | number = 0,
+    fixedUnits?: string
+): string | undefined {
+    const { settings } = settingsStore;
+    const { fiat } = settings;
+    const units = fixedUnits || unitsStore.units;
+
+    if (units === 'BTC') {
+        // handle negative values
+        const valueToProcess = value.toString() || '0';
+        if (valueToProcess.includes('-')) {
+            const processedValue = valueToProcess.split('-')[1];
+            return `-₿${FeeUtils.toFixed(Number(processedValue))}`;
+        }
+
+        return `₿${FeeUtils.toFixed(Number(value || 0))}`;
+    } else if (units === 'sats') {
+        const [wholeSats] = value.toString().split('.');
+        const sats = `${numberWithCommas(wholeSats || value) || 0} ${
+            Number(value) === 1 || Number(value) === -1 ? 'sat' : 'sats'
+        }`;
+        return sats;
+    } else if (units === 'fiat' && fiat) {
+        if (fiatStore.fiatRates) {
+            const fiatEntry = getFiatEntry(fiat);
+            if (!fiatEntry) {
+                return localeString('general.notAvailable');
+            }
+            const { code } = fiatEntry;
+            const { symbol, space, rtl, separatorSwap } =
+                fiatStore.symbolLookup(code);
+
+            // handle amounts passed in with commas
+            const amount = Number(value.toString().replace(/,/g, '.')).toFixed(
+                2
+            );
+
+            const formattedAmount = separatorSwap
+                ? numberWithDecimals(amount)
+                : numberWithCommas(amount);
+
+            if (rtl) {
+                return `${formattedAmount}${space ? ' ' : ''}${symbol}`;
+            } else {
+                return `${symbol}${space ? ' ' : ''}${formattedAmount}`;
+            }
+        } else {
+            return localeString('general.notAvailable');
+        }
+    }
+}
+
+/**
+ * Calculates the fee as a percentage of the payment amount.
+ * Returns a string like "1.5%" or empty string if not applicable.
+ *
+ * @param fee - The fee amount (string or number)
+ * @param amount - The payment amount (string or number)
+ * @returns Formatted percentage string (e.g., "1.5%") or empty string
+ */
+export function getFeePercentage(
+    fee: string | number | undefined,
+    amount: string | number | undefined
+): string {
+    if (!fee || !amount || fee == '0' || amount == '0') return '';
+
+    return (
+        Number(new BigNumber(fee).div(amount).times(100).toFixed(3))
+            .toString()
+            .replace(/-/g, '') + '%'
+    );
+}
+
+/**
+ * Converts satoshis to millisatoshis
+ * @param sats - Amount in satoshis
+ * @returns Amount in millisatoshis
+ */
+export function satsToMillisats(sats: number): number {
+    return Math.floor(sats * 1000);
+}
+
+/**
+ * Converts millisatoshis to satoshis
+ * @param millisats - Amount in millisatoshis
+ * @returns Amount in satoshis
+ */
+export function millisatsToSats(millisats: number): number {
+    return Math.floor(millisats / 1000);
+}
+
+/**
+ * Whether an amount is a whole number of satoshis. On-chain outputs cannot
+ * carry millisatoshis, but the sats keypad allows 3 decimals.
+ * @param sats - Amount in satoshis (string or number)
+ * @returns true for whole numbers, false for fractions and non-numbers
+ */
+export function isWholeSatAmount(sats: string | number): boolean {
+    return Number.isInteger(Number(sats));
+}
+
+/**
+ * Converts a routing fee limit in satoshis into the `maxTotalRoutingFeeMsat`
+ * value ldk-node expects.
+ *
+ * Returns undefined when no limit was supplied or the value is unusable, so
+ * the caller can apply a default rather than send a nonsense cap.
+ * A limit of 0, as '0' or as the number 0, is a real cap of zero, not
+ * "no limit".
+ *
+ * @param feeLimitSat - Fee limit in satoshis, as collected by FeeLimit
+ * @returns Fee limit in millisatoshis, or undefined if none applies
+ */
+export function feeLimitSatsToMaxRoutingFeeMsat(
+    feeLimitSat?: string | number | null
+): number | undefined {
+    if (feeLimitSat == null || feeLimitSat === '') return undefined;
+    const msats = satsToMillisats(Number(feeLimitSat));
+    return Number.isFinite(msats) && msats >= 0 ? msats : undefined;
+}
+
+/**
+ * Converts a percent routing fee limit into whole satoshis for an amount.
+ *
+ * Rounds up so that a nonzero percent of a nonzero amount never becomes a
+ * fee limit of 0 sats, which backends treat as a hard cap of zero.
+ *
+ * @param maxFeePercent - Fee limit as a percent of the amount; commas are
+ * accepted as the decimal separator
+ * @param satAmount - Payment amount in satoshis
+ * @returns Fee limit in whole satoshis, or '' when the amount is missing or
+ * not above 0, or the percent is missing, not a number or negative
+ */
+export function getFeeLimitSatsFromPercent(
+    maxFeePercent: string,
+    satAmount?: string | number
+): string {
+    const percent = new BigNumber(maxFeePercent.replace(/,/g, '.'));
+    const amount = new BigNumber(satAmount ?? NaN);
+    if (!percent.isFinite() || percent.lt(0)) return '';
+    if (!amount.isFinite() || !amount.gt(0)) return '';
+    return percent
+        .div(100)
+        .times(amount)
+        .integerValue(BigNumber.ROUND_CEIL)
+        .toFixed();
+}
+
+/**
+ * LDK's default routing fee cap for a payment: 1% of the amount plus 50 sats.
+ *
+ * ldk-node applies this itself when a BOLT 11 or BOLT 12 payment is sent
+ * without `maxTotalRoutingFeeMsat`, but routes a keysend sent without one
+ * with no fee cap, so keysends pass it explicitly.
+ *
+ * @param amountMsat - Payment amount in millisatoshis
+ * @returns Fee cap in millisatoshis
+ */
+export function defaultMaxRoutingFeeMsat(amountMsat: number): number {
+    return Math.floor(amountMsat / 100) + 50_000;
+}
+
+/**
+ * Converts an amount in the current display unit (sats, BTC, or fiat) to satoshis
+ * @param amount - The amount to convert (as string or number)
+ * @param forceUnit - Optional unit override ('sats', 'BTC', or 'fiat')
+ * @returns The amount in satoshis
+ */
+export function getSatAmount(
+    amount: string | number,
+    forceUnit?: string
+): number {
+    const { fiatRates } = fiatStore;
+    const { settings } = settingsStore;
+    const { fiat } = settings;
+    const { units } = unitsStore;
+    const effectiveUnits = forceUnit || units;
+
+    const value = amount ? amount.toString().replace(/,/g, '.') : 0;
+
+    const fiatEntry =
+        fiat && fiatRates
+            ? fiatRates.find((entry: any) => entry.code === fiat)
+            : null;
+
+    const rate = fiat && fiatRates && fiatEntry ? fiatEntry.rate : 0;
+
+    let satAmount: number = 0;
+    switch (effectiveUnits) {
+        case 'sats':
+            satAmount = Number(value);
+            break;
+        case 'BTC':
+            satAmount = new BigNumber(value || 0)
+                .multipliedBy(SATS_PER_BTC)
+                .toNumber();
+            break;
+        case 'fiat':
+            satAmount =
+                rate && value
+                    ? Number(
+                          new BigNumber(value)
+                              .dividedBy(rate)
+                              .multipliedBy(SATS_PER_BTC)
+                              .toNumber()
+                              .toFixed(0)
+                      )
+                    : 0;
+            break;
+        default:
+            satAmount = 0;
+            break;
+    }
+
+    // never hand back NaN - it is falsy in some checks and truthy once
+    // stringified, which lets unparseable input slip past amount guards
+    return isNaN(satAmount) ? 0 : satAmount;
+}

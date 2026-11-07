@@ -1,0 +1,219 @@
+import * as React from 'react';
+import { TouchableOpacity, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Button from '../../../components/Button';
+import Header from '../../../components/Header';
+import LayerBalances from '../../../components/LayerBalances';
+import LoadingIndicator from '../../../components/LoadingIndicator';
+import Screen from '../../../components/Screen';
+import { Row } from '../../../components/layout/Row';
+
+import BalanceStore from '../../../stores/BalanceStore';
+import UnitsStore from '../../../stores/UnitsStore';
+import UTXOsStore from '../../../stores/UTXOsStore';
+
+import BackendUtils from '../../../utils/BackendUtils';
+import { localeString } from '../../../utils/LocaleUtils';
+import { themeColor } from '../../../utils/ThemeUtils';
+
+import Add from '../../../assets/images/SVG/Add.svg';
+import Filter from '../../../assets/images/SVG/Filter On.svg';
+
+interface AccountsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    BalanceStore: BalanceStore;
+    UTXOsStore: UTXOsStore;
+    UnitsStore: UnitsStore;
+    route: Route<
+        'Accounts',
+        {
+            value: string;
+            satAmount: string;
+            lightning: string;
+            offer: string;
+            locked: boolean;
+        }
+    >;
+}
+
+interface AccountsState {
+    value: string;
+    satAmount: string;
+    lightning: string;
+    offer: string;
+    locked: boolean;
+    editMode: boolean;
+    refreshing: boolean;
+}
+
+@inject('BalanceStore', 'UTXOsStore', 'UnitsStore')
+@observer
+export default class Accounts extends React.Component<
+    AccountsProps,
+    AccountsState
+> {
+    state = {
+        value: '',
+        satAmount: '',
+        lightning: '',
+        offer: '',
+        locked: false,
+        editMode: false,
+        refreshing: false
+    };
+
+    componentDidMount() {
+        const { UTXOsStore } = this.props;
+        if (BackendUtils.supportsAccounts()) UTXOsStore.listAccounts();
+
+        const { route } = this.props;
+        const { value, satAmount, lightning, offer, locked } =
+            route.params ?? {};
+
+        if (value) {
+            this.setState({ value });
+        }
+
+        if (satAmount) {
+            this.setState({ satAmount });
+        }
+
+        if (lightning) {
+            this.setState({ lightning });
+        }
+
+        if (offer) {
+            this.setState({ offer });
+        }
+
+        if (locked) {
+            this.setState({ locked });
+        }
+    }
+
+    handleRefresh = async () => {
+        const { BalanceStore, UTXOsStore } = this.props;
+        this.setState({ refreshing: true });
+        try {
+            await Promise.all(
+                BackendUtils.supportsAccounts()
+                    ? [
+                          BalanceStore.getBlockchainBalance(true, false),
+                          BalanceStore.getLightningBalance(true),
+                          UTXOsStore.listAccounts()
+                      ]
+                    : [
+                          BalanceStore.getBlockchainBalance(true, false),
+                          BalanceStore.getLightningBalance(true)
+                      ]
+            );
+        } finally {
+            this.setState({ refreshing: false });
+        }
+    };
+
+    render() {
+        const { BalanceStore, UnitsStore, UTXOsStore, navigation } = this.props;
+        const {
+            value,
+            satAmount,
+            lightning,
+            offer,
+            locked,
+            editMode,
+            refreshing
+        } = this.state;
+        const { loadingAccounts, accounts } = UTXOsStore;
+
+        const FilterButton = () => (
+            <TouchableOpacity
+                onPress={() => {
+                    this.setState({
+                        editMode: !editMode
+                    });
+                }}
+            >
+                <Filter
+                    style={{ alignSelf: 'center', marginRight: 15 }}
+                    fill={themeColor('text')}
+                />
+            </TouchableOpacity>
+        );
+
+        const AddButton = () => (
+            <TouchableOpacity
+                onPress={() => navigation.navigate('ImportAccount')}
+                accessibilityLabel={localeString('general.add')}
+            >
+                <Add
+                    fill={themeColor('text')}
+                    width="30"
+                    height="30"
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: satAmount
+                            ? localeString('views.Accounts.select')
+                            : localeString('views.Accounts.title'),
+                        style: { color: themeColor('text') }
+                    }}
+                    rightComponent={
+                        <Row>
+                            {refreshing && (
+                                <View style={{ marginRight: 10 }}>
+                                    <LoadingIndicator size={30} />
+                                </View>
+                            )}
+                            {!value && (
+                                <>
+                                    {accounts.length > 0 && <FilterButton />}
+                                    <AddButton />
+                                </>
+                            )}
+                        </Row>
+                    }
+                    navigation={navigation}
+                />
+                {loadingAccounts && !refreshing && <LoadingIndicator />}
+                {(!loadingAccounts || refreshing) && (
+                    <LayerBalances
+                        navigation={navigation}
+                        BalanceStore={BalanceStore}
+                        UnitsStore={UnitsStore}
+                        onRefresh={this.handleRefresh}
+                        // for payment method selection
+                        value={value}
+                        satAmount={satAmount}
+                        lightning={lightning}
+                        offer={offer}
+                        locked={locked}
+                        editMode={editMode}
+                    />
+                )}
+                {(!loadingAccounts || refreshing) && !!value && !!lightning && (
+                    <Button
+                        title={localeString('views.Accounts.fetchTxFees')}
+                        containerStyle={{
+                            margin: 20
+                        }}
+                        onPress={() =>
+                            navigation.navigate('EditFee', {
+                                displayOnly: true
+                            })
+                        }
+                    />
+                )}
+            </Screen>
+        );
+    }
+}

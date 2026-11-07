@@ -1,0 +1,1180 @@
+import ReactNativeBlobUtil from 'react-native-blob-util';
+import { settingsStore, nodeInfoStore } from '../stores/Stores';
+import {
+    doTorRequest,
+    isOnionHttpsUrl,
+    RequestMethod
+} from '../utils/TorUtils';
+import Invoice from './../models/Invoice';
+import OpenChannelRequest from './../models/OpenChannelRequest';
+import Base64Utils from './../utils/Base64Utils';
+import VersionUtils from './../utils/VersionUtils';
+import { localeString } from './../utils/LocaleUtils';
+import { toLnrpcAddressType } from './../utils/LndUtils';
+import {
+    findPaymentByHash,
+    grpcErrorCode,
+    markRestErrorResponse
+} from './../utils/PaymentLookupUtils';
+import {
+    DEFAULT_MAX_TRANSACTIONS,
+    getNewestTransactions,
+    TransactionPageRequest
+} from './../utils/OnchainTransactionUtils';
+import { sha256Bytes } from './../utils/HashingUtils';
+import { inFlightRequestKey } from './../utils/InFlightRequestUtils';
+import BigNumber from 'bignumber.js';
+
+interface Headers {
+    macaroon?: string;
+    encodingtype?: string;
+    'Grpc-Metadata-Macaroon'?: string;
+    'Grpc-Metadata-macaroon'?: string;
+}
+
+// keep track of all active calls so we can cancel when appropriate
+const calls = new Map<string, Promise<any>>();
+
+export default class LND {
+    torSocksPort?: number = undefined;
+    private defaultTimeout: number = 30000;
+    clearCachedCalls = () => calls.clear();
+
+    restReq = async (
+        headers: Headers | any,
+        url: string,
+        method: any,
+        data?: any,
+        certVerification: boolean = false,
+        useTor?: boolean,
+        timeout?: number
+    ) => {
+        const id = inFlightRequestKey(headers, url, data);
+        if (calls.has(id)) {
+            return calls.get(id);
+        }
+        // API is a bit of a mess but
+        // If tor enabled in setting, start up the daemon here
+        if (useTor === true) {
+            calls.set(
+                id,
+                doTorRequest(
+                    url,
+                    method as RequestMethod,
+                    JSON.stringify(data),
+                    headers,
+                    // .onion-over-Tor: bypass TLS validation (the .onion
+                    // address authenticates at the Tor layer, upstream
+                    // self-signed certs can't match anyway).
+                    // Clearnet-over-Tor: keep strict TLS because exit
+                    // nodes can MITM.
+                    isOnionHttpsUrl(url),
+                    // undefined keeps doTorRequest's own default; only
+                    // request-scoped deadlines (payments) override it
+                    timeout
+                )
+                    .then((response: any) => {
+                        calls.delete(id);
+                        return response;
+                    })
+                    .catch((error: any) => {
+                        // evict rejected requests too, otherwise every
+                        // subsequent identical call gets the same cached
+                        // rejection until the next reconnect clears the map
+                        calls.delete(id);
+                        throw error;
+                    })
+            );
+        } else {
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(
+                    () => reject(new Error('Request timeout')),
+                    timeout || this.defaultTimeout
+                );
+            });
+
+            const fetchPromise = ReactNativeBlobUtil.config({
+                trusty: !certVerification,
+                // never replay the macaroon / rune headers to a redirect target
+                followRedirect: false,
+                // RNBlobUtil's native default is 60s; without this a
+                // payment request holding the connection open longer than
+                // that dies natively no matter what the race below allows
+                timeout: timeout || this.defaultTimeout
+            })
+                .fetch(method, url, headers, data ? JSON.stringify(data) : data)
+                .then((response: any) => {
+                    calls.delete(id);
+                    if (response.info().status < 300) {
+                        // handle ws responses
+                        if (response.data.includes('\n')) {
+                            const split = response.data.split('\n');
+                            const length = split.length;
+                            // last instance is empty
+                            return JSON.parse(split[length - 2]);
+                        }
+                        return response.json();
+                    } else {
+                        let grpcCode: unknown;
+                        try {
+                            const errorInfo = response.json();
+                            grpcCode = grpcErrorCode(errorInfo);
+                            throw markRestErrorResponse(
+                                new Error(
+                                    (errorInfo.error &&
+                                        errorInfo.error.message) ||
+                                        errorInfo.message ||
+                                        errorInfo.error
+                                ),
+                                grpcCode
+                            );
+                        } catch (e) {
+                            if (
+                                response.data &&
+                                typeof response.data === 'string'
+                            ) {
+                                throw markRestErrorResponse(
+                                    new Error(response.data),
+                                    grpcCode
+                                );
+                            } else {
+                                throw markRestErrorResponse(
+                                    new Error(
+                                        localeString(
+                                            'backends.LND.restReq.connectionError'
+                                        )
+                                    ),
+                                    grpcCode
+                                );
+                            }
+                        }
+                    }
+                });
+
+            const racePromise = Promise.race([
+                fetchPromise,
+                timeoutPromise
+            ]).catch((error) => {
+                calls.delete(id);
+                console.log('Request timed out for:', url);
+                throw error;
+            });
+
+            calls.set(id, racePromise);
+        }
+
+        return await calls.get(id);
+    };
+
+    supports = (minVersion: string, eosVersion?: string) => {
+        const { nodeInfo } = nodeInfoStore;
+        const { version } = nodeInfo;
+        const { isSupportedVersion } = VersionUtils;
+        return isSupportedVersion(version, minVersion, eosVersion);
+    };
+
+    wsReq = (route: string, method: string, data?: any) => {
+        const { host, lndhubUrl, port, macaroonHex, accessToken } =
+            settingsStore;
+
+        const auth = macaroonHex || accessToken;
+        const headers: any = this.getHeaders(auth, true);
+        const methodRoute = `${route}?method=${method}`;
+        const url = this.getURL(host || lndhubUrl, port, methodRoute, true);
+
+        return new Promise(function (resolve, reject) {
+            const ws: any = new WebSocket(url, null, {
+                headers
+            });
+
+            // keep pulling in responses until the socket closes
+            let resp: any;
+
+            ws.addEventListener('open', () => {
+                // connection opened
+                ws.send(JSON.stringify(data)); // send a message
+            });
+
+            ws.addEventListener('message', (e: any) => {
+                // a message was received
+                const data = JSON.parse(e.data);
+                if (data.error) {
+                    reject(data.error);
+                } else {
+                    resp = e.data;
+                }
+            });
+
+            ws.addEventListener('error', (e: any) => {
+                const certWarning = localeString('backends.LND.wsReq.warning');
+                // an error occurred
+                reject(
+                    e.message ? `${certWarning} (${e.message})` : certWarning
+                );
+            });
+
+            ws.addEventListener('close', () => {
+                // connection closed; nothing catches what a listener throws,
+                // so don't parse a response that never came
+                if (resp === undefined) {
+                    reject(
+                        localeString('backends.LND.restReq.connectionError')
+                    );
+                    return;
+                }
+                resolve(JSON.parse(resp));
+            });
+        });
+    };
+
+    getHeaders = (macaroonHex: string, ws?: boolean): any => {
+        if (ws) {
+            return {
+                'Grpc-Metadata-Macaroon': macaroonHex
+            };
+        }
+        return {
+            'Grpc-Metadata-macaroon': macaroonHex
+        };
+    };
+
+    getURL = (
+        host: string,
+        port: string | number,
+        route: string,
+        ws?: boolean
+    ) => {
+        const hostPath = host.includes('://') ? host : `https://${host}`;
+        let baseUrl = `${hostPath}${port ? ':' + port : ''}`;
+
+        if (ws) {
+            // anchor to the scheme: a bare string replace rewrites the
+            // first match anywhere, so a host containing "http" had its
+            // own name mangled (https://httpbin.org -> wss://wsbin.org)
+            baseUrl = baseUrl.replace(/^https/, 'wss').replace(/^http/, 'ws');
+        }
+
+        if (baseUrl[baseUrl.length - 1] === '/') {
+            baseUrl = baseUrl.slice(0, -1);
+        }
+
+        return `${baseUrl}${route}`;
+    };
+
+    request = (
+        route: string,
+        method: string,
+        data?: any,
+        params?: any,
+        timeout?: number
+    ) => {
+        const {
+            host,
+            lndhubUrl,
+            port,
+            macaroonHex,
+            accessToken,
+            certVerification,
+            enableTor
+        } = settingsStore;
+
+        if (params) {
+            route = `${route}?${Object.keys(params)
+                .map((key: string) => key + '=' + params[key])
+                .join('&')}`;
+        }
+
+        const auth = macaroonHex || accessToken;
+        const headers: any = this.getHeaders(auth);
+        headers['Content-Type'] = 'application/json';
+        const url = this.getURL(host || lndhubUrl, port, route);
+        return this.restReq(
+            headers,
+            url,
+            method,
+            data,
+            certVerification,
+            enableTor,
+            timeout
+        );
+    };
+
+    getRequest = (route: string, data?: any) =>
+        this.request(route, 'get', null, data);
+    postRequest = (route: string, data?: any, timeout?: number) =>
+        this.request(route, 'post', data, null, timeout);
+    deleteRequest = (route: string) => this.request(route, 'delete', null);
+
+    getTransactionsPage = (data?: TransactionPageRequest | null) =>
+        this.getRequest(
+            `/v1/transactions?end_height=${data?.end_height ?? -1}${
+                data?.start_height ? `&start_height=${data.start_height}` : ''
+            }&max_transactions=${
+                data?.max_transactions ?? DEFAULT_MAX_TRANSACTIONS
+            }`
+        ).then((data: any) => ({
+            transactions: data.transactions || []
+        }));
+    getTransactions = async (data?: Partial<TransactionPageRequest> | null) => {
+        // callers that pick their own range get exactly that range
+        if (
+            data?.start_height !== undefined ||
+            data?.end_height !== undefined
+        ) {
+            return await this.getTransactionsPage({
+                start_height: data.start_height,
+                end_height: data.end_height,
+                max_transactions:
+                    data.max_transactions ?? DEFAULT_MAX_TRANSACTIONS
+            });
+        }
+        const transactions = await getNewestTransactions({
+            fetchPage: (request) =>
+                this.getTransactionsPage(request).then(
+                    (page: any) => page.transactions
+                ),
+            limit: data?.max_transactions ?? DEFAULT_MAX_TRANSACTIONS
+        });
+        return { transactions };
+    };
+    getChannels = () => this.getRequest('/v1/channels');
+    getPendingChannels = () => this.getRequest('/v1/channels/pending');
+    getClosedChannels = () => this.getRequest('/v1/channels/closed');
+    getChannelInfo = (chanId: string) =>
+        this.getRequest(`/v1/graph/edge/${chanId}`);
+    getBlockchainBalance = (data: any) =>
+        this.getRequest('/v1/balance/blockchain', data);
+    getLightningBalance = () => this.getRequest('/v1/balance/channels');
+    sendCoins = (data: any) =>
+        this.postRequest('/v1/transactions', {
+            addr: data.addr,
+            sat_per_vbyte: data.sat_per_vbyte,
+            amount: data.amount,
+            spend_unconfirmed: data.spend_unconfirmed,
+            send_all: data.send_all,
+            outpoints: data.outpoints,
+            label: data.label
+        });
+    sendCustomMessage = (data: any) =>
+        this.postRequest('/v1/custommessage', {
+            peer: Base64Utils.hexToBase64(data.peer),
+            type: data.type,
+            data: Base64Utils.hexToBase64(data.data)
+        });
+    subscribeCustomMessages = (onResponse: any, onError: any) => {
+        const route = '/v1/custommessage/subscribe';
+        const method = 'GET';
+
+        const { host, lndhubUrl, port, macaroonHex, accessToken } =
+            settingsStore;
+
+        const auth = macaroonHex || accessToken;
+        const headers: any = this.getHeaders(auth, true);
+        const methodRoute = `${route}?method=${method}`;
+        const url = this.getURL(host || lndhubUrl, port, methodRoute, true);
+
+        const ws: any = new WebSocket(url, null, {
+            headers
+        });
+
+        ws.addEventListener('open', () => {
+            // connection opened
+            console.log('subscribeCustomMessages ws open');
+            ws.send(JSON.stringify({}));
+        });
+
+        ws.addEventListener('message', (e: any) => {
+            // a message was received
+            const data = JSON.parse(e.data);
+            console.log('subscribeCustomMessagews message', data);
+            if (data.error) {
+                onError(data.error);
+            } else {
+                onResponse(data);
+            }
+        });
+
+        ws.addEventListener('error', (e: any) => {
+            // an error occurred
+            console.log('subscribeCustomMessages ws err', e);
+            const certWarning = localeString('backends.LND.wsReq.warning');
+            onError(e.message ? `${certWarning} (${e.message})` : certWarning);
+        });
+
+        ws.addEventListener('close', () => {
+            // ws closed
+            console.log('subscribeCustomMessages ws close');
+        });
+
+        return ws;
+    };
+    getNetworkInfo = () => this.getRequest('/v1/graph/info');
+    getMyNodeInfo = () => this.getRequest('/v1/getinfo');
+    getInvoices = (
+        params: { limit?: number; reversed?: boolean } = {
+            limit: 500,
+            reversed: true
+        }
+    ) =>
+        this.getRequest(
+            `/v1/invoices?reversed=${
+                params?.reversed !== undefined ? params.reversed : true
+            }${params?.limit ? `&num_max_invoices=${params.limit}` : ''}`
+        );
+    createInvoice = (data: any) =>
+        this.postRequest('/v1/invoices', {
+            memo: data.memo,
+            value_msat: data.value_msat || Number(data.value) * 1000,
+            expiry: data.expiry_seconds,
+            is_amp: data.is_amp,
+            is_blinded: data.is_blinded,
+            private: data.private,
+            r_preimage: data.preimage
+                ? Base64Utils.hexToBase64(data.preimage)
+                : undefined,
+            route_hints: data.route_hints
+        });
+    getPayments = (
+        params: {
+            maxPayments?: number;
+            reversed?: boolean;
+            creationDateStart?: number;
+        } = {
+            maxPayments: 500,
+            reversed: true
+        }
+    ) =>
+        this.getRequest(
+            `/v1/payments?include_incomplete=true${
+                params?.maxPayments ? `&max_payments=${params.maxPayments}` : ''
+            }&reversed=${
+                params?.reversed !== undefined ? params.reversed : true
+            }${
+                params?.creationDateStart
+                    ? `&creation_date_start=${params.creationDateStart}`
+                    : ''
+            }`
+        );
+
+    getNewAddress = (data: any) => {
+        const { type, ...rest } = data;
+        const lnrpcType = toLnrpcAddressType(type);
+        return this.getRequest(
+            '/v1/newaddress',
+            lnrpcType === undefined ? rest : { ...rest, type: lnrpcType }
+        );
+    };
+    getNewChangeAddress = (data: any) =>
+        this.postRequest('/v2/wallet/address/next', data);
+    openChannelSync = (data: OpenChannelRequest) => {
+        let request: any = {
+            private: data.privateChannel,
+            scid_alias: data.scidAlias,
+            local_funding_amount: data.local_funding_amount || 0,
+            min_confs: data.min_confs,
+            node_pubkey_string: data.node_pubkey_string,
+            sat_per_vbyte: data.sat_per_vbyte,
+            spend_unconfirmed: data.spend_unconfirmed,
+            close_address: data.close_address,
+            memo: data.memo
+        };
+
+        if (data.fundMax) {
+            request.fund_max = true;
+            delete request.local_funding_amount;
+        }
+
+        if (data.simpleTaprootChannel) {
+            request.commitment_type = 'SIMPLE_TAPROOT';
+        }
+
+        if (data.utxos && data.utxos.length > 0) {
+            request.outpoints = data.utxos.map((utxo: string) => {
+                const [txid_str, output_index] = utxo.split(':');
+                return {
+                    txid_str,
+                    output_index: Number(output_index)
+                };
+            });
+        }
+
+        return this.postRequest('/v1/channels', request);
+    };
+    openChannelStream = (data: OpenChannelRequest) => {
+        // prepare request
+        let request: any = {
+            private: data.privateChannel,
+            scid_alias: data.scidAlias,
+            local_funding_amount: data.local_funding_amount,
+            min_confs: data.min_confs,
+            node_pubkey_string: data.node_pubkey_string,
+            sat_per_vbyte: data.sat_per_vbyte,
+            spend_unconfirmed: data.spend_unconfirmed
+        };
+
+        if (data.fundMax) {
+            request.fund_max = true;
+        }
+
+        if (data.simpleTaprootChannel) {
+            request.commitment_type = 'SIMPLE_TAPROOT';
+        }
+
+        if (data.utxos && data.utxos.length > 0) {
+            request.outpoints = data.utxos.map((utxo: string) => {
+                const [txid_str, output_index] = utxo.split(':');
+                return {
+                    txid_str,
+                    output_index: Number(output_index)
+                };
+            });
+        }
+
+        if (data.node_pubkey_string) {
+            request.node_pubkey = Base64Utils.hexToBase64(
+                data.node_pubkey_string
+            );
+        }
+
+        if (data.funding_shim) {
+            request.funding_shim = data.funding_shim;
+            delete request.sat_per_vbyte;
+        }
+
+        // make call
+        const { host, lndhubUrl, port, macaroonHex, accessToken } =
+            settingsStore;
+
+        const auth = macaroonHex || accessToken;
+        const headers: any = this.getHeaders(auth, true);
+        const methodRoute = '/v1/channels/stream?method=POST';
+        const url = this.getURL(host || lndhubUrl, port, methodRoute, true);
+
+        return new Promise(function (resolve, reject) {
+            const ws: any = new WebSocket(url, null, {
+                headers
+            });
+
+            // keep pulling in responses until the socket closes
+            let resp: any;
+
+            ws.addEventListener('open', () => {
+                // connection opened
+                ws.send(JSON.stringify(request)); // send a message
+            });
+
+            ws.addEventListener('message', (e: any) => {
+                // a message was received
+                const data = JSON.parse(e.data);
+                if (data?.result?.psbt_fund) {
+                    resolve(data);
+                } else if (data.error) {
+                    reject(data.error);
+                } else {
+                    resp = e.data;
+                }
+            });
+
+            ws.addEventListener('error', (e: any) => {
+                const certWarning = localeString('backends.LND.wsReq.warning');
+                // an error occurred
+                reject(
+                    e.message ? `${certWarning} (${e.message})` : certWarning
+                );
+            });
+
+            ws.addEventListener('close', () => {
+                // connection closed; nothing catches what a listener throws,
+                // so don't parse a response that never came
+                if (resp === undefined) {
+                    reject(
+                        localeString('backends.LND.restReq.connectionError')
+                    );
+                    return;
+                }
+                resolve(JSON.parse(resp));
+            });
+        });
+    };
+    connectPeer = (data: any) => this.postRequest('/v1/peers', data);
+    decodePaymentRequest = (urlParams?: Array<string>) =>
+        this.getRequest(`/v1/payreq/${urlParams && urlParams[0]}`);
+    payLightningInvoice = async (data: any) => {
+        if (data.pubkey) delete data.pubkey;
+
+        const timeoutSeconds = Number(data.timeout_seconds) || 60;
+        // native transport deadline for the send request, past the
+        // forcedTimeout below
+        const requestTimeoutMs = (timeoutSeconds + 5) * 1000;
+        const dispatchDeadline = Date.now() + requestTimeoutMs;
+
+        const forcedTimeout = async (time_ms: number, response: any) => {
+            await new Promise((res) => setTimeout(res, time_ms));
+            return response;
+        };
+
+        // payment_timed_out marks the outcome as unknown on the node (the
+        // client gave up, not the payment), so the caller can track the
+        // payment to its terminal state instead of reporting failure.
+        // dispatch_deadline_ms is when the request is torn down natively;
+        // before then it may still reach the node, so a lookup finding no
+        // record isn't proof the payment was never sent.
+        const timedOutResponse = () => ({
+            payment_error: localeString(
+                'views.SendingLightning.paymentTimedOut'
+            ),
+            payment_timed_out: true,
+            dispatch_deadline_ms: dispatchDeadline
+        });
+
+        // The request timeout must exceed the forcedTimeout below, or the
+        // generic transport rejection wins the race and the user sees a
+        // retryable-looking error instead of the payment-timed-out shape
+        // (dangerous on keysend, where a retry double-sends).
+        const call = () =>
+            this.postRequest(
+                '/v2/router/send',
+                {
+                    ...data,
+                    allow_self_payment: true
+                },
+                requestTimeoutMs
+            ).catch((err: any) => {
+                // safety net if the transport deadline ever fires first:
+                // a client-side timeout is outcome-unknown, not a failure
+                if (err?.message === 'Request timeout')
+                    return timedOutResponse();
+                throw err;
+            });
+
+        const result: any = await Promise.race([
+            forcedTimeout((timeoutSeconds + 1) * 1000, timedOutResponse()),
+            call()
+        ]);
+
+        return result;
+    };
+    // scans payments pages because LND REST has no non-streaming
+    // per-payment lookup (TrackPaymentV2 streams until terminal)
+    lookupPayment = (data: {
+        payment_hash: string;
+        creation_date_start?: number;
+    }) =>
+        findPaymentByHash(
+            (request) => this.getPayments(request),
+            data.payment_hash,
+            data.creation_date_start
+        );
+    closeChannel = (urlParams?: Array<string>) => {
+        let requestString = `/v1/channels/${urlParams && urlParams[0]}/${
+            urlParams && urlParams[1]
+        }?force=${urlParams && urlParams[2]}`;
+
+        if (urlParams && !urlParams[2] && urlParams[3]) {
+            requestString += `&sat_per_vbyte=${urlParams && urlParams[3]}`;
+        }
+
+        if (urlParams && urlParams[4]) {
+            requestString += `&delivery_address=${urlParams && urlParams[4]}`;
+        }
+
+        return this.deleteRequest(requestString);
+    };
+    abandonChannel = (urlParams?: Array<string | boolean | undefined>) => {
+        const fundingTxIdStr =
+            urlParams && typeof urlParams[0] === 'string' ? urlParams[0] : '';
+        const outputIndex =
+            urlParams && typeof urlParams[1] === 'string'
+                ? Number(urlParams[1])
+                : 0;
+
+        // Build URL path: /v1/channels/abandon/{funding_txid_str}/{output_index}
+        let requestString = `/v1/channels/abandon/${fundingTxIdStr}/${outputIndex}`;
+
+        // Add boolean query parameters only if explicitly set (not undefined)
+        const queryParams: string[] = [];
+        if (urlParams && urlParams[2]) {
+            queryParams.push(
+                `pending_funding_shim_only=${Boolean(urlParams[2])}`
+            );
+        }
+        if (urlParams && urlParams[3]) {
+            queryParams.push(`i_know_what_i_am_doing=${Boolean(urlParams[3])}`);
+        }
+
+        if (queryParams.length > 0) {
+            requestString += `?${queryParams.join('&')}`;
+        }
+
+        return this.deleteRequest(requestString);
+    };
+    getNodeInfo = (urlParams?: Array<string>) =>
+        this.getRequest(`/v1/graph/node/${urlParams && urlParams[0]}`);
+    getFees = () => this.getRequest('/v1/fees');
+    setFees = (data: any) => {
+        const {
+            chan_point,
+            base_fee_msat,
+            fee_rate,
+            time_lock_delta,
+            min_htlc,
+            max_htlc,
+            base_fee_msat_inbound,
+            fee_rate_inbound
+        } = data;
+
+        if (data.global) {
+            return this.postRequest('/v1/chanpolicy', {
+                base_fee_msat,
+                fee_rate: `${Number(fee_rate) / 100}`,
+                ...(this.supportInboundFees() && {
+                    inboundFee: {
+                        ...(base_fee_msat_inbound !== '' && {
+                            base_fee_msat: base_fee_msat_inbound
+                        }),
+                        ...(fee_rate_inbound !== '' &&
+                            fee_rate_inbound !== undefined && {
+                                fee_rate_ppm: `${new BigNumber(fee_rate_inbound)
+                                    .multipliedBy(10000)
+                                    .toFixed(0)}`
+                            })
+                    }
+                }),
+                global: true,
+                time_lock_delta: Number(time_lock_delta),
+                min_htlc_msat: min_htlc ? `${Number(min_htlc) * 1000}` : null,
+                max_htlc_msat: max_htlc ? `${Number(max_htlc) * 1000}` : null,
+                min_htlc_msat_specified: min_htlc ? true : false
+            });
+        }
+        return this.postRequest('/v1/chanpolicy', {
+            base_fee_msat,
+            fee_rate: `${Number(fee_rate) / 100}`,
+            ...(this.supportInboundFees() && {
+                inboundFee: {
+                    ...(base_fee_msat_inbound !== '' && {
+                        base_fee_msat: base_fee_msat_inbound
+                    }),
+                    ...(fee_rate_inbound !== '' &&
+                        fee_rate_inbound !== undefined && {
+                            fee_rate_ppm: `${new BigNumber(fee_rate_inbound)
+                                .multipliedBy(10000)
+                                .toFixed(0)}`
+                        })
+                }
+            }),
+            chan_point: {
+                funding_txid_str: chan_point.funding_txid_str,
+                output_index: chan_point.output_index
+            },
+            time_lock_delta: Number(time_lock_delta),
+            min_htlc_msat: min_htlc ? `${Number(min_htlc) * 1000}` : null,
+            max_htlc_msat: max_htlc ? `${Number(max_htlc) * 1000}` : null,
+            min_htlc_msat_specified: min_htlc ? true : false
+        });
+    };
+    // takes a raw PolicyUpdateRequest, used by Developer Tools
+    updateChannelPolicy = (data: any) =>
+        this.postRequest('/v1/chanpolicy', data);
+    getRoutes = (urlParams?: Array<string>) =>
+        this.getRequest(
+            `/v1/graph/routes/${urlParams && urlParams[0]}/${
+                urlParams && urlParams[1]
+            }`
+        );
+    getForwardingHistory = (
+        hours = 24,
+        chanIdIn?: string,
+        chanIdOut?: string
+    ) => {
+        const req: any = {
+            num_max_events: 10000000,
+            start_time: Math.round(
+                new Date(Date.now() - hours * 60 * 60 * 1000).getTime() / 1000
+            ).toString(),
+            end_time: Math.round(new Date().getTime() / 1000).toString()
+        };
+        if (this.supports('v0.20.0')) {
+            if (chanIdIn) {
+                req.incoming_chan_ids = [chanIdIn];
+            }
+            if (chanIdOut) {
+                req.outgoing_chan_ids = [chanIdOut];
+            }
+        }
+        return this.postRequest('/v1/switch', req);
+    };
+    // Coin Control
+    fundPsbt = (data: any) => this.postRequest('/v2/wallet/psbt/fund', data);
+    signPsbt = (data: any) => this.postRequest('/v2/wallet/psbt/sign', data);
+    finalizePsbt = (data: any) =>
+        this.postRequest('/v2/wallet/psbt/finalize', data);
+    publishTransaction = (data: any) => {
+        if (data.tx_hex) data.tx_hex = Base64Utils.hexToBase64(data.tx_hex);
+        return this.postRequest('/v2/wallet/tx', data);
+    };
+    fundingStateStep = (data: any) =>
+        this.postRequest('/v1/funding/step', data);
+    getUTXOs = (data: any) => this.postRequest('/v2/wallet/utxos', data);
+    bumpFee = (data: any) => this.postRequest('/v2/wallet/bumpfee', data);
+    bumpForceCloseFee = (data: any) =>
+        this.postRequest('/v2/wallet/BumpForceCloseFee', data);
+    listAccounts = () => this.getRequest('/v2/wallet/accounts');
+    listAddresses = () => this.getRequest('/v2/wallet/addresses');
+    importAccount = (data: any) =>
+        this.postRequest('/v2/wallet/accounts/import', data);
+    signMessage = (message: string) =>
+        this.postRequest('/v1/signmessage', {
+            msg: Base64Utils.utf8ToBase64(message)
+        });
+    verifyMessage = (data: any) =>
+        this.postRequest('/v1/verifymessage', {
+            msg: Base64Utils.utf8ToBase64(data.msg),
+            signature: data.signature
+        });
+    signMessageWithAddr = async (message: string, address: string) =>
+        this.postRequest('/v2/wallet/address/signmessage', {
+            msg: Base64Utils.utf8ToBase64(message),
+            addr: address
+        });
+    verifyMessageWithAddr = async (
+        message: string,
+        signature: string,
+        address: string
+    ) =>
+        this.postRequest('/v2/wallet/address/verifymessage', {
+            msg: Base64Utils.utf8ToBase64(message),
+            signature,
+            addr: address
+        });
+    lnurlAuth = async (r_hash: string) => {
+        const signed = await this.signMessage(r_hash);
+        return {
+            signature: sha256Bytes(
+                Base64Utils.stringToUint8Array(signed.signature)
+            )
+        };
+    };
+    lookupInvoice = (data: any) =>
+        this.getRequest(`/v1/invoice/${data.r_hash}`);
+    subscribeInvoice = (r_hash: string) =>
+        this.getRequest(`/v2/invoices/subscribe/${r_hash}`);
+    subscribeTransactions = () => this.getRequest('/v1/transactions/subscribe');
+    // Poll lookupInvoice for the watched payment hash instead of scanning
+    // the invoice list, which can push the watched invoice out of the
+    // window on busy nodes. rHash arrives base64url encoded from the
+    // Receive view; the REST lookup endpoint expects hex. A settled
+    // invoice is the signal, with no amount check: LND does not settle a
+    // fixed-amount invoice for less, and with the Flow LSP the node invoice
+    // is for the Receive amount minus the LSP fee
+    watchInvoicePaid = (
+        { rHash }: { rHash: string },
+        onPaid: (payload: {
+            amountSat: number;
+            tx?: string;
+            preimage?: string;
+        }) => void
+    ): (() => void) => {
+        const interval = setInterval(() => {
+            this.lookupInvoice({
+                r_hash: Base64Utils.base64UrlToHex(rHash)
+            })
+                .then((result: any) => {
+                    const invoice = new Invoice(result);
+                    const amountPaid = invoice.getAmount;
+                    if (invoice.isPaid && Number(amountPaid) !== 0) {
+                        clearInterval(interval);
+                        onPaid({
+                            amountSat: Number(amountPaid),
+                            tx: invoice.getPaymentRequest
+                        });
+                    }
+                })
+                .catch(() => {
+                    // invoice not found or node unreachable;
+                    // retry on the next tick
+                });
+        }, 5000);
+        return () => clearInterval(interval);
+    };
+    watchOnchainReceived = (
+        {
+            address,
+            expectedAmountSat,
+            numConfPreference,
+            blockHeight
+        }: {
+            address: string;
+            expectedAmountSat?: string | number;
+            numConfPreference: number;
+            blockHeight?: number;
+        },
+        onReceived: (payload: { amountSat: number; txid: string }) => void
+    ): (() => void) => {
+        const interval = setInterval(() => {
+            // only look for transactions in the last 3 blocks
+            this.getTransactions(
+                blockHeight ? { start_height: blockHeight - 3 } : null
+            )
+                .then((response: any) => {
+                    const txs = response.transactions;
+                    for (let i = 0; i < txs.length; i++) {
+                        const result = txs[i];
+                        if (
+                            result.dest_addresses.includes(address) &&
+                            result.num_confirmations >= numConfPreference
+                        ) {
+                            // loop through outputs since amount is negative if unconfirmed
+                            const output_details = result.output_details;
+                            for (let j = 0; j < output_details.length; j++) {
+                                const output = output_details[j];
+                                if (
+                                    Number(output.amount) >=
+                                        Number(expectedAmountSat ?? 0) &&
+                                    output.address === address
+                                ) {
+                                    clearInterval(interval);
+                                    onReceived({
+                                        amountSat: Number(output.amount),
+                                        txid: result.tx_hash
+                                    });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                })
+                .catch(() => {
+                    // node unreachable; retry on the next tick
+                });
+        }, 7000);
+        return () => clearInterval(interval);
+    };
+    initChanAcceptor = (data?: any) => {
+        const { host, lndhubUrl, port, macaroonHex, accessToken } =
+            settingsStore;
+
+        const auth = macaroonHex || accessToken;
+        const headers: any = this.getHeaders(auth, true);
+        const url = this.getURL(
+            host || lndhubUrl,
+            port,
+            '/v1/channels/acceptor?method=POST',
+            true
+        );
+
+        const ws: any = new WebSocket(url, null, {
+            headers
+        });
+
+        // keep pulling in responses until the socket closes
+        let resp: any;
+
+        // read per request: the socket can outlive the settings and the LSP
+        // info it was opened with
+        const { getZeroConfPeers, getLspPubkey } = data;
+
+        ws.addEventListener('open', (e: any) => {
+            console.log('channel acceptor opened', e);
+            ws.send(JSON.stringify({ accept: true }));
+        });
+
+        ws.addEventListener('message', (e: any) => {
+            // a message was received
+            const res = JSON.parse(e.data);
+            if (res.error) {
+                console.log('chanAcceptor err', res.error);
+            } else {
+                resp = JSON.parse(e.data).result;
+                const requestPubkey = Base64Utils.base64ToHex(resp.node_pubkey);
+                const pending_chan_id = resp.pending_chan_id;
+
+                const lspPubkey = getLspPubkey();
+                const zeroConfPeers = getZeroConfPeers();
+                const isZeroConfAllowed =
+                    lspPubkey === requestPubkey ||
+                    (zeroConfPeers && zeroConfPeers.includes(requestPubkey));
+
+                const acceptData = {
+                    accept: !resp.wants_zero_conf || isZeroConfAllowed,
+                    zero_conf: isZeroConfAllowed && resp.wants_zero_conf,
+                    pending_chan_id
+                };
+                ws.send(JSON.stringify(acceptData)); // send a message
+            }
+        });
+
+        ws.addEventListener('error', (e: any) => {
+            const certWarning = localeString('backends.LND.wsReq.warning');
+            // an error occurred
+            console.log(
+                e.message ? `${certWarning} (${e.message})` : certWarning
+            );
+        });
+
+        ws.addEventListener('close', () => {
+            console.log('channel acceptor close');
+        });
+
+        return ws;
+    };
+
+    listPeers = async () => {
+        try {
+            const res = await this.getRequest('/v1/peers');
+            return res.peers ?? [];
+        } catch (error) {
+            console.error('Failed to fetch peers:', error);
+            return [];
+        }
+    };
+
+    disconnectPeer = async (pubkey: string): Promise<boolean | null> => {
+        try {
+            await this.deleteRequest(`/v1/peers/${pubkey}`);
+            return true;
+        } catch (error) {
+            console.error(`Error disconnecting peer ${pubkey}:`, error);
+            return null;
+        }
+    };
+
+    listWatchtowers = (params?: {
+        include_sessions?: boolean;
+        exclude_exhausted_sessions?: boolean;
+    }) => {
+        const queryParams = params
+            ? Object.keys(params)
+                  .filter(
+                      (key) => params[key as keyof typeof params] !== undefined
+                  )
+                  .map((key) => `${key}=${params[key as keyof typeof params]}`)
+                  .join('&')
+            : '';
+        const route = queryParams
+            ? `/v2/watchtower/client?${queryParams}`
+            : '/v2/watchtower/client';
+        return this.getRequest(route);
+    };
+
+    addWatchtower = (data: { pubkey: string; address: string }) => {
+        return this.postRequest('/v2/watchtower/client', {
+            pubkey: Base64Utils.hexToBase64(data.pubkey),
+            address: data.address
+        });
+    };
+
+    removeWatchtower = (pubkey: string) => {
+        const pubkeyBase64Url = Base64Utils.base64ToBase64Url(pubkey);
+        const route = `/v2/watchtower/client/${pubkeyBase64Url}`;
+        return this.deleteRequest(route);
+    };
+
+    getWatchtowerInfo = (
+        pubkey: string,
+        params?: {
+            include_sessions?: boolean;
+            exclude_exhausted_sessions?: boolean;
+        }
+    ) => {
+        const pubkeyBase64Url = Base64Utils.base64ToBase64Url(pubkey);
+        const queryParams = params
+            ? Object.keys(params)
+                  .filter(
+                      (key) => params[key as keyof typeof params] !== undefined
+                  )
+                  .map((key) => `${key}=${params[key as keyof typeof params]}`)
+                  .join('&')
+            : '';
+        const route = queryParams
+            ? `/v2/watchtower/client/info/${pubkeyBase64Url}?${queryParams}`
+            : `/v2/watchtower/client/info/${pubkeyBase64Url}`;
+        return this.getRequest(route);
+    };
+
+    deactivateWatchtower = (pubkey: string) => {
+        const pubkeyBase64Url = Base64Utils.base64ToBase64Url(pubkey);
+        return this.postRequest(
+            `/v2/watchtower/client/tower/deactivate/${pubkeyBase64Url}`,
+            {}
+        );
+    };
+    getWatchtowerStats = () => this.getRequest('/v2/watchtower/client/stats');
+
+    getWatchtowerPolicy = (policy_type?: number) => {
+        const params = policy_type !== undefined ? { policy_type } : {};
+        return this.getRequest('/v2/watchtower/client/policy', params);
+    };
+
+    terminateWatchtowerSession = (session_id: string) =>
+        this.postRequest(
+            `/v2/watchtower/client/sessions/terminate/${Base64Utils.hexToBase64(
+                session_id
+            )}`,
+            {}
+        );
+
+    supportsWatchtowerClient = () => true;
+    supportsPeers = () => true;
+    supportsMessageSigning = () => true;
+    supportsMessageVerification = () => true;
+    requiresVerifyPubkey = () => false;
+    supportsLnurlAuth = () => true;
+    supportsOnchainBalance = () => true;
+    supportsOnchainSends = () => true;
+    supportsOnchainReceiving = () => true;
+    supportsUnconfirmedTransactionOrigin = () => true;
+    supportsLightningSends = () => true;
+    supportsKeysend = () => true;
+    supportsPaymentLookup = () => true;
+    supportsChannelManagement = () => true;
+    supportsCircularRebalancing = () => true;
+    supportsForceClose = () => true;
+    supportsPendingChannels = () => true;
+    supportsClosedChannels = () => true;
+    supportsMPP = () => this.supports('v0.10.0');
+    supportsAMP = () => this.supports('v0.13.0');
+    supportsCoinControl = () => this.supports('v0.12.0');
+    supportsChannelCoinControl = () => this.supports('v0.17.0');
+    supportsHopPicking = () => this.supports('v0.11.0');
+    supportsAccounts = () => this.supports('v0.13.0');
+    // ImportAccountRequest.birthday_height and the rescan RPC are Zeus
+    // lnd-fork extensions; upstream lnd has neither
+    supportsAccountImportRescan = () => false;
+    supportsRouting = () => true;
+    supportsNodeInfo = () => true;
+    supportsWithdrawalRequests = () => false;
+    singleFeesEarnedTotal = () => false;
+    supportsAddressTypeSelection = () => true;
+    supportsNestedSegWit = () => true;
+    supportsTaproot = () => this.supports('v0.15.0');
+    supportsBumpFee = () => true;
+    supportsOnchainSendFeeRate = () => true;
+    supportsChannelOpenFeeRate = () => true;
+    supportsChannelOpenMinConfs = () => true;
+    supportsFlowLSP = () => true;
+    supportsNetworkInfo = () => true;
+    supportsSimpleTaprootChannels = () => this.supports('v0.17.0');
+    supportsCustomPreimages = () => true;
+    supportsSweep = () => true;
+    supportsOnchainSendMax = () => this.supports('v0.18.3');
+    supportsChannelMemo = () => this.supports('v0.17.0');
+    supportsOnchainBatching = () => true;
+    supportsChannelBatching = () => true;
+    supportsChannelFundMax = () => true;
+    supportsLSPScustomMessage = () => true;
+    supportsLSPS1rest = () => true;
+    supportsOffers = (): Promise<boolean> | boolean => false;
+    supportsListingOffers = () => false;
+    supportsBolt12Address = () => false;
+    supportsBolt11BlindedRoutes = () => this.supports('v0.18.3');
+    supportsAddressesWithDerivationPaths = () => this.supports('v0.18.0');
+    supportsCustomFeeLimit = () => true;
+    isLNDBased = () => true;
+    supportsForwardingHistory = () => true;
+    supportInboundFees = () => this.supports('v0.18.0');
+    supportsCashuWallet = () => false;
+    supportsAddressMessageSigning = () => true;
+    supportsSettingInvoiceExpiration = () => true;
+    supportsNostrWalletConnectService = () => true;
+}

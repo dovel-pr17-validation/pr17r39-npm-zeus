@@ -1,0 +1,287 @@
+name: Coverage Comment
+on:
+  workflow_run:
+    workflows: ["Test"]
+    types:
+      - completed
+permissions:
+  actions: read
+  pull-requests: write
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download coverage summary
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-summary
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Post or update coverage comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Artifact contents come from an untrusted PR run: parse as
+            // data only, and validate before acting on them.
+            const prNumber = parseInt(
+                fs.readFileSync('PR_NUMBER', 'utf8').trim(),
+                10
+            );
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+                core.setFailed('Invalid PR number in artifact');
+                return;
+            }
+
+            const run = context.payload.workflow_run;
+            const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+            });
+            if (pr.head.sha !== run.head_sha) {
+                core.info(
+                    `PR #${prNumber} head ${pr.head.sha} does not match ` +
+                        `run head ${run.head_sha}; skipping (stale or mismatched run)`
+                );
+                return;
+            }
+
+            // The summary is attacker-controlled (a PR can make the test
+            // script write anything), and its values are interpolated into
+            // a bot-authored comment. Only strictly validated shapes are
+            // rendered; anything else fails the run without commenting.
+            const METRICS = ['statements', 'branches', 'functions', 'lines'];
+            const isCount = (n) => Number.isInteger(n) && n >= 0;
+            const isValidTotal = (t) =>
+                t !== null &&
+                typeof t === 'object' &&
+                METRICS.every((key) => {
+                    const m = t[key];
+                    return (
+                        m !== null &&
+                        typeof m === 'object' &&
+                        isCount(m.covered) &&
+                        isCount(m.total) &&
+                        m.covered <= m.total &&
+                        (m.pct === 'Unknown' ||
+                            (typeof m.pct === 'number' &&
+                                Number.isFinite(m.pct) &&
+                                m.pct >= 0 &&
+                                m.pct <= 100))
+                    );
+                });
+
+            const summary = JSON.parse(
+                fs.readFileSync('coverage-summary.json', 'utf8')
+            );
+            const total = summary.total;
+            if (!isValidTotal(total)) {
+                core.setFailed(
+                    'coverage-summary.json failed validation; not commenting'
+                );
+                return;
+            }
+
+            // Per-folder breakdown. The per-file keys are absolute paths on
+            // the Test runner. Both workflows run on ubuntu-latest in the
+            // same repo, so this job's GITHUB_WORKSPACE is the same root.
+            // Folder names end up in the comment, so only plain names are
+            // used; anything else is counted under (other).
+            const ROOT = `${process.env.GITHUB_WORKSPACE}/`;
+            const MAX_FOLDERS = 30;
+            const folderOf = (file) => {
+                if (!file.startsWith(ROOT)) return '(other)';
+                const parts = file.slice(ROOT.length).split('/');
+                if (parts.length === 1) return '(root)';
+                return /^[A-Za-z0-9._-]{1,40}$/.test(parts[0])
+                    ? parts[0]
+                    : '(other)';
+            };
+            // Returns a Map of folder -> summed counts, or null if any
+            // per-file entry fails validation.
+            const byFolder = (data) => {
+                const folders = new Map();
+                for (const [file, metrics] of Object.entries(data)) {
+                    if (file === 'total') continue;
+                    if (!isValidTotal(metrics)) return null;
+                    const name = folderOf(file);
+                    if (!folders.has(name)) {
+                        folders.set(name, { files: 0 });
+                        for (const key of METRICS) {
+                            folders.get(name)[key] = { covered: 0, total: 0 };
+                        }
+                    }
+                    const folder = folders.get(name);
+                    folder.files += 1;
+                    for (const key of METRICS) {
+                        folder[key].covered += metrics[key].covered;
+                        folder[key].total += metrics[key].total;
+                    }
+                }
+                return folders.size > MAX_FOLDERS ? null : folders;
+            };
+            const folders = byFolder(summary);
+            if (!folders) {
+                core.setFailed(
+                    'coverage-summary.json per-file entries failed validation; not commenting'
+                );
+                return;
+            }
+
+            // Baseline: the most recent successful master-push Test run
+            // that uploaded a coverage-baseline artifact. Absent until the
+            // first master push after this workflow lands.
+            let baseline = null;
+            let baselineFolders = null;
+            let baselineSha = null;
+            const { data: masterRuns } =
+                await github.rest.actions.listWorkflowRuns({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    workflow_id: 'test.yml',
+                    branch: 'master',
+                    event: 'push',
+                    status: 'success',
+                    per_page: 10
+                });
+            for (const candidate of masterRuns.workflow_runs) {
+                const { data: arts } =
+                    await github.rest.actions.listWorkflowRunArtifacts({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        run_id: candidate.id
+                    });
+                const art = arts.artifacts.find(
+                    (a) => a.name === 'coverage-baseline' && !a.expired
+                );
+                if (!art) continue;
+                const dl = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: art.id,
+                    archive_format: 'zip'
+                });
+                fs.writeFileSync('baseline.zip', Buffer.from(dl.data));
+                await exec.exec('unzip', ['-o', 'baseline.zip', '-d', 'baseline']);
+                const candidateSummary = JSON.parse(
+                    fs.readFileSync('baseline/coverage-summary.json', 'utf8')
+                );
+                if (!isValidTotal(candidateSummary.total)) {
+                    core.info(
+                        `Baseline from run ${candidate.id} failed validation; skipping`
+                    );
+                    continue;
+                }
+                baseline = candidateSummary.total;
+                // Folder diffs are optional: show n/a rather than
+                // dropping the whole baseline.
+                baselineFolders = byFolder(candidateSummary);
+                baselineSha = candidate.head_sha;
+                break;
+            }
+
+            const row = (label, key) => {
+                const m = total[key];
+                const pct = typeof m.pct === 'number' ? `${m.pct}%` : m.pct;
+                let diff = 'n/a';
+                if (
+                    baseline &&
+                    typeof m.pct === 'number' &&
+                    typeof baseline[key]?.pct === 'number'
+                ) {
+                    const d = Number((m.pct - baseline[key].pct).toFixed(2));
+                    diff = d === 0 ? '0.00%' : `${d > 0 ? '+' : ''}${d.toFixed(2)}%`;
+                }
+                return `| ${label} | ${pct} | ${m.covered}/${m.total} | ${diff} |`;
+            };
+
+            // Same rounding as istanbul's json-summary pct.
+            const percent = (m) =>
+                m.total === 0
+                    ? null
+                    : Math.floor((10000 * m.covered) / m.total) / 100;
+            const folderCell = (name, key) => {
+                const p = percent(folders.get(name)[key]);
+                if (p === null) return 'n/a';
+                const base = baselineFolders?.get(name);
+                const bp = base ? percent(base[key]) : null;
+                if (bp === null) return `${p}%`;
+                const d = Number((p - bp).toFixed(2));
+                return d === 0
+                    ? `${p}%`
+                    : `${p}% (${d > 0 ? '+' : ''}${d.toFixed(2)})`;
+            };
+            const folderOrder = (name) =>
+                name === '(root)' ? 0 : name === '(other)' ? 2 : 1;
+            const folderNames = [...folders.keys()].sort(
+                (a, b) => folderOrder(a) - folderOrder(b) || a.localeCompare(b)
+            );
+            const folderRows = folderNames.map(
+                (name) =>
+                    `| ${folderOrder(name) === 1 ? `\`${name}\`` : name} | ` +
+                    `${folders.get(name).files} | ` +
+                    METRICS.map((key) => folderCell(name, key)).join(' | ') +
+                    ' |'
+            );
+
+            const marker = '<!-- jest-coverage-summary -->';
+            const body = [
+                marker,
+                '## Test coverage',
+                '',
+                '| Metric | Coverage | Covered/Total | vs master |',
+                '| --- | --- | --- | --- |',
+                row('Statements', 'statements'),
+                row('Branches', 'branches'),
+                row('Functions', 'functions'),
+                row('Lines', 'lines'),
+                '',
+                '<details>',
+                '<summary>Coverage by folder</summary>',
+                '',
+                'Change vs master in parentheses when nonzero.',
+                '',
+                '| Folder | Files | Statements | Branches | Functions | Lines |',
+                '| --- | --- | --- | --- | --- | --- |',
+                ...folderRows,
+                '',
+                '</details>',
+                '',
+                `Commit: ${run.head_sha} | [Test run](${run.html_url})` +
+                    (baselineSha
+                        ? ` | Baseline: master@${baselineSha.slice(0, 9)}`
+                        : '')
+            ].join('\n');
+
+            const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    per_page: 100
+                }
+            );
+            const existing = comments.find(
+                (c) =>
+                    c.user.login === 'github-actions[bot]' &&
+                    c.body.includes(marker)
+            );
+            if (existing) {
+                await github.rest.issues.updateComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                    body
+                });
+            } else {
+                await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body
+                });
+            }

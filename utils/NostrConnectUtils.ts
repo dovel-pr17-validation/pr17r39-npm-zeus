@@ -1,0 +1,2029 @@
+import { Platform } from 'react-native';
+import { Notifications } from 'react-native-notifications';
+import { Relay, generateSecretKey, getPublicKey } from 'nostr-tools';
+import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import {
+    Nip47NotificationType,
+    Nip47Method,
+    Nip47Transaction,
+    Nip47ListTransactionsRequest,
+    Nip47LookupInvoiceRequest,
+    Nip47MakeInvoiceRequest
+} from '@getalby/sdk';
+
+import {
+    BudgetRenewalType,
+    PermissionType,
+    TimeUnit,
+    ConnectionActivity
+} from '../models/NWCConnection';
+import Invoice from '../models/Invoice';
+import Payment from '../models/Payment';
+import CashuPayment from '../models/CashuPayment';
+import CashuInvoice from '../models/CashuInvoice';
+import { lnrpc } from '../proto/lightning';
+
+import Base64Utils from './Base64Utils';
+import { FAILURE_REASON_LOCALE_KEYS } from './ErrorUtils';
+import { localeString } from './LocaleUtils';
+import dateTimeUtils from './DateTimeUtils';
+import Bolt11Utils from './Bolt11Utils';
+import BackendUtils from './BackendUtils';
+import { millisatsToSats, satsToMillisats } from './AmountUtils';
+import { numberWithCommas } from './UnitsUtils';
+
+export interface PermissionOption {
+    key: PermissionType;
+    title: string;
+    description: string;
+}
+
+export interface IndividualPermissionOption {
+    key: Nip47Method;
+    title: string;
+    description: string;
+}
+
+export interface BudgetRenewalOption {
+    key: BudgetRenewalType;
+    title: string;
+}
+
+const PRESET_INDEX = {
+    FIRST: 0,
+    SECOND: 1,
+    THIRD: 2,
+    NEVER: 3,
+    CUSTOM: 4
+} as const;
+
+const NWC_TRAY_NOTIFICATION_KEYS = {
+    outgoingTitle:
+        'stores.NostrWalletConnectStore.paymentSentNotificationTitle',
+    outgoingBody: 'stores.NostrWalletConnectStore.paymentSentNotificationBody',
+    outgoingFailedTitle:
+        'stores.NostrWalletConnectStore.paymentFailedNotificationTitle',
+    outgoingFailedBody:
+        'stores.NostrWalletConnectStore.paymentFailedNotificationBody',
+    invoiceReadyTitle:
+        'stores.NostrWalletConnectStore.invoiceCreatedNotificationTitle',
+    invoiceReadyBody:
+        'stores.NostrWalletConnectStore.invoiceCreatedNotificationBody',
+    invoiceReadyBodyWithDescription:
+        'stores.NostrWalletConnectStore.invoiceCreatedNotificationBodyWithDescription'
+} as const;
+
+export const NWC_ACTIVITY_NOTIF_KEYS = {
+    action: 'zeusNwcAction',
+    connectionId: 'zeusNwcConnectionId',
+    failedActivityId: 'zeusNwcFailedActivityId',
+    openActivity: 'connection_activity'
+} as const;
+
+export type NwcActivityNotif = {
+    connectionId: string;
+    failedActivityId?: string;
+};
+
+function nonEmptyString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+export function parseNwcActivityNotif(
+    payload: unknown
+): NwcActivityNotif | null {
+    if (!payload || typeof payload !== 'object') return null;
+
+    const p = payload as Record<string, unknown>;
+    const k = NWC_ACTIVITY_NOTIF_KEYS;
+
+    if (p[k.action] !== k.openActivity) return null;
+
+    const connectionId = nonEmptyString(p[k.connectionId]);
+    if (!connectionId) return null;
+
+    const failedActivityId = nonEmptyString(p[k.failedActivityId]);
+    return failedActivityId
+        ? { connectionId, failedActivityId }
+        : { connectionId };
+}
+
+export const DEFAULT_INVOICE_EXPIRY_SECONDS = 3600;
+
+export enum Nip47ErrorCode {
+    INTERNAL_ERROR = 'INTERNAL_ERROR',
+    RATE_LIMITED = 'RATE_LIMITED',
+    INVALID_INVOICE = 'INVALID_INVOICE',
+    FAILED_TO_PAY_INVOICE = 'FAILED_TO_PAY_INVOICE',
+    FAILED_TO_CREATE_INVOICE = 'FAILED_TO_CREATE_INVOICE',
+    NOT_FOUND = 'NOT_FOUND',
+    /** NIP-47: pubkey has no wallet connected (e.g. unknown connection). */
+    UNAUTHORIZED = 'UNAUTHORIZED',
+    INSUFFICIENT_BALANCE = 'INSUFFICIENT_BALANCE',
+    INVOICE_EXPIRED = 'INVOICE_EXPIRED',
+    /** NIP-47: pubkey not allowed for this operation (e.g. connection expired). */
+    RESTRICTED = 'RESTRICTED',
+    /** NIP-47: other / invalid request payload (e.g. empty sign_message). */
+    OTHER = 'OTHER'
+}
+
+export interface WalletConfigFields {
+    implementation?: string;
+    host?: string;
+    port?: string;
+    url?: string;
+    lndhubUrl?: string;
+    username?: string;
+    password?: string;
+    pairingPhrase?: string;
+    nostrWalletConnectUrl?: string;
+    lndDir?: string;
+    ldkNodeDir?: string;
+}
+
+export default class NostrConnectUtils {
+    /**
+     * Identifies a wallet config by the fields that select its node or
+     * account, so NWC connections can be matched to a config that is not
+     * the current wallet (the config does not store the node pubkey).
+     * Hashed because the fields include LNC pairing phrases and LndHub
+     * passwords. Applies the same default node dirs as SettingsStore and
+     * getNodeDir. Returns undefined when the config has none of these
+     * fields.
+     */
+    static getWalletConfigId(node?: WalletConfigFields): string | undefined {
+        if (!node) return undefined;
+        const implementation = node.implementation || 'lnd';
+        let fields: Array<string | undefined>;
+        switch (implementation) {
+            case 'embedded-lnd':
+                fields = [node.lndDir || 'lnd'];
+                break;
+            case 'ldk-node':
+                fields = [node.ldkNodeDir || 'ldk'];
+                break;
+            case 'lndhub':
+                // On LNbits every wallet logs in as "admin" (or "invoice")
+                // and the password, the wallet's API key, selects the
+                // wallet.
+                fields = [
+                    node.lndhubUrl,
+                    node.username && node.password
+                        ? bytesToHex(
+                              sha256(
+                                  utf8ToBytes(
+                                      `${node.username}:${node.password}`
+                                  )
+                              )
+                          )
+                        : node.username
+                ];
+                break;
+            case 'lightning-node-connect':
+                fields = [node.pairingPhrase];
+                break;
+            case 'nostr-wallet-connect':
+                fields = [node.nostrWalletConnectUrl];
+                break;
+            default:
+                fields = [node.host, node.port, node.url];
+        }
+        if (!fields.some(Boolean)) return undefined;
+        return bytesToHex(
+            sha256(
+                utf8ToBytes(
+                    JSON.stringify([
+                        implementation,
+                        ...fields.map((field) => field || '')
+                    ])
+                )
+            )
+        );
+    }
+
+    static getNotifications(): Nip47NotificationType[] {
+        // Only types we actually publish
+        return ['payment_received', 'payment_sent'];
+    }
+
+    static get TIME_UNITS(): TimeUnit[] {
+        return [
+            localeString('time.hours'),
+            localeString('time.days'),
+            localeString('time.weeks'),
+            localeString('time.months'),
+            localeString('time.years')
+        ];
+    }
+    static getAvailablePermissions(): IndividualPermissionOption[] {
+        return [
+            {
+                key: 'get_info',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.getInfo'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.getInfoDescription'
+                )
+            },
+            {
+                key: 'get_balance',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.getBalance'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.getBalanceDescription'
+                )
+            },
+            {
+                key: 'pay_invoice',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.payInvoice'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.payInvoiceDescription'
+                )
+            },
+            {
+                key: 'make_invoice',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.makeInvoice'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.makeInvoiceDescription'
+                )
+            },
+            {
+                key: 'lookup_invoice',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.lookupInvoice'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.lookupInvoiceDescription'
+                )
+            },
+            {
+                key: 'list_transactions',
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.listTransactions'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.listTransactionsDescription'
+                )
+            },
+            {
+                key: 'sign_message',
+                title: localeString('views.Settings.signMessage.button'),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.signMessageDescription'
+                )
+            }
+        ];
+    }
+
+    static getBudgetRenewalOptions(): BudgetRenewalOption[] {
+        return [
+            {
+                key: BudgetRenewalType.Never,
+                title: localeString('models.Invoice.never')
+            },
+            {
+                key: BudgetRenewalType.Daily,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.budgetRenewal.daily'
+                )
+            },
+            {
+                key: BudgetRenewalType.Weekly,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.budgetRenewal.weekly'
+                )
+            },
+            {
+                key: BudgetRenewalType.Monthly,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.budgetRenewal.monthly'
+                )
+            },
+            {
+                key: BudgetRenewalType.Yearly,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.budgetRenewal.yearly'
+                )
+            }
+        ];
+    }
+
+    static getPermissionTypes(): PermissionOption[] {
+        return [
+            {
+                key: PermissionType.FullAccess,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.walletAccess'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.walletAccessDescription'
+                )
+            },
+            {
+                key: PermissionType.ReadOnly,
+                title: localeString(
+                    'views.Settings.NostrWalletConnect.readOnly'
+                ),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.readOnlyDescription'
+                )
+            },
+            {
+                key: PermissionType.Custom,
+                title: localeString('views.Settings.NostrWalletConnect.custom'),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.customDescription'
+                )
+            }
+        ];
+    }
+
+    static getExpiryPresetButtons(): string[] {
+        return [
+            localeString('time.1W'),
+            localeString('time.1mo'),
+            localeString('time.12mo'),
+            localeString('models.Invoice.never'),
+            localeString('general.custom')
+        ];
+    }
+
+    static getExpiryPresetIndex(expiryAt: Date, createdAt: Date): number {
+        const expiryDays = NostrConnectUtils.calculateExpiryDays(
+            expiryAt,
+            createdAt
+        )?.toString();
+        if (!expiryDays) return PRESET_INDEX.NEVER;
+        if (expiryDays === '7') return PRESET_INDEX.FIRST;
+        if (expiryDays === '30') return PRESET_INDEX.SECOND;
+        if (expiryDays === '365') return PRESET_INDEX.THIRD;
+        return PRESET_INDEX.CUSTOM;
+    }
+
+    static getExpiryDateFromPreset(
+        presetIndex: number,
+        customExpiryValue?: number,
+        customExpiryUnit?: TimeUnit
+    ): Date | undefined {
+        const now = new Date();
+        switch (presetIndex) {
+            case PRESET_INDEX.FIRST:
+                return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+            case PRESET_INDEX.SECOND:
+                return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+            case PRESET_INDEX.THIRD:
+                return new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+            case PRESET_INDEX.NEVER:
+                return undefined;
+            case PRESET_INDEX.CUSTOM:
+                if (customExpiryValue && customExpiryUnit) {
+                    return NostrConnectUtils.calculateCustomExpiryDate(
+                        customExpiryValue,
+                        customExpiryUnit
+                    );
+                }
+                return new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000);
+            default:
+                return new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        }
+    }
+
+    static calculateCustomExpiryDate(value: number, unit: TimeUnit): Date {
+        const now = new Date();
+        const unitLower = unit.toLowerCase();
+
+        if (unitLower.includes('hours')) {
+            return new Date(now.getTime() + value * 60 * 60 * 1000);
+        } else if (unitLower.includes('days')) {
+            return new Date(now.getTime() + value * 24 * 60 * 60 * 1000);
+        } else if (unitLower.includes('weeks')) {
+            return new Date(now.getTime() + value * 7 * 24 * 60 * 60 * 1000);
+        } else if (unitLower.includes('months')) {
+            const newDate = new Date(now);
+            newDate.setMonth(newDate.getMonth() + value);
+            return newDate;
+        } else if (unitLower.includes('years')) {
+            const newDate = new Date(now);
+            newDate.setFullYear(newDate.getFullYear() + value);
+            return newDate;
+        }
+
+        return new Date(now.getTime() + value * 24 * 60 * 60 * 1000);
+    }
+
+    static calculateExpiryDays(expiresAt: Date, createdAt: Date): string {
+        const expiry = new Date(expiresAt);
+        expiry.setHours(0, 0, 0, 0);
+        const created = new Date(createdAt);
+        created.setHours(0, 0, 0, 0);
+        const diffTime = expiry.getTime() - created.getTime();
+        const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+        return diffDays > 0 ? diffDays.toString() : '';
+    }
+
+    /**
+     * Methods this wallet service implements (NIP-47 info event).
+     * Includes `sign_message`; that method is not part of the default grant.
+     */
+    static getWalletServiceMethods(): Nip47Method[] {
+        const methods: Nip47Method[] = [
+            ...NostrConnectUtils.getFullAccessPermissions()
+        ];
+        if (BackendUtils.supportsMessageSigning()) {
+            methods.push('sign_message');
+        }
+        return methods;
+    }
+
+    /**
+     * Methods this connection should advertise on get_info.
+     * Drops `sign_message` when the active backend cannot sign, so
+     * advertised methods match the registered handlers.
+     */
+    static advertisedConnectionMethods(
+        permissions: Nip47Method[] = []
+    ): Nip47Method[] {
+        if (BackendUtils.supportsMessageSigning()) {
+            return permissions;
+        }
+        return NostrConnectUtils.withoutSignMessage(permissions);
+    }
+
+    /**
+     * Default wallet-access grant. Omits `sign_message`: that signs
+     * arbitrary text with the Lightning node identity key and must be
+     * opted into per connection, on top of a preset.
+     */
+    static getFullAccessPermissions(): Nip47Method[] {
+        return [
+            'get_info',
+            'get_balance',
+            'pay_invoice',
+            'make_invoice',
+            'lookup_invoice',
+            'list_transactions'
+        ];
+    }
+
+    static isValidSignMessage(message: unknown): message is string {
+        return typeof message === 'string' && message.length > 0;
+    }
+
+    static getReadOnlyPermissions(): Nip47Method[] {
+        return [
+            'get_info',
+            'get_balance',
+            'lookup_invoice',
+            'list_transactions'
+        ];
+    }
+
+    /** Wallet methods shown under Custom. Sign Message is a separate opt-in. */
+    static getWalletPermissionOptions(): IndividualPermissionOption[] {
+        return NostrConnectUtils.getAvailablePermissions().filter(
+            (permission) => permission.key !== 'sign_message'
+        );
+    }
+
+    static getSignMessagePermission(): IndividualPermissionOption {
+        return (
+            NostrConnectUtils.getAvailablePermissions().find(
+                (permission) => permission.key === 'sign_message'
+            ) || {
+                key: 'sign_message',
+                title: localeString('views.Settings.signMessage.button'),
+                description: localeString(
+                    'views.Settings.NostrWalletConnect.permissions.signMessageDescription'
+                )
+            }
+        );
+    }
+
+    static withoutSignMessage(permissions: Nip47Method[]): Nip47Method[] {
+        return permissions.filter(
+            (permission) => permission !== 'sign_message'
+        );
+    }
+
+    static withPreservedSignMessage(
+        base: Nip47Method[],
+        current: Nip47Method[] = []
+    ): Nip47Method[] {
+        return current.includes('sign_message')
+            ? [...base, 'sign_message']
+            : base;
+    }
+
+    static samePermissionSet(a: Nip47Method[], b: Nip47Method[]): boolean {
+        if (a.length !== b.length) return false;
+        const sortedA = a.slice().sort();
+        const sortedB = b.slice().sort();
+        return sortedA.every(
+            (permission, index) => permission === sortedB[index]
+        );
+    }
+
+    static getPermissionShortDescription(permission: Nip47Method): string {
+        const descriptions: { [key: string]: string } = {
+            get_info: localeString(
+                'views.Settings.NostrWalletConnect.permissions.getInfoShort'
+            ),
+            get_balance: localeString(
+                'views.Settings.NostrWalletConnect.permissions.getBalanceShort'
+            ),
+            pay_invoice: localeString(
+                'views.Settings.NostrWalletConnect.permissions.payInvoiceShort'
+            ),
+            make_invoice: localeString(
+                'views.Settings.NostrWalletConnect.permissions.makeInvoiceShort'
+            ),
+            lookup_invoice: localeString(
+                'views.Settings.NostrWalletConnect.permissions.lookupInvoiceShort'
+            ),
+            list_transactions: localeString(
+                'views.Settings.NostrWalletConnect.permissions.listTransactionsShort'
+            ),
+            sign_message: localeString(
+                'views.Settings.NostrWalletConnect.permissions.signMessageShort'
+            )
+        };
+        return descriptions[permission] || permission.replace(/_/g, ' ');
+    }
+
+    static getPermissionsForType(
+        permissionType: PermissionType,
+        currentPermissions: Nip47Method[] = []
+    ): { permissions: Nip47Method[] } {
+        switch (permissionType) {
+            case PermissionType.FullAccess:
+                return {
+                    permissions: NostrConnectUtils.withPreservedSignMessage(
+                        NostrConnectUtils.getFullAccessPermissions(),
+                        currentPermissions
+                    )
+                };
+            case PermissionType.ReadOnly:
+                return {
+                    permissions: NostrConnectUtils.withPreservedSignMessage(
+                        NostrConnectUtils.getReadOnlyPermissions(),
+                        currentPermissions
+                    )
+                };
+            case PermissionType.Custom:
+                return {
+                    permissions: currentPermissions
+                };
+            default:
+                return {
+                    permissions: []
+                };
+        }
+    }
+
+    static determinePermissionType(permissions: Nip47Method[]): PermissionType {
+        const walletPermissions =
+            NostrConnectUtils.withoutSignMessage(permissions);
+        if (
+            NostrConnectUtils.samePermissionSet(
+                walletPermissions,
+                NostrConnectUtils.getFullAccessPermissions()
+            )
+        ) {
+            return PermissionType.FullAccess;
+        }
+        if (
+            NostrConnectUtils.samePermissionSet(
+                walletPermissions,
+                NostrConnectUtils.getReadOnlyPermissions()
+            )
+        ) {
+            return PermissionType.ReadOnly;
+        }
+        return PermissionType.Custom;
+    }
+
+    /** True when `pay_invoice` is among granted methods (budget / payment UI applies). */
+    static hasPaymentPermissions(permissions: Nip47Method[]): boolean {
+        return permissions.includes('pay_invoice');
+    }
+
+    static getBudgetRenewalIndex(budgetRenewal?: string): number {
+        const options = NostrConnectUtils.getBudgetRenewalOptions();
+        const index = options.findIndex(
+            (option) => option.key === budgetRenewal
+        );
+        return index >= 0 ? index : 0;
+    }
+    /**
+     * Recomputes connection expiry from now when regenerating a connection
+     * (new secret, same settings). Preset durations (7d / 30d / 1y) restart
+     * from the current time; custom durations use stored value + unit.
+     */
+    static refreshExpiryForRegenerate({
+        expiresAt,
+        createdAt,
+        customExpiryValue,
+        customExpiryUnit
+    }: {
+        expiresAt?: Date;
+        createdAt: Date;
+        customExpiryValue?: number;
+        customExpiryUnit?: TimeUnit;
+    }): {
+        expiresAt?: Date;
+        customExpiryValue?: number;
+        customExpiryUnit?: TimeUnit;
+    } {
+        if (!expiresAt) {
+            return {};
+        }
+
+        const priorExpiresAt = new Date(expiresAt);
+        const priorCreatedAt = new Date(createdAt);
+
+        if (customExpiryValue && customExpiryUnit) {
+            return {
+                expiresAt: NostrConnectUtils.calculateCustomExpiryDate(
+                    customExpiryValue,
+                    customExpiryUnit
+                ),
+                customExpiryValue,
+                customExpiryUnit
+            };
+        }
+
+        const presetIndex = NostrConnectUtils.getExpiryPresetIndex(
+            priorExpiresAt,
+            priorCreatedAt
+        );
+        if (presetIndex === PRESET_INDEX.CUSTOM) {
+            const durationMs = Math.max(
+                priorExpiresAt.getTime() - priorCreatedAt.getTime(),
+                24 * 60 * 60 * 1000
+            );
+            return {
+                expiresAt: new Date(Date.now() + durationMs)
+            };
+        }
+
+        return {
+            expiresAt: NostrConnectUtils.getExpiryDateFromPreset(presetIndex)
+        };
+    }
+
+    /**
+     * Decodes invoice and extracts payment hash, description hash, and expiry time
+     * Used for NIP-47 transaction creation
+     * @param paymentRequest - Bolt11 payment request string
+     * @param fallbackExpirySeconds - Fallback expiry time in seconds (default: 3600)
+     * @returns Object containing payment hash, description hash, and expiry time
+     * @throws Error if invoice decoding fails
+     */
+
+    static async decodeInvoiceTags(
+        invoice: string,
+        checkForPaidStatus: boolean = false
+    ): Promise<{
+        paymentHash: string;
+        descriptionHash: string;
+        description: string;
+        amount: number;
+        amountMsat?: number;
+        expiryTime: number;
+        createdAt: number;
+        isExpired: boolean;
+        paymentRequest: string;
+        network: string;
+        isPaid?: boolean;
+    }> {
+        const decoded = Bolt11Utils.decode(invoice);
+        const paymentHash = decoded.payment_hash || '';
+        const descriptionHash = decoded.description_hash || '';
+        const description = decoded.description || '';
+        const createdAt = decoded.timestamp || 0;
+        const expireTime = decoded.timeExpireDate || 0;
+        const currentTime = Math.floor(Date.now() / 1000);
+        const isExpired = expireTime > 0 && currentTime > expireTime;
+        let isPaid = false;
+        if (paymentHash && checkForPaidStatus) {
+            try {
+                const result = await BackendUtils.lookupInvoice({
+                    r_hash: paymentHash
+                });
+                isPaid = new Invoice(result).isPaid;
+            } catch (e) {}
+        }
+        return {
+            paymentHash,
+            descriptionHash,
+            description,
+            amount:
+                decoded.satoshis ||
+                millisatsToSats(Number(decoded?.millisatoshis)) ||
+                0,
+            amountMsat: Number(decoded?.millisatoshis) || 0,
+            expiryTime: expireTime,
+            createdAt,
+            isExpired,
+            paymentRequest: decoded.paymentRequest,
+            network: decoded.network?.bech32 || 'bitcoin',
+            isPaid
+        };
+    }
+
+    static async lookupInvoicePaidFromNode(options: {
+        paymentRequest?: string;
+        rHash?: string;
+    }): Promise<boolean> {
+        const pr = options.paymentRequest?.trim() || '';
+        if (/^ln/i.test(pr)) {
+            try {
+                const decoded = await NostrConnectUtils.decodeInvoiceTags(
+                    pr,
+                    true
+                );
+                return !!decoded.isPaid;
+            } catch {
+                return false;
+            }
+        }
+        const hash = NostrConnectUtils.normalizePaymentHash(options.rHash);
+        if (!hash) return false;
+        try {
+            const result = await BackendUtils.lookupInvoice({ r_hash: hash });
+            if (!result || typeof result !== 'object') return false;
+            return new Invoice(result).isPaid;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * NIP-47 payment hashes are hex, but some clients send them
+     * base64-encoded. Stored hashes are hex, so a request value has to be
+     * normalized before any exact comparison.
+     */
+    static normalizePaymentHash(paymentHash?: string): string | undefined {
+        const hash = paymentHash?.trim();
+        if (!hash) return undefined;
+        return hash.includes('=') ? Base64Utils.base64ToHex(hash) : hash;
+    }
+
+    /** Wrap a persisted plain-object invoice as an Invoice when needed. */
+    static coerceLightningInvoice(
+        invoice: Invoice | CashuInvoice | null | undefined
+    ): Invoice | undefined {
+        if (!invoice) return undefined;
+        if (invoice instanceof Invoice) return invoice;
+        if (invoice instanceof CashuInvoice) return undefined;
+        return new Invoice(invoice as any);
+    }
+
+    /** Resolve a lookup hash from payment_hash and/or invoice on the request. */
+    static async resolveLookupPaymentHash(
+        request: Nip47LookupInvoiceRequest,
+        paymentRequest?: string
+    ): Promise<string | undefined> {
+        const fromRequest = NostrConnectUtils.normalizePaymentHash(
+            request.payment_hash
+        );
+        if (fromRequest) return fromRequest;
+
+        const invoice = request.invoice || paymentRequest;
+        if (!invoice) return undefined;
+
+        try {
+            const decoded = await NostrConnectUtils.decodeInvoiceTags(invoice);
+            return decoded.paymentHash || undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Whether a BOLT11 string matches a NIP-47 lookup request (invoice or hash). */
+    static async paymentRequestMatchesLookupRequest(
+        paymentRequest: string,
+        request: Nip47LookupInvoiceRequest,
+        normalizedHash?: string
+    ): Promise<boolean> {
+        if (
+            request.invoice &&
+            paymentRequest.toLowerCase() === request.invoice.toLowerCase()
+        ) {
+            return true;
+        }
+        const hash =
+            normalizedHash ??
+            NostrConnectUtils.normalizePaymentHash(request.payment_hash);
+        if (!hash) return false;
+        try {
+            const decoded = await NostrConnectUtils.decodeInvoiceTags(
+                paymentRequest
+            );
+            return decoded.paymentHash === hash;
+        } catch {
+            return false;
+        }
+    }
+
+    static lightningInvoiceExpiresAt(
+        invoice: Invoice,
+        createdAt: number
+    ): number {
+        if (Number(invoice.expires_at) > 0) {
+            return Number(invoice.expires_at);
+        }
+        if (Number(invoice.expiry) > 0) {
+            return createdAt + Number(invoice.expiry);
+        }
+        return 0;
+    }
+
+    static async findConnectionActivityByLookupRequest(
+        activities: ConnectionActivity[],
+        request: Nip47LookupInvoiceRequest
+    ): Promise<ConnectionActivity | undefined> {
+        const normalizedHash = await NostrConnectUtils.resolveLookupPaymentHash(
+            request
+        );
+        for (const activity of activities) {
+            if (
+                await NostrConnectUtils.connectionActivityMatchesLookupRequest(
+                    activity,
+                    request,
+                    normalizedHash
+                )
+            ) {
+                return activity;
+            }
+        }
+        return undefined;
+    }
+
+    static async connectionActivityMatchesLookupRequest(
+        activity: ConnectionActivity,
+        request: Nip47LookupInvoiceRequest,
+        normalizedHash?: string
+    ): Promise<boolean> {
+        const hash =
+            normalizedHash ??
+            NostrConnectUtils.normalizePaymentHash(request.payment_hash);
+        const paymentRequest =
+            activity.invoice?.getPaymentRequest ||
+            activity.payment?.getPaymentRequest;
+
+        if (request.invoice) {
+            const requestInvoiceLower = request.invoice.toLowerCase();
+            if (activity.id.toLowerCase() === requestInvoiceLower) return true;
+            if (paymentRequest?.toLowerCase() === requestInvoiceLower) {
+                return true;
+            }
+            if (
+                paymentRequest &&
+                (await NostrConnectUtils.paymentRequestMatchesLookupRequest(
+                    paymentRequest,
+                    request,
+                    hash
+                ))
+            ) {
+                return true;
+            }
+        }
+
+        if (hash) {
+            const activityHash = NostrConnectUtils.normalizePaymentHash(
+                NostrConnectUtils.extractPaymentHashFromActivity(activity)
+            );
+            if (activityHash && activityHash === hash) return true;
+        }
+
+        return false;
+    }
+
+    static async decodeInvoiceTagsForMakeInvoice(
+        paymentRequest: string,
+        rHash?: string
+    ): Promise<{
+        paymentHash: string;
+        descriptionHash: string;
+        expiryTime: number;
+    }> {
+        const isLightning = rHash !== undefined;
+        let paymentHash = isLightning ? rHash || '' : '';
+        let descriptionHash = '';
+        let expiryTime = 0;
+
+        try {
+            const decoded = await NostrConnectUtils.decodeInvoiceTags(
+                paymentRequest
+            );
+            if (isLightning) {
+                paymentHash = decoded.paymentHash || rHash!;
+                descriptionHash = decoded.descriptionHash;
+                expiryTime =
+                    decoded?.expiryTime ||
+                    dateTimeUtils.getCurrentTimestamp() +
+                        DEFAULT_INVOICE_EXPIRY_SECONDS;
+            } else {
+                paymentHash = decoded.paymentHash;
+                descriptionHash = decoded.descriptionHash;
+                expiryTime =
+                    decoded?.expiryTime ??
+                    dateTimeUtils.getCurrentTimestamp() +
+                        DEFAULT_INVOICE_EXPIRY_SECONDS;
+            }
+        } catch (decodeError) {
+            if (!isLightning) {
+                console.error(
+                    'decodeInvoiceTagsForMakeInvoice: failed to decode Cashu invoice tags',
+                    decodeError
+                );
+                expiryTime =
+                    dateTimeUtils.getCurrentTimestamp() +
+                    DEFAULT_INVOICE_EXPIRY_SECONDS;
+                return { paymentHash: '', descriptionHash: '', expiryTime };
+            }
+            if (!paymentHash && rHash) {
+                paymentHash = rHash;
+            }
+            if (!paymentHash) {
+                throw new Error(
+                    localeString(
+                        'stores.NostrWalletConnectStore.error.failedToDecodeInvoice'
+                    )
+                );
+            }
+            expiryTime =
+                dateTimeUtils.getCurrentTimestamp() +
+                DEFAULT_INVOICE_EXPIRY_SECONDS;
+        }
+        return { paymentHash, descriptionHash, expiryTime };
+    }
+
+    static buildMakeInvoiceSuccessPayload(
+        connectionDisplayName: string,
+        request: Nip47MakeInvoiceRequest,
+        fields: {
+            paymentRequest: string;
+            paymentHash: string;
+            descriptionHash: string;
+            expiryTime: number;
+        }
+    ): { result: Nip47Transaction; error: undefined } {
+        NostrConnectUtils.notifyNwcInvoiceReady(
+            millisatsToSats(request.amount),
+            connectionDisplayName,
+            request.description
+        );
+        const result = NostrConnectUtils.createNip47Transaction({
+            type: 'incoming',
+            state: 'pending',
+            invoice: fields.paymentRequest,
+            payment_hash: fields.paymentHash || '',
+            amount: request.amount,
+            description: request.description,
+            description_hash: fields.descriptionHash,
+            expires_at: fields.expiryTime
+        });
+        return { result, error: undefined };
+    }
+
+    /**
+     * Creates a NIP-47 transaction object with sensible defaults
+     * @param params - Transaction parameters
+     * @param params.type - Transaction type: 'incoming' or 'outgoing'
+     * @param params.state - Transaction state: 'pending', 'settled', or 'failed'
+     * @param params.invoice - Payment request/invoice string
+     * @param params.payment_hash - Payment hash
+     * @param params.amount - Amount in millisatoshis
+     * @param params.description - Optional description
+     * @param params.description_hash - Optional description hash
+     * @param params.preimage - Optional preimage
+     * @param params.fees_paid - Optional fees paid in millisatoshis (default: 0)
+     * @param params.settled_at - Optional settlement timestamp (default: 0)
+     * @param params.created_at - Optional creation timestamp (default: current time)
+     * @param params.expires_at - Optional expiry timestamp (default: created_at + 3600)
+     * @param params.metadata - Optional metadata object
+     * @returns NIP-47 transaction object
+     */
+    static createNip47Transaction(params: {
+        type: 'incoming' | 'outgoing';
+        state: 'pending' | 'settled' | 'failed';
+        invoice: string;
+        payment_hash: string;
+        amount: number;
+        description?: string;
+        description_hash?: string;
+        preimage?: string;
+        fees_paid?: number;
+        settled_at?: number;
+        created_at?: number;
+        expires_at?: number;
+        metadata?: any;
+    }): Nip47Transaction {
+        const now = dateTimeUtils.getCurrentTimestamp();
+        const DEFAULT_EXPIRY_SECONDS = 3600;
+
+        return {
+            type: params.type,
+            state: params.state,
+            invoice: params.invoice || '',
+            description: params.description || '',
+            description_hash: params.description_hash || '',
+            preimage: params.preimage || '',
+            payment_hash: params.payment_hash,
+            amount: params.amount,
+            fees_paid: params.fees_paid ?? 0,
+            settled_at: params.settled_at ?? 0,
+            created_at: params.created_at ?? now,
+            expires_at:
+                params.expires_at ??
+                (params.created_at ?? now) + DEFAULT_EXPIRY_SECONDS,
+            ...(params.metadata && { metadata: params.metadata })
+        };
+    }
+
+    static isIgnorableError(error: string): boolean {
+        const msg = error.toLowerCase();
+        return (
+            msg.includes('already paid') ||
+            msg.includes('already been settled') ||
+            msg.includes('invoice expired') ||
+            msg.includes('has expired') ||
+            msg.includes('not payable') ||
+            msg.includes('invoice canceled') ||
+            msg.includes('invoice cancelled')
+        );
+    }
+
+    static isInFlightPaymentStatus(
+        status: string | number | null | undefined
+    ): boolean {
+        // 1 / '1' = lnrpc.Payment.PaymentStatus.IN_FLIGHT (embedded-lnd enum + stringified)
+        return status === 'IN_FLIGHT' || status === 1 || status === '1';
+    }
+
+    static isPaymentTimedOutMessage(message?: string | null): boolean {
+        if (!message) return false;
+        const normalized = message.toLowerCase();
+        // English substring catches raw backend/LND strings; keys are locale-stable.
+        return (
+            normalized.includes('timed out') ||
+            message === 'views.SendingLightning.paymentTimedOut' ||
+            message === 'error.paymentTimedOut' ||
+            message ===
+                localeString('views.SendingLightning.paymentTimedOut') ||
+            message === localeString('error.paymentTimedOut')
+        );
+    }
+
+    /**
+     * True when a payment failed for lack of a route, the failure a lower
+     * fee cap can cause. Locale keys and their translations cover the
+     * mapped LND and LDK Node reasons; English substrings cover raw
+     * Core Lightning errors. LND's timeout reason mentions "routes to try"
+     * and is excluded.
+     */
+    static isRouteFailureMessage(message?: string | null): boolean {
+        if (!message) return false;
+        const text = message.replace(/\.$/, '');
+        const isKey = (key: string) =>
+            text === key || text === localeString(key).replace(/\.$/, '');
+        if (
+            isKey('error.failureReasonTimeout') ||
+            NostrConnectUtils.isPaymentTimedOutMessage(message)
+        ) {
+            return false;
+        }
+        if (
+            isKey('error.failureReasonNoRoute') ||
+            isKey('error.ldk.routeNotFound') ||
+            isKey('error.ldk.retriesExhausted')
+        ) {
+            return true;
+        }
+        const normalized = message.toLowerCase();
+        return [
+            'no route',
+            'route not found',
+            'find a route',
+            'ran out of routes',
+            'find a path',
+            'usable set of paths'
+        ].some((phrase) => normalized.includes(phrase));
+    }
+
+    /**
+     * Max hold when the node never lists the payment (LndHub, paginated
+     * history). Must outlast an outgoing HTLC: LND and Core Lightning allow
+     * a route time lock of up to 2016 blocks (about two weeks) by default.
+     * The invoice expiry is not used, since it does not limit how long an
+     * HTLC that was already sent stays unresolved.
+     */
+    static readonly UNRESOLVED_PAY_INVOICE_MAX_AGE_MS =
+        21 * 24 * 60 * 60 * 1000;
+
+    /** True when an unresolved pay_invoice hold should be released. */
+    static isPayInvoiceHoldAbandoned(
+        activity: ConnectionActivity,
+        nowMs: number = Date.now()
+    ): boolean {
+        if (
+            activity.type !== 'pay_invoice' ||
+            activity.payment_source === 'cashu' ||
+            activity.isBudgetDebited
+        ) {
+            return false;
+        }
+
+        const createdAt = activity.createdAt?.getTime();
+        if (!createdAt) return false;
+
+        return (
+            nowMs >=
+            createdAt + NostrConnectUtils.UNRESOLVED_PAY_INVOICE_MAX_AGE_MS
+        );
+    }
+
+    static isSettledPayment(payment: Payment): boolean {
+        return !payment.isIncomplete && !payment.isFailed;
+    }
+
+    static isListedPaymentInTransit(payment: Payment): boolean {
+        if (NostrConnectUtils.isSettledPayment(payment)) return false;
+        if (payment.isInTransit) return true;
+
+        const hasInFlightStatus =
+            NostrConnectUtils.isInFlightPaymentStatus(payment.status) ||
+            payment.status === 'pending';
+
+        return hasInFlightStatus && payment.isIncomplete && !payment.isFailed;
+    }
+
+    /** CLN listpays marks failures with status only — no htlcs/failure_reason. */
+    static isListedPaymentFailed(payment: Payment): boolean {
+        if (payment.isFailed) return true;
+        const status = payment.status;
+        return status === 'failed' || status === 'FAILED';
+    }
+
+    static paymentFailureReasonLocaleKey(
+        reason: string | number | null | undefined
+    ): string {
+        if (
+            reason == null ||
+            reason === '' ||
+            reason === 'FAILURE_REASON_NONE' ||
+            reason === lnrpc.PaymentFailureReason.FAILURE_REASON_NONE
+        ) {
+            return 'error.paymentFailed';
+        }
+        const name =
+            typeof reason === 'number'
+                ? lnrpc.PaymentFailureReason[reason]
+                : String(reason);
+        return FAILURE_REASON_LOCALE_KEYS[name] || 'error.paymentFailed';
+    }
+
+    // CLN lists one entry per pay/xpay call, so an invoice retried after a
+    // failure has the old failed attempt next to the live one. Return the
+    // attempt that decides the outcome: settled, else in flight, else the
+    // first match.
+    static findPaymentForInvoice<T extends Payment>(
+        invoice: string,
+        payments: T[],
+        paymentHash?: string | null
+    ): T | undefined {
+        const attempts = payments.filter((p) =>
+            NostrConnectUtils.matchesPaymentRequest(p, invoice, paymentHash)
+        );
+        return (
+            attempts.find((p) => NostrConnectUtils.isSettledPayment(p)) ||
+            attempts.find((p) =>
+                NostrConnectUtils.isListedPaymentInTransit(p)
+            ) ||
+            attempts[0]
+        );
+    }
+
+    // Builds a settled payment record from request-side state, for when a
+    // payment verifiably succeeded (preimage in hand) but cannot be found
+    // in the node's refreshed payments list (pagination window, indexing
+    // lag, backends with incomplete listPayments). Budget accounting must
+    // not depend on that lookup: a spend that escapes finalizePayment is
+    // never debited.
+    static buildSettledPaymentFallback({
+        invoice,
+        payment_source,
+        amountSats,
+        preimage,
+        feeSats,
+        paymentHash
+    }: {
+        invoice: string;
+        payment_source: 'lightning' | 'cashu';
+        amountSats: number;
+        preimage?: string | null;
+        feeSats?: string | number | null;
+        paymentHash?: string | null;
+    }): Payment | CashuPayment {
+        const data = {
+            payment_request: invoice,
+            ...(paymentHash ? { payment_hash: paymentHash } : {}),
+            ...(preimage ? { payment_preimage: preimage } : {}),
+            value_sat: amountSats,
+            ...(feeSats ? { fee_sat: feeSats.toString() } : {}),
+            status: 'SUCCEEDED',
+            creation_date: Math.floor(Date.now() / 1000).toString()
+        };
+        return payment_source === 'cashu'
+            ? new CashuPayment(data)
+            : new Payment(data);
+    }
+
+    static findInTransitPaymentForInvoice<T extends Payment>(
+        invoice: string,
+        payments: T[],
+        paymentHash?: string | null
+    ): T | undefined {
+        return payments.find(
+            (p) =>
+                NostrConnectUtils.matchesPaymentRequest(
+                    p,
+                    invoice,
+                    paymentHash
+                ) && NostrConnectUtils.isListedPaymentInTransit(p)
+        );
+    }
+
+    private static matchesPaymentRequest(
+        payment: Payment,
+        invoice: string,
+        paymentHash?: string | null
+    ): boolean {
+        return (
+            payment.getPaymentRequest === invoice ||
+            (!!paymentHash && payment.paymentHash === paymentHash)
+        );
+    }
+
+    static isTransactionsStorePaymentInTransit(state: {
+        status: string | number | null;
+        isIncomplete: boolean | null;
+        error: boolean;
+        payment_error: string | null;
+        loading: boolean;
+    }): boolean {
+        if (NostrConnectUtils.isInFlightPaymentStatus(state.status)) {
+            return true;
+        }
+
+        return (
+            state.isIncomplete === true &&
+            !state.error &&
+            !state.payment_error &&
+            !state.loading
+        );
+    }
+
+    /**
+     * Whole-sat budget debit for a fee that may be fractional (msat / 1000).
+     * Round to nearest sat; do not use for NIP-47 fees_paid.
+     */
+    static resolveFeeSats(fee: string | number | null | undefined): number {
+        const raw = Number(fee);
+        if (!Number.isFinite(raw) || raw <= 0) return 0;
+        return Math.round(raw);
+    }
+
+    static resolveLightningPaymentInTransit({
+        invoice,
+        payments,
+        paymentHash,
+        paymentState
+    }: {
+        invoice: string;
+        payments: Payment[];
+        paymentHash?: string | null;
+        paymentState: {
+            status: string | number | null;
+            isIncomplete: boolean | null;
+            error: boolean;
+            payment_error: string | null;
+            loading: boolean;
+        };
+    }): { inTransit: boolean; payment?: Payment } {
+        if (
+            NostrConnectUtils.isTransactionsStorePaymentInTransit(paymentState)
+        ) {
+            const payment =
+                NostrConnectUtils.findInTransitPaymentForInvoice(
+                    invoice,
+                    payments,
+                    paymentHash
+                ) ||
+                NostrConnectUtils.findPaymentForInvoice(
+                    invoice,
+                    payments,
+                    paymentHash
+                );
+
+            if (payment && NostrConnectUtils.isSettledPayment(payment)) {
+                return { inTransit: false, payment };
+            }
+
+            return { inTransit: true, payment };
+        }
+
+        const timedOutOrStillLoading =
+            NostrConnectUtils.isPaymentTimedOutMessage(
+                paymentState.payment_error
+            ) || paymentState.loading;
+
+        if (timedOutOrStillLoading || paymentState.isIncomplete) {
+            const listed = NostrConnectUtils.findPaymentForInvoice(
+                invoice,
+                payments,
+                paymentHash
+            );
+            if (listed && NostrConnectUtils.isSettledPayment(listed)) {
+                return { inTransit: false, payment: listed };
+            }
+            // Timeout / still-loading with no listed outcome: the HTLC may
+            // still settle. Treat as in-flight so budget is held via
+            // pendingSpendSats instead of recording a terminal failure.
+            if (
+                timedOutOrStillLoading &&
+                (!listed || NostrConnectUtils.isListedPaymentInTransit(listed))
+            ) {
+                return { inTransit: true, payment: listed };
+            }
+            if (listed && NostrConnectUtils.isListedPaymentInTransit(listed)) {
+                return { inTransit: true, payment: listed };
+            }
+            // Checked after in-transit so a payment the node still lists as
+            // in flight keeps its budget hold
+            if (listed && NostrConnectUtils.isListedPaymentFailed(listed)) {
+                return { inTransit: false, payment: listed };
+            }
+        }
+
+        return { inTransit: false };
+    }
+
+    private static extractInvoiceFromActivity(
+        activity: ConnectionActivity
+    ): string {
+        if (activity.invoice?.getPaymentRequest) {
+            return activity.invoice.getPaymentRequest;
+        }
+        if (activity.payment?.getPaymentRequest) {
+            return activity.payment.getPaymentRequest;
+        }
+        return activity.id || '';
+    }
+
+    private static extractPaymentHashFromActivity(
+        activity: ConnectionActivity
+    ): string {
+        if (activity.paymentHash) {
+            return activity.paymentHash;
+        }
+        if (activity.payment?.paymentHash) {
+            return activity.payment.paymentHash;
+        }
+        if (activity.invoice) {
+            const invoiceHash =
+                (activity.invoice as Invoice).getRHash ||
+                (activity.invoice as Invoice).payment_hash;
+            if (invoiceHash) return invoiceHash;
+        }
+        // activity.id holds the payment request, which is not a payment hash
+        return '';
+    }
+
+    private static extractAmountFromActivity(
+        activity: ConnectionActivity
+    ): number {
+        if (activity.satAmount !== undefined) {
+            return satsToMillisats(activity.satAmount);
+        }
+
+        if (activity.payment?.getAmount !== undefined) {
+            return satsToMillisats(Number(activity.payment.getAmount) || 0);
+        }
+
+        if (activity.invoice) {
+            const invoiceAmount = activity.invoice.getAmount;
+            if (invoiceAmount !== undefined && invoiceAmount !== null) {
+                return satsToMillisats(Number(invoiceAmount));
+            }
+
+            const invoiceObj = activity.invoice as any;
+            if (invoiceObj?.decoded?.satoshis !== undefined) {
+                return satsToMillisats(Number(invoiceObj.decoded.satoshis));
+            }
+            if (invoiceObj?.decoded?.millisatoshis !== undefined) {
+                return Number(invoiceObj.decoded.millisatoshis);
+            }
+            if (invoiceObj?.amount !== undefined) {
+                return satsToMillisats(Number(invoiceObj.amount));
+            }
+        }
+
+        return 0;
+    }
+
+    private static extractCreatedAtFromActivity(
+        activity: ConnectionActivity
+    ): number {
+        const now = Math.floor(Date.now() / 1000);
+
+        if (activity.invoice) {
+            const invoiceObj = activity.invoice as any;
+            if (invoiceObj?.decoded?.timestamp !== undefined) {
+                return Number(invoiceObj.decoded.timestamp);
+            }
+            if (invoiceObj?.getTimestamp) {
+                return Number(invoiceObj.getTimestamp);
+            }
+            if (invoiceObj?.created_at) {
+                return Number(invoiceObj.created_at);
+            }
+            if (invoiceObj?.creation_date) {
+                return Number(invoiceObj.creation_date);
+            }
+        }
+        if (activity.payment) {
+            const paymentObj = activity.payment as any;
+            if (paymentObj?.getTimestamp) {
+                return Number(paymentObj.getTimestamp);
+            }
+            if (paymentObj?.created_at) {
+                return Number(paymentObj.created_at);
+            }
+            if (paymentObj?.creation_date) {
+                return Number(paymentObj.creation_date);
+            }
+            if (paymentObj?.timestamp) {
+                return Number(paymentObj.timestamp);
+            }
+        }
+
+        return now;
+    }
+    private static extractExpiresAtFromActivity(
+        activity: ConnectionActivity
+    ): number {
+        const explicitExpiresAt = Number(activity?.expiresAt);
+        if (explicitExpiresAt > 0) {
+            return explicitExpiresAt;
+        }
+
+        if (activity.invoice) {
+            const lightningInvoice = NostrConnectUtils.coerceLightningInvoice(
+                activity.invoice
+            );
+            if (lightningInvoice) {
+                const createdAt = Math.floor(
+                    lightningInvoice.getCreationDate.getTime() / 1000
+                );
+                return NostrConnectUtils.lightningInvoiceExpiresAt(
+                    lightningInvoice,
+                    createdAt
+                );
+            }
+            if (activity.invoice.expires_at) {
+                return Number(activity.invoice.expires_at);
+            }
+            if (activity.invoice.expiry) {
+                return Number(activity.invoice.expiry);
+            }
+            const invoiceObj = activity.invoice as any;
+            if (invoiceObj?.decoded?.timeExpireDate) {
+                return Number(invoiceObj.decoded.timeExpireDate);
+            }
+        }
+
+        return 0;
+    }
+
+    private static extractSettledAtFromActivity(
+        activity: ConnectionActivity
+    ): number {
+        if (activity.invoice) {
+            const invoiceObj = activity.invoice as any;
+            if (invoiceObj?.settled_at) {
+                return Number(invoiceObj.settled_at);
+            }
+            if (invoiceObj?.settle_date) {
+                return Number(invoiceObj.settle_date);
+            }
+            if (invoiceObj?.paid_at) {
+                return Number(invoiceObj.paid_at);
+            }
+            if (invoiceObj?.settleDate) {
+                const settleDate = invoiceObj.settleDate;
+                if (settleDate instanceof Date) {
+                    return Math.floor(settleDate.getTime() / 1000);
+                }
+                return Number(settleDate);
+            }
+        }
+
+        if (activity.payment) {
+            const paymentObj = activity.payment as any;
+            if (paymentObj?.getTimestamp) {
+                return Number(paymentObj.getTimestamp);
+            }
+            if (paymentObj?.created_at) {
+                return Number(paymentObj.created_at);
+            }
+            if (paymentObj?.creation_date) {
+                return Number(paymentObj.creation_date);
+            }
+            if (paymentObj?.timestamp) {
+                return Number(paymentObj.timestamp);
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * Converts a ConnectionActivity to a NIP-47 transaction
+     * @param activity - Connection activity to convert
+     * @returns NIP-47 transaction object
+     */
+    static convertConnectionActivityToNip47Transaction(
+        activity: ConnectionActivity
+    ): Nip47Transaction {
+        const type: 'incoming' | 'outgoing' =
+            activity.type === 'make_invoice' ? 'incoming' : 'outgoing';
+
+        const state: 'settled' | 'pending' | 'failed' =
+            activity.status === 'success'
+                ? 'settled'
+                : activity.status === 'failed' || activity.status === 'expired'
+                ? 'failed'
+                : 'pending';
+
+        const invoice = NostrConnectUtils.extractInvoiceFromActivity(activity);
+        const paymentHash =
+            NostrConnectUtils.extractPaymentHashFromActivity(activity);
+        const amount = NostrConnectUtils.extractAmountFromActivity(activity);
+        const created_at =
+            NostrConnectUtils.extractCreatedAtFromActivity(activity);
+        const expires_at =
+            NostrConnectUtils.extractExpiresAtFromActivity(activity);
+
+        const feesPaid = activity.fees_paid
+            ? satsToMillisats(activity.fees_paid)
+            : activity.payment
+            ? satsToMillisats(Number(activity.payment.getFee) || 0)
+            : 0;
+
+        const lightningInvoice =
+            activity.payment_source === 'cashu'
+                ? undefined
+                : NostrConnectUtils.coerceLightningInvoice(activity.invoice);
+
+        const description =
+            activity.invoice?.getMemo || activity.payment?.getMemo || '';
+
+        const description_hash = lightningInvoice?.getDescriptionHash || '';
+
+        const preimage =
+            activity.preimage ||
+            activity.payment?.getPreimage ||
+            (lightningInvoice?.isPaid ? lightningInvoice.getRPreimage : '') ||
+            '';
+
+        const settled_at =
+            state === 'settled'
+                ? NostrConnectUtils.extractSettledAtFromActivity(activity) ||
+                  created_at
+                : 0;
+
+        return NostrConnectUtils.createNip47Transaction({
+            type,
+            state,
+            invoice,
+            payment_hash: paymentHash,
+            amount,
+            description,
+            description_hash,
+            preimage,
+            fees_paid: feesPaid,
+            settled_at,
+            created_at,
+            expires_at
+        });
+    }
+
+    /**
+     * Filters and paginates NIP-47 transactions based on request parameters
+     * @param transactions - Array of transactions to filter
+     * @param request - Filter and pagination parameters
+     * @returns Filtered and paginated transactions with total count
+     */
+    static filterAndPaginateTransactions(
+        transactions: Nip47Transaction[],
+        request: Nip47ListTransactionsRequest
+    ): {
+        transactions: Nip47Transaction[];
+        totalCount: number;
+    } {
+        let filtered = [...transactions];
+
+        // Filter by type
+        if (request.type && request.type.trim() !== '') {
+            filtered = filtered.filter((tx) => tx.type === request.type);
+        }
+
+        // Filter by from timestamp
+        if (request.from) {
+            filtered = filtered.filter((tx) => tx.created_at >= request.from!);
+        }
+
+        // Filter by until timestamp
+        if (request.until) {
+            filtered = filtered.filter((tx) => tx.created_at <= request.until!);
+        }
+
+        // NIP-47 defines unpaid as "include unpaid invoices, default false", so
+        // it widens the result rather than selecting only unpaid ones
+        if (!request.unpaid) {
+            filtered = filtered.filter((tx) => tx.state === 'settled');
+        }
+
+        // Calculate pagination
+        const totalCount = filtered.length;
+        const offset = Math.max(0, request.offset || 0);
+        const MAX_LIMIT = 1000;
+        const limit = request.limit
+            ? Math.min(request.limit, MAX_LIMIT)
+            : Math.min(totalCount, MAX_LIMIT);
+
+        // Apply pagination
+        const paginated = filtered.slice(offset, offset + limit);
+
+        return {
+            transactions: paginated,
+            totalCount
+        };
+    }
+    static buildWalletConnectConnectionUrl(
+        walletPubKeyHex: string,
+        relayUrl: string,
+        connectionSecretKeyHex: string,
+        lud16?: string | null
+    ): string {
+        let url = `nostr+walletconnect://${walletPubKeyHex}?relay=${relayUrl}&secret=${connectionSecretKeyHex}`;
+        if (lud16) {
+            url += `&lud16=${lud16}`;
+        }
+        return url;
+    }
+
+    static generateConnectionSecret(
+        walletPubKeyHex: string,
+        relayUrl: string,
+        lud16?: string | null
+    ): {
+        connectionUrl: string;
+        connectionPrivateKey: string;
+        connectionPublicKey: string;
+    } {
+        const connectionSecretKey = generateSecretKey();
+        const connectionPrivateKey = bytesToHex(connectionSecretKey);
+        const connectionPublicKey = getPublicKey(connectionSecretKey);
+        const connectionUrl = NostrConnectUtils.buildWalletConnectConnectionUrl(
+            walletPubKeyHex,
+            relayUrl,
+            connectionPrivateKey,
+            lud16
+        );
+        return {
+            connectionUrl,
+            connectionPrivateKey,
+            connectionPublicKey
+        };
+    }
+
+    static notifyOutgoingNwcPayment(
+        amountSats: number,
+        connectionDisplayName: string
+    ): void {
+        const amountLabel = numberWithCommas(amountSats.toString());
+        const unit = localeString('general.sats');
+        const title = localeString(NWC_TRAY_NOTIFICATION_KEYS.outgoingTitle);
+        const body = localeString(NWC_TRAY_NOTIFICATION_KEYS.outgoingBody, {
+            amount: amountLabel,
+            unit,
+            connectionName: connectionDisplayName
+        });
+        NostrConnectUtils.emitOsNotification(title, body);
+    }
+
+    static notifyOutgoingNwcPaymentFailed(
+        amountSats: number,
+        connectionDisplayName: string,
+        connectionId: string,
+        failedActivityId: string
+    ): void {
+        const amountLabel = numberWithCommas(amountSats.toString());
+        const unit = localeString('general.sats');
+        const title = localeString(
+            NWC_TRAY_NOTIFICATION_KEYS.outgoingFailedTitle
+        );
+        const body = localeString(
+            NWC_TRAY_NOTIFICATION_KEYS.outgoingFailedBody,
+            {
+                amount: amountLabel,
+                unit,
+                connectionName: connectionDisplayName
+            }
+        );
+        const k = NWC_ACTIVITY_NOTIF_KEYS;
+        const extras: Record<string, string> = {
+            [k.action]: k.openActivity,
+            [k.connectionId]: connectionId,
+            [k.failedActivityId]: failedActivityId
+        };
+        NostrConnectUtils.emitOsNotification(title, body, extras);
+    }
+
+    static notifyNwcInvoiceReady(
+        amountSats: number,
+        connectionDisplayName: string,
+        description?: string
+    ): void {
+        const amountLabel = numberWithCommas(amountSats.toString());
+        const unit = localeString('general.sats');
+        const title = localeString(
+            NWC_TRAY_NOTIFICATION_KEYS.invoiceReadyTitle
+        );
+        let body: string;
+        if (description) {
+            body = localeString(
+                NWC_TRAY_NOTIFICATION_KEYS.invoiceReadyBodyWithDescription,
+                {
+                    amount: amountLabel,
+                    unit,
+                    connectionName: connectionDisplayName,
+                    description
+                }
+            );
+        } else {
+            body = localeString(NWC_TRAY_NOTIFICATION_KEYS.invoiceReadyBody, {
+                amount: amountLabel,
+                unit,
+                connectionName: connectionDisplayName
+            });
+        }
+        NostrConnectUtils.emitOsNotification(title, body);
+    }
+
+    private static emitOsNotification(
+        title: string,
+        body: string,
+        extraPayload?: Record<string, string>
+    ): void {
+        const base = { title, body, ...extraPayload };
+        if (Platform.OS === 'android') {
+            // @ts-ignore:next-line
+            Notifications.postLocalNotification(base);
+        } else if (Platform.OS === 'ios') {
+            // @ts-ignore:next-line
+            Notifications.postLocalNotification({
+                ...base,
+                sound: 'chime.aiff'
+            });
+        }
+    }
+
+    static createNip47Error(
+        message: string,
+        code: Nip47ErrorCode = Nip47ErrorCode.INTERNAL_ERROR
+    ): {
+        result: undefined;
+        error: {
+            code: Nip47ErrorCode;
+            message: string;
+        };
+    } {
+        return {
+            result: undefined,
+            error: {
+                code,
+                message
+            }
+        };
+    }
+
+    /** Integer sats ≥ 0 from a scalar field on a decoded payreq payload. */
+    private static nonNegativeSats(value: unknown): number {
+        return Math.max(0, Math.floor(Number(value) || 0));
+    }
+
+    /**
+     * Sats from the Lightning wallet payreq decode (num_satoshis, satoshis,
+     * millisatoshis) — same shape as decodePaymentRequest / typical LND decode fields.
+     */
+    private static satsFromLightningDecodedPayReq(decodedPayReq: any): number {
+        if (!decodedPayReq || typeof decodedPayReq !== 'object') {
+            return 0;
+        }
+
+        const { nonNegativeSats: n } = NostrConnectUtils;
+
+        const fromNumSat = n(decodedPayReq.num_satoshis);
+        if (fromNumSat > 0) {
+            return fromNumSat;
+        }
+        if (decodedPayReq.satoshis !== undefined) {
+            const fromSat = n(decodedPayReq.satoshis);
+            if (fromSat > 0) {
+                return fromSat;
+            }
+        }
+        // a sub-sat amount is still an amount: never report it as none
+        // num_msat: LND, millisatoshis: bolt11 decode, amount_msat: CLN
+        // (a number, or "500msat" on older versions)
+        for (const msats of [
+            decodedPayReq.num_msat,
+            decodedPayReq.millisatoshis,
+            decodedPayReq.amount_msat
+        ]) {
+            const ms = Number(String(msats ?? '').replace(/msat$/, '')) || 0;
+            if (ms > 0) {
+                return Math.max(1, millisatsToSats(ms));
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Amount in sats from a decoded payreq / Invoice (Cashu getPayReq, bolt11 decode, etc.).
+     * Prefer getRequestAmount when present, then getAmount, then raw BOLT11 fields.
+     */
+    static payInvoiceAmountSatsFromDecodedInvoice(invoice: any): number {
+        if (!invoice) return 0;
+
+        const { nonNegativeSats: n } = NostrConnectUtils;
+
+        let sats = n(invoice.getRequestAmount);
+        if (sats <= 0) {
+            sats = n(invoice.getAmount);
+        }
+        if (sats <= 0 && invoice.satoshis != null) {
+            sats = n(invoice.satoshis);
+        }
+        if (sats <= 0 && invoice.num_satoshis != null) {
+            sats = n(invoice.num_satoshis);
+        }
+        if (sats <= 0 && invoice.millisatoshis != null) {
+            const ms = Number(invoice.millisatoshis) || 0;
+            if (ms > 0) {
+                sats = millisatsToSats(ms);
+            }
+        }
+        return sats;
+    }
+
+    private static satsFromRequestedMsat(requestedMsat: unknown): number {
+        if (
+            typeof requestedMsat !== 'number' ||
+            !Number.isFinite(requestedMsat) ||
+            requestedMsat <= 0 ||
+            requestedMsat % 1000 !== 0
+        ) {
+            return 0;
+        }
+        return millisatsToSats(requestedMsat);
+    }
+
+    /**
+     * Single resolver for NWC pay_invoice: Lightning (wallet payreq decode) or
+     * Cashu (decoded Invoice / payreq model).
+     */
+    static async resolvePayInvoiceAmount(params: {
+        paymentRequest: string;
+        /** Lightning: object from decodePaymentRequest */
+        lightningDecodedPayReq?: any;
+        /** Cashu: Invoice (or similar) from getPayReq */
+        decodedInvoice?: any;
+        /** Lightning: request `amount` (msat), used for zero-amount invoices */
+        requestedAmountMsat?: number;
+    }): Promise<{ amountSats: number; zeroAmountInvoice: boolean }> {
+        const {
+            paymentRequest,
+            lightningDecodedPayReq,
+            decodedInvoice,
+            requestedAmountMsat
+        } = params;
+
+        if (lightningDecodedPayReq) {
+            const fromLightning =
+                NostrConnectUtils.satsFromLightningDecodedPayReq(
+                    lightningDecodedPayReq
+                );
+            if (fromLightning > 0) {
+                return { amountSats: fromLightning, zeroAmountInvoice: false };
+            }
+            const { amount, amountMsat } =
+                await NostrConnectUtils.decodeInvoiceTags(paymentRequest);
+            if (amount > 0 || (amountMsat ?? 0) > 0) {
+                if (__DEV__) {
+                    console.log(
+                        'NWC: Lightning decode had no amount; using BOLT11 tags (msat):',
+                        amountMsat ?? amount * 1000
+                    );
+                }
+                // a sub-sat amount is still an amount
+                return {
+                    amountSats: Math.max(1, amount),
+                    zeroAmountInvoice: false
+                };
+            }
+            return {
+                amountSats:
+                    NostrConnectUtils.satsFromRequestedMsat(
+                        requestedAmountMsat
+                    ),
+                zeroAmountInvoice: true
+            };
+        }
+
+        const fromDecoded =
+            NostrConnectUtils.payInvoiceAmountSatsFromDecodedInvoice(
+                decodedInvoice
+            );
+        if (fromDecoded > 0) {
+            return { amountSats: fromDecoded, zeroAmountInvoice: false };
+        }
+        const { amount } = await NostrConnectUtils.decodeInvoiceTags(
+            paymentRequest
+        );
+        return {
+            amountSats: amount > 0 ? amount : 0,
+            zeroAmountInvoice: false
+        };
+    }
+
+    static async getPayInvoiceAmountSats(params: {
+        paymentRequest: string;
+        lightningDecodedPayReq?: any;
+        decodedInvoice?: any;
+        requestedAmountMsat?: number;
+    }): Promise<number> {
+        return (await NostrConnectUtils.resolvePayInvoiceAmount(params))
+            .amountSats;
+    }
+
+    static async pingRelay(relayUrl: string): Promise<{
+        status: boolean;
+        error?: string | null;
+    }> {
+        let relay: Relay | undefined;
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+        try {
+            relay = new Relay(relayUrl);
+            const timeout = new Promise<void>((_, reject) => {
+                timeoutId = setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                localeString(
+                                    'views.Settings.NostrWalletConnect.connectionTimeout'
+                                )
+                            )
+                        ),
+                    5000
+                );
+            });
+            await Promise.race([relay.connect(), timeout]);
+            return { status: true, error: null };
+        } catch (_e) {
+            return {
+                status: false,
+                error: localeString(
+                    'stores.NostrWalletConnectStore.error.failedToConnectRelay',
+                    { relayUrl }
+                )
+            };
+        } finally {
+            if (timeoutId !== undefined) {
+                clearTimeout(timeoutId);
+            }
+            relay?.close();
+        }
+    }
+}

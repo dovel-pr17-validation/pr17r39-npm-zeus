@@ -1,0 +1,200 @@
+import { action, observable, runInAction } from 'mobx';
+import NetworkInfo from '../models/NetworkInfo';
+import NodeInfo from '../models/NodeInfo';
+import ChannelsStore from './ChannelsStore';
+import SettingsStore from './SettingsStore';
+import { errorToUserFriendly } from '../utils/ErrorUtils';
+import BackendUtils from '../utils/BackendUtils';
+import Storage from '../storage';
+
+import Channel from '../models/Channel';
+
+export default class NodeInfoStore {
+    @observable public loading = false;
+    @observable public error = false;
+    @observable public errorMsg: string;
+    @observable public nodeInfo: NodeInfo | any = {};
+    @observable public networkInfo: NetworkInfo | any = {};
+    @observable public testnet: boolean;
+    @observable public regtest: boolean;
+    @observable public supportsOffers: boolean;
+    @observable public supportsListingOffers: boolean;
+    channelsStore: ChannelsStore;
+    settingsStore: SettingsStore;
+    // nodeIds whose legacy xprv cache has been purged this session
+    private purgedXprvCacheFor: string | null = null;
+
+    constructor(channelsStore: ChannelsStore, settingsStore: SettingsStore) {
+        this.channelsStore = channelsStore;
+        this.settingsStore = settingsStore;
+    }
+
+    @action
+    public reset = () => {
+        this.error = false;
+        this.loading = false;
+        this.nodeInfo = {};
+        this.regtest = false;
+        this.testnet = false;
+        this.errorMsg = '';
+        this.supportsOffers = false;
+        this.supportsListingOffers = false;
+    };
+
+    @action
+    public handleGetNodeInfoError = () => {
+        this.error = true;
+        this.loading = false;
+        this.nodeInfo = {};
+    };
+
+    @action
+    private handleGetNetworkInfoError = () => {
+        this.error = true;
+        this.loading = false;
+        this.networkInfo = {};
+    };
+
+    private currentRequest: any;
+
+    @action
+    public getNodeInfo = () => {
+        this.errorMsg = '';
+        this.loading = true;
+        const currentRequest = (this.currentRequest = {});
+        return new Promise((resolve, reject) => {
+            BackendUtils.getMyNodeInfo()
+                .then((data: any) => {
+                    if (this.currentRequest !== currentRequest) {
+                        // A newer getNodeInfo call superseded this one.
+                        // Settle anyway: callers like Wallet's fetchData
+                        // await this promise, and a bare return would leave
+                        // it pending forever, wedging fetchLock and the
+                        // connecting overlay until app restart.
+                        resolve('Old getNodeInfo call');
+                        return;
+                    }
+                    const nodeInfo = new NodeInfo(data);
+                    runInAction(() => {
+                        this.nodeInfo = nodeInfo;
+                        this.testnet = nodeInfo.isTestNet;
+                        this.regtest = nodeInfo.isRegTest;
+                        this.loading = false;
+                        this.error = false;
+                        this.supportsOffers = BackendUtils.supportsOffers();
+                        this.supportsListingOffers =
+                            BackendUtils.supportsListingOffers();
+                    });
+                    // Purge the legacy '<pubkey>-extended-private-keys' xprv
+                    // cache written by older builds (KEY-006). Done here,
+                    // where the node pubkey is definitionally known: the
+                    // SeedQRExport read-site purge silently no-ops when
+                    // nodeInfo has not loaded yet (observed on-device), and
+                    // this also covers users who never open that screen.
+                    if (
+                        nodeInfo.nodeId &&
+                        this.purgedXprvCacheFor !== nodeInfo.nodeId
+                    ) {
+                        this.purgedXprvCacheFor = nodeInfo.nodeId;
+                        Storage.removeItem(
+                            `${nodeInfo.nodeId}-extended-private-keys`
+                        ).catch(() => {});
+                        // Same cache, written by those builds while nodeInfo
+                        // had not loaded yet and nodeId was undefined
+                        Storage.removeItem(
+                            'undefined-extended-private-keys'
+                        ).catch(() => {});
+                    }
+                    resolve(nodeInfo);
+                })
+                .catch((error: any) => {
+                    if (this.currentRequest !== currentRequest) {
+                        resolve('Old getNodeInfo call');
+                        return;
+                    }
+                    const errorMsg = errorToUserFriendly(error.toString());
+                    runInAction(() => {
+                        this.errorMsg = errorMsg;
+                        this.handleGetNodeInfoError();
+                    });
+                    reject(error);
+                });
+        });
+    };
+
+    @action
+    public getNetworkInfo = () => {
+        this.errorMsg = '';
+        this.loading = true;
+        return BackendUtils.getNetworkInfo()
+            .then((data: any) => {
+                runInAction(() => {
+                    this.networkInfo = new NetworkInfo(data);
+                    this.loading = false;
+                    this.error = false;
+                });
+                return this.networkInfo;
+            })
+            .catch((error: any) => {
+                const errorMsg = errorToUserFriendly(error.toString());
+                runInAction(() => {
+                    this.errorMsg = errorMsg;
+                    this.handleGetNetworkInfoError();
+                });
+            });
+    };
+
+    public isLightningReadyToSend = async () => {
+        await this.channelsStore.getChannels();
+        await this.getNodeInfo();
+        const syncedToChain = this.nodeInfo?.synced_to_chain;
+
+        return (
+            syncedToChain &&
+            this.channelsStore.channels.some(
+                (channel: Channel) => channel.active
+            )
+        );
+    };
+
+    public isLightningReadyToReceive = async () => {
+        await this.channelsStore.getChannels();
+        let syncedToChain = this.nodeInfo?.synced_to_chain;
+        if (!syncedToChain) {
+            await this.getNodeInfo();
+            syncedToChain = this.nodeInfo?.synced_to_chain;
+        }
+
+        return (
+            syncedToChain &&
+            this.channelsStore.channels.some(
+                (channel: Channel) => channel.active
+            )
+        );
+    };
+
+    public flowLspNotConfigured = () => {
+        const { implementation, certVerification } = this.settingsStore;
+
+        const scidAlias =
+            this.nodeInfo.features && this.nodeInfo.features['47'];
+        const zeroConf = this.nodeInfo.features && this.nodeInfo.features['51'];
+        const zeroConfConfig = zeroConf && scidAlias;
+
+        const restIsConfigured = certVerification && zeroConfConfig;
+        const flowLspNotConfigured =
+            implementation === 'lnd'
+                ? !restIsConfigured
+                : BackendUtils.isLocalWallet()
+                ? false
+                : true;
+
+        return {
+            flowLspNotConfigured,
+            restIsConfigured,
+            zeroConfConfig,
+            zeroConf,
+            scidAlias
+        };
+    };
+}

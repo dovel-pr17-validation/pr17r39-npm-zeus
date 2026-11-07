@@ -1,0 +1,1117 @@
+import * as React from 'react';
+import {
+    Alert,
+    ScrollView,
+    StyleSheet,
+    Text,
+    View,
+    TouchableOpacity,
+    ActivityIndicator
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import MaterialIcons from '@react-native-vector-icons/material-icons';
+
+import Header from '../../components/Header';
+import Screen from '../../components/Screen';
+import CopyButton from '../../components/CopyButton';
+import Switch from '../../components/Switch';
+import TextInput from '../../components/TextInput';
+
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import {
+    DEFAULT_POLICY_BASE_FEE_MSAT,
+    DEFAULT_POLICY_FEE_RATE_PPM,
+    DEFAULT_POLICY_TIME_LOCK_DELTA
+} from '../../utils/ChannelEdgeRepairUtils';
+
+import SettingsStore, { Implementations } from '../../stores/SettingsStore';
+import Accordion from '../../components/Accordion';
+
+interface DeveloperToolsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+}
+
+interface DeveloperToolsState {
+    selectedCommand: string | null;
+    loading: boolean;
+    response: string | null;
+    error: string | null;
+    /** Which Developer Tools category accordions are expanded (key = category title) */
+    categoryAccordionOpen: Record<string, boolean>;
+    showScrollTop: boolean;
+    showScrollBottom: boolean;
+    contentHeight: number;
+    scrollViewHeight: number;
+}
+
+interface CategoryProps {
+    title: string;
+    commands: DeveloperCommand[];
+    selectedCommand: string | null;
+    onCommand: (
+        command: string,
+        param?: string | Array<string | boolean | object | undefined>
+    ) => Promise<void>;
+    implementation: Implementations;
+    open: boolean;
+    onAccordionToggle: (next: boolean) => void;
+}
+
+interface CommandProps {
+    command: string;
+    onTap: (
+        command: string,
+        param?: string | Array<string | boolean | object | undefined>
+    ) => Promise<void>;
+    selected: boolean;
+}
+
+interface CommandState {
+    subItems?: Array<{
+        commandParameters: any;
+        label: string;
+        channelInfo?: {
+            chanId: string;
+            remotePubkey: string;
+            outpoint: string;
+        };
+    }>;
+    selectedSubItemIndex?: number;
+    loading: boolean;
+    expanded: boolean;
+    pendingFundingShimOnly?: boolean;
+    iKnowWhatIAmDoing?: boolean;
+    baseFeeMsat: string;
+    feeRatePpm: string;
+    timeLockDelta: string;
+    minHtlcMsat: string;
+    maxHtlcMsat: string;
+    createMissingEdge?: boolean;
+}
+
+interface ResponseContainerProps {
+    title: string;
+    content: string;
+    type: 'response' | 'error';
+}
+
+interface DeveloperCommand {
+    name: string;
+    compatibleImplementations: Implementations[];
+}
+
+const categories: Array<{
+    title: string;
+    commands: DeveloperCommand[];
+}> = [
+    {
+        title: 'General',
+        commands: [
+            {
+                name: 'getMyNodeInfo',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getNetworkInfo',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            }
+        ]
+    },
+    {
+        title: 'Lightning',
+        commands: [
+            {
+                name: 'getLightningBalance',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lndhub',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getInvoices',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lndhub',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getPayments',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lndhub',
+                    'lightning-node-connect'
+                ]
+            }
+        ]
+    },
+    {
+        title: 'On-chain',
+        commands: [
+            {
+                name: 'getBlockchainBalance',
+                compatibleImplementations: [
+                    'lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getTransactions',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getUTXOs',
+                compatibleImplementations: [
+                    'lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getNewAddress',
+                compatibleImplementations: ['lnd', 'cln-rest']
+            },
+            {
+                name: 'listAccounts',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'listAddresses',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            }
+        ]
+    },
+    {
+        title: 'Channels',
+        commands: [
+            {
+                name: 'getChannels',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getPendingChannels',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getClosedChannels',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getChannelInfo',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getFees',
+                compatibleImplementations: [
+                    'lnd',
+                    'cln-rest',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'getForwardingHistory',
+                compatibleImplementations: ['lnd', 'lightning-node-connect']
+            },
+            {
+                name: 'abandonChannel',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            },
+            {
+                name: 'updateChannelPolicy',
+                compatibleImplementations: [
+                    'lnd',
+                    'embedded-lnd',
+                    'lightning-node-connect'
+                ]
+            }
+        ]
+    }
+];
+
+const ResponseContainer = ({
+    title,
+    content,
+    type
+}: ResponseContainerProps) => (
+    <View
+        style={[
+            styles.responseContainer,
+            { backgroundColor: themeColor('secondary') }
+        ]}
+    >
+        <View style={styles.responseContainerHeaderRow}>
+            <Text
+                style={[
+                    styles.responseTitle,
+                    {
+                        color:
+                            type === 'error'
+                                ? themeColor('error')
+                                : themeColor('secondaryText')
+                    }
+                ]}
+            >
+                {localeString(title)}:
+            </Text>
+            <CopyButton copyValue={content} iconOnly={true} iconSize={20} />
+        </View>
+        <Text style={[styles.responseText, { color: themeColor('text') }]}>
+            {content}
+        </Text>
+    </View>
+);
+
+class Command extends React.Component<CommandProps, CommandState> {
+    private commandsWithSubItems = [
+        'getChannelInfo',
+        'abandonChannel',
+        'updateChannelPolicy'
+    ];
+
+    state: CommandState = {
+        loading: false,
+        expanded: false,
+        pendingFundingShimOnly: false,
+        iKnowWhatIAmDoing: false,
+        baseFeeMsat: DEFAULT_POLICY_BASE_FEE_MSAT,
+        feeRatePpm: String(DEFAULT_POLICY_FEE_RATE_PPM),
+        timeLockDelta: String(DEFAULT_POLICY_TIME_LOCK_DELTA),
+        minHtlcMsat: '',
+        maxHtlcMsat: '',
+        createMissingEdge: false
+    };
+
+    private loadSubItems = async () => {
+        if (this.commandsWithSubItems.includes(this.props.command)) {
+            this.setState({ loading: true });
+            try {
+                const response = await BackendUtils.call('getChannels');
+                const channels = response.channels || [];
+                const subItems = channels.map((channel: any) => {
+                    const label = `Channel ${channel.chan_id} (${channel.remote_pubkey})`;
+
+                    if (this.props.command === 'updateChannelPolicy') {
+                        return {
+                            label,
+                            commandParameters: [
+                                channel.channel_point || '',
+                                channel.local_constraints?.max_pending_amt_msat?.toString() ||
+                                    ''
+                            ]
+                        };
+                    } else if (this.props.command === 'abandonChannel') {
+                        // Parse channel_point (format: "txid:index") for abandonChannel
+                        const channelPoint = channel.channel_point || '';
+                        const [fundingTxId, outputIndex] =
+                            channelPoint.split(':');
+                        return {
+                            label,
+                            commandParameters: [
+                                fundingTxId,
+                                outputIndex || '0'
+                            ],
+                            channelInfo: {
+                                chanId: channel.chan_id,
+                                remotePubkey: channel.remote_pubkey,
+                                outpoint: channelPoint
+                            }
+                        };
+                    } else {
+                        // Use chan_id for getChannelInfo
+                        return {
+                            label,
+                            commandParameters: [channel.chan_id]
+                        };
+                    }
+                });
+                if (this.props.command === 'updateChannelPolicy') {
+                    subItems.unshift({
+                        label: localeString(
+                            'views.Tools.developerTools.updateChannelPolicy.global'
+                        ),
+                        commandParameters: ['global']
+                    });
+                }
+                this.setState({ subItems, loading: false });
+            } catch (error) {
+                console.error('Error loading channels:', error);
+                this.setState({ loading: false, expanded: false });
+            }
+        }
+    };
+
+    private onCommandTap(command: string): void {
+        if (this.commandsWithSubItems.includes(command)) {
+            if (!this.state.expanded) {
+                this.loadSubItems();
+            }
+            this.setState({ expanded: !this.state.expanded });
+        } else {
+            this.props.onTap(command);
+        }
+    }
+
+    private onSubItemTap(
+        command: string,
+        commandParameters: any,
+        selectedSubItemIndex: number,
+        channelInfo?: { chanId: string; remotePubkey: string; outpoint: string }
+    ): void {
+        this.setState({ selectedSubItemIndex });
+        if (command === 'updateChannelPolicy') {
+            const {
+                baseFeeMsat,
+                feeRatePpm,
+                timeLockDelta,
+                minHtlcMsat,
+                maxHtlcMsat,
+                createMissingEdge
+            } = this.state;
+
+            const data: any = {
+                base_fee_msat: baseFeeMsat || '0',
+                fee_rate_ppm: Number(feeRatePpm) || 0,
+                time_lock_delta: Number(timeLockDelta) || 0
+            };
+            if (minHtlcMsat) {
+                data.min_htlc_msat = minHtlcMsat;
+                data.min_htlc_msat_specified = true;
+            }
+            if (maxHtlcMsat) {
+                data.max_htlc_msat = maxHtlcMsat;
+            } else if (createMissingEdge && commandParameters[1]) {
+                // lnd recreates a missing edge with max_htlc 0, and a blank
+                // max_htlc_msat means "keep current", so the update fails
+                // validation (min_htlc > max_htlc 0) unless we supply the
+                // channel's negotiated max in-flight amount
+                data.max_htlc_msat = commandParameters[1];
+            }
+            if (createMissingEdge) data.create_missing_edge = true;
+
+            if (commandParameters[0] === 'global') {
+                data.global = true;
+            } else {
+                const [fundingTxId, outputIndex] =
+                    commandParameters[0].split(':');
+                data.chan_point = {
+                    funding_txid_str: fundingTxId,
+                    output_index: Number(outputIndex) || 0
+                };
+            }
+
+            this.props.onTap(command, [data]);
+            return;
+        }
+        // For abandonChannel, include boolean parameters only if explicitly set to true
+        if (command === 'abandonChannel' && channelInfo) {
+            const params: Array<string | boolean | undefined> = [
+                ...commandParameters
+            ];
+            // Only include boolean params if they are explicitly true
+            // Pass undefined if false so backends can check for !== undefined
+            params.push(
+                this.state.pendingFundingShimOnly === true ? true : undefined
+            );
+            params.push(
+                this.state.iKnowWhatIAmDoing === true ? true : undefined
+            );
+
+            // Show confirmation dialog before abandoning channel
+            const details = [
+                `${localeString('views.Channel.channelId')}: ${
+                    channelInfo.chanId
+                }`,
+                `${localeString('views.NodeInfo.pubkey')}: ${
+                    channelInfo.remotePubkey
+                }`,
+                `${localeString('views.Channel.channelPoint')}: ${
+                    channelInfo.outpoint
+                }`
+            ].join('\n\n');
+
+            Alert.alert(
+                localeString('views.Tools.developerTools.abandonChannel.title'),
+                `${localeString(
+                    'views.Tools.developerTools.abandonChannel.message'
+                )}\n\n${details}`,
+                [
+                    {
+                        text: localeString('general.cancel'),
+                        style: 'cancel'
+                    },
+                    {
+                        text: localeString(
+                            'views.Tools.developerTools.abandonChannel.confirm'
+                        ),
+                        style: 'destructive',
+                        onPress: () => this.props.onTap(command, params)
+                    }
+                ]
+            );
+        } else {
+            this.props.onTap(command, commandParameters);
+        }
+    }
+
+    render() {
+        const { command, selected: isSelected } = this.props;
+        const { subItems, loading, selectedSubItemIndex, expanded } =
+            this.state;
+        const needsSubItems = this.commandsWithSubItems.includes(command);
+
+        return (
+            <View>
+                <TouchableOpacity
+                    onPress={() => this.onCommandTap(command)}
+                    style={styles.commandContainer}
+                >
+                    <Text
+                        style={{
+                            ...styles.commandText,
+                            color: isSelected
+                                ? themeColor('highlight')
+                                : themeColor('text')
+                        }}
+                    >
+                        {command}
+                    </Text>
+                </TouchableOpacity>
+
+                {expanded && needsSubItems && (subItems != null || loading) && (
+                    <View
+                        style={[{ backgroundColor: themeColor('secondary') }]}
+                    >
+                        {command === 'abandonChannel' && (
+                            <View
+                                style={[
+                                    styles.booleanParamsContainer,
+                                    {
+                                        backgroundColor:
+                                            themeColor('background')
+                                    }
+                                ]}
+                            >
+                                <View style={styles.booleanParamRow}>
+                                    <Text
+                                        style={[
+                                            styles.booleanParamLabel,
+                                            {
+                                                color: themeColor('text')
+                                            }
+                                        ]}
+                                    >
+                                        pending_funding_shim_only
+                                    </Text>
+                                    <Switch
+                                        value={
+                                            this.state.pendingFundingShimOnly ||
+                                            false
+                                        }
+                                        onValueChange={(value: boolean) =>
+                                            this.setState({
+                                                pendingFundingShimOnly: value
+                                            })
+                                        }
+                                    />
+                                </View>
+                                <View style={styles.booleanParamRow}>
+                                    <Text
+                                        style={[
+                                            styles.booleanParamLabel,
+                                            {
+                                                color: themeColor('text')
+                                            }
+                                        ]}
+                                    >
+                                        i_know_what_i_am_doing
+                                    </Text>
+                                    <Switch
+                                        value={
+                                            this.state.iKnowWhatIAmDoing ||
+                                            false
+                                        }
+                                        onValueChange={(value: boolean) =>
+                                            this.setState({
+                                                iKnowWhatIAmDoing: value
+                                            })
+                                        }
+                                    />
+                                </View>
+                            </View>
+                        )}
+                        {command === 'updateChannelPolicy' && (
+                            <View
+                                style={[
+                                    styles.booleanParamsContainer,
+                                    {
+                                        backgroundColor:
+                                            themeColor('background')
+                                    }
+                                ]}
+                            >
+                                {(
+                                    [
+                                        {
+                                            key: 'baseFeeMsat',
+                                            label: 'base_fee_msat'
+                                        },
+                                        {
+                                            key: 'feeRatePpm',
+                                            label: 'fee_rate_ppm'
+                                        },
+                                        {
+                                            key: 'timeLockDelta',
+                                            label: 'time_lock_delta'
+                                        },
+                                        {
+                                            key: 'minHtlcMsat',
+                                            label: 'min_htlc_msat'
+                                        },
+                                        {
+                                            key: 'maxHtlcMsat',
+                                            label: 'max_htlc_msat'
+                                        }
+                                    ] as const
+                                ).map((field) => (
+                                    <View
+                                        style={styles.textParamRow}
+                                        key={field.key}
+                                    >
+                                        <Text
+                                            style={[
+                                                styles.booleanParamLabel,
+                                                {
+                                                    color: themeColor('text')
+                                                }
+                                            ]}
+                                        >
+                                            {field.label}
+                                        </Text>
+                                        <TextInput
+                                            value={this.state[field.key]}
+                                            onChangeText={(value: string) =>
+                                                this.setState({
+                                                    [field.key]: value
+                                                } as any)
+                                            }
+                                            keyboardType="numeric"
+                                            style={styles.textParamInput}
+                                        />
+                                    </View>
+                                ))}
+                                <View style={styles.booleanParamRow}>
+                                    <Text
+                                        style={[
+                                            styles.booleanParamLabel,
+                                            {
+                                                color: themeColor('text')
+                                            }
+                                        ]}
+                                    >
+                                        create_missing_edge
+                                    </Text>
+                                    <Switch
+                                        value={
+                                            this.state.createMissingEdge ||
+                                            false
+                                        }
+                                        onValueChange={(value: boolean) =>
+                                            this.setState({
+                                                createMissingEdge: value
+                                            })
+                                        }
+                                    />
+                                </View>
+                            </View>
+                        )}
+                        {loading ? (
+                            <ActivityIndicator color={themeColor('text')} />
+                        ) : subItems!.length === 0 ? (
+                            <Text
+                                style={[
+                                    styles.subItemText,
+                                    { color: themeColor('text') }
+                                ]}
+                            >
+                                {localeString(
+                                    'views.Tools.developerTools.noItemsExist'
+                                )}
+                            </Text>
+                        ) : (
+                            subItems!.map((item, index) => (
+                                <TouchableOpacity
+                                    key={index}
+                                    onPress={() =>
+                                        this.onSubItemTap(
+                                            command,
+                                            item.commandParameters,
+                                            index,
+                                            item.channelInfo
+                                        )
+                                    }
+                                >
+                                    <Text
+                                        style={[
+                                            styles.subItemText,
+                                            {
+                                                color:
+                                                    selectedSubItemIndex ===
+                                                        index && isSelected
+                                                        ? themeColor(
+                                                              'highlight'
+                                                          )
+                                                        : themeColor('text')
+                                            }
+                                        ]}
+                                    >
+                                        {item.label}
+                                    </Text>
+                                </TouchableOpacity>
+                            ))
+                        )}
+                    </View>
+                )}
+            </View>
+        );
+    }
+}
+
+class Category extends React.Component<CategoryProps> {
+    render() {
+        const {
+            title,
+            commands,
+            onCommand,
+            implementation,
+            open,
+            onAccordionToggle
+        } = this.props;
+
+        const filteredCommands = commands.filter((c) =>
+            c.compatibleImplementations.includes(implementation)
+        );
+
+        return (
+            <Accordion
+                title={title}
+                open={open}
+                spacing="none"
+                containerStyle={{
+                    backgroundColor: themeColor('secondary')
+                }}
+                headerStyle={{ backgroundColor: themeColor('secondary') }}
+                titleStyle={{
+                    ...styles.categoryTitle,
+                    color: themeColor('text')
+                }}
+                onToggle={onAccordionToggle}
+            >
+                {filteredCommands.map((command) => (
+                    <Command
+                        key={command.name}
+                        command={command.name}
+                        onTap={onCommand}
+                        selected={this.props.selectedCommand === command.name}
+                    />
+                ))}
+            </Accordion>
+        );
+    }
+}
+
+@inject('SettingsStore')
+@observer
+export default class DeveloperTools extends React.Component<
+    DeveloperToolsProps,
+    DeveloperToolsState
+> {
+    scrollViewRef = React.createRef<ScrollView>();
+
+    state = {
+        selectedCommand: null,
+        loading: false,
+        response: null,
+        error: null,
+        categoryAccordionOpen: {} as Record<string, boolean>,
+        showScrollTop: false,
+        showScrollBottom: false,
+        contentHeight: 0,
+        scrollViewHeight: 0
+    };
+
+    handleCategoryAccordionToggle = (categoryTitle: string, next: boolean) => {
+        this.setState((prev) => {
+            const categoryAccordionOpen = {
+                ...prev.categoryAccordionOpen,
+                [categoryTitle]: next
+            };
+            const anyOpen = Object.values(categoryAccordionOpen).some(Boolean);
+            return {
+                categoryAccordionOpen,
+                response: anyOpen ? prev.response : null
+            };
+        });
+    };
+
+    handleScroll = (event: any) => {
+        const currentScrollPosition = event.nativeEvent.contentOffset.y;
+        const contentHeight = event.nativeEvent.contentSize.height;
+        const scrollViewHeight = event.nativeEvent.layoutMeasurement.height;
+        const scrollableDistance = contentHeight - scrollViewHeight;
+        const distanceFromBottom = scrollableDistance - currentScrollPosition;
+
+        this.setState({
+            showScrollTop: currentScrollPosition > 100,
+            showScrollBottom:
+                distanceFromBottom > 100 && contentHeight > scrollViewHeight,
+            contentHeight,
+            scrollViewHeight
+        });
+    };
+
+    scrollToTop = () => {
+        this.scrollViewRef.current?.scrollTo({ y: 0, animated: true });
+    };
+
+    scrollToBottom = () => {
+        const { contentHeight, scrollViewHeight } = this.state;
+        const scrollToY = Math.max(0, contentHeight - scrollViewHeight);
+        this.scrollViewRef.current?.scrollTo({ y: scrollToY, animated: true });
+    };
+
+    handleCommand = async (
+        command: string,
+        param?: string | Array<string | boolean | object | undefined>
+    ) => {
+        this.setState({
+            selectedCommand: command,
+            loading: true,
+            response: null,
+            error: null
+        });
+        try {
+            // BackendUtils.call uses .apply() which spreads arrays as arguments.
+            // For methods expecting urlParams?: Array<string>, we need to wrap the array
+            // in another array so it's passed as a single array argument.
+            // For methods expecting a single string (like getChannelInfo), pass the array as-is
+            // so the first element is extracted.
+            const commandsNeedingArrayParam = [
+                'abandonChannel',
+                'closeChannel'
+            ];
+            const args =
+                Array.isArray(param) &&
+                commandsNeedingArrayParam.includes(command)
+                    ? [param]
+                    : param;
+            const response = await BackendUtils.call(command, args);
+            this.setState({
+                loading: false,
+                response: JSON.stringify(response, null, 2)
+            });
+        } catch (error: any) {
+            this.setState({
+                loading: false,
+                error: error.message || 'Unknown error'
+            });
+        }
+    };
+
+    render() {
+        const { navigation, SettingsStore } = this.props;
+        const { loading, response, error, showScrollTop, showScrollBottom } =
+            this.state;
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Tools.developerTools.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    navigation={navigation}
+                />
+                <ScrollView
+                    ref={this.scrollViewRef}
+                    contentContainerStyle={styles.container}
+                    onScroll={this.handleScroll}
+                    onContentSizeChange={(_contentWidth, contentHeight) => {
+                        this.setState({ contentHeight });
+                    }}
+                    onLayout={(event) => {
+                        this.setState({
+                            scrollViewHeight: event.nativeEvent.layout.height
+                        });
+                    }}
+                    scrollEventThrottle={16}
+                >
+                    {categories
+                        .filter((c) =>
+                            c.commands.some((c) =>
+                                c.compatibleImplementations.includes(
+                                    SettingsStore.implementation
+                                )
+                            )
+                        )
+                        .map((category) => (
+                            <Category
+                                key={category.title}
+                                title={category.title}
+                                commands={category.commands}
+                                onCommand={this.handleCommand}
+                                selectedCommand={this.state.selectedCommand}
+                                implementation={SettingsStore.implementation}
+                                open={
+                                    this.state.categoryAccordionOpen[
+                                        category.title
+                                    ] ?? false
+                                }
+                                onAccordionToggle={(next) =>
+                                    this.handleCategoryAccordionToggle(
+                                        category.title,
+                                        next
+                                    )
+                                }
+                            />
+                        ))}
+
+                    {loading && (
+                        <View
+                            style={[
+                                styles.responseContainer,
+                                { backgroundColor: themeColor('secondary') }
+                            ]}
+                        >
+                            <ActivityIndicator color={themeColor('text')} />
+                        </View>
+                    )}
+
+                    {response && (
+                        <ResponseContainer
+                            title="general.response"
+                            content={response}
+                            type="response"
+                        />
+                    )}
+
+                    {error && (
+                        <ResponseContainer
+                            title="general.error"
+                            content={error}
+                            type="error"
+                        />
+                    )}
+                </ScrollView>
+                {showScrollTop && (
+                    <TouchableOpacity
+                        style={[
+                            styles.scrollTopButton,
+                            {
+                                backgroundColor: themeColor('secondary'),
+                                borderColor: themeColor('background')
+                            }
+                        ]}
+                        onPress={this.scrollToTop}
+                    >
+                        <MaterialIcons
+                            name="arrow-upward"
+                            size={24}
+                            color={themeColor('text')}
+                        />
+                    </TouchableOpacity>
+                )}
+                {showScrollBottom && (
+                    <TouchableOpacity
+                        style={[
+                            styles.scrollBottomButton,
+                            {
+                                backgroundColor: themeColor('secondary'),
+                                borderColor: themeColor('background')
+                            }
+                        ]}
+                        onPress={this.scrollToBottom}
+                    >
+                        <MaterialIcons
+                            name="arrow-downward"
+                            size={24}
+                            color={themeColor('text')}
+                        />
+                    </TouchableOpacity>
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    scrollTopButton: {
+        position: 'absolute',
+        bottom: 10,
+        right: 10,
+        width: 45,
+        height: 45,
+        borderRadius: 22.5,
+        justifyContent: 'center',
+        alignItems: 'center',
+        elevation: 5,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.3,
+        shadowRadius: 3.84,
+        borderWidth: 1
+    },
+    scrollBottomButton: {
+        position: 'absolute',
+        bottom: 10,
+        left: 10,
+        width: 45,
+        height: 45,
+        borderRadius: 22.5,
+        justifyContent: 'center',
+        alignItems: 'center',
+        elevation: 5,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.3,
+        shadowRadius: 3.84,
+        borderWidth: 1
+    },
+    container: {
+        gap: 10,
+        marginTop: 15,
+        width: '90%',
+        alignSelf: 'center',
+        paddingBottom: 20
+    },
+    categoryContainer: {
+        borderRadius: 10,
+        overflow: 'hidden',
+        paddingVertical: 13,
+        paddingHorizontal: 16
+    },
+    categoryTitle: {
+        fontSize: 16,
+        fontFamily: 'Zocial'
+    },
+    commandContainer: {
+        paddingTop: 12,
+        paddingLeft: 16
+    },
+    commandText: {
+        fontSize: 14,
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    subItemText: {
+        fontSize: 12,
+        fontFamily: 'PPNeueMontreal-Book',
+        paddingTop: 8,
+        paddingLeft: 32
+    },
+    booleanParamsContainer: {
+        marginTop: 8,
+        marginHorizontal: 16,
+        marginBottom: 8,
+        padding: 12,
+        borderRadius: 8
+    },
+    booleanParamRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingVertical: 8
+    },
+    booleanParamLabel: {
+        fontSize: 12,
+        fontFamily: 'PPNeueMontreal-Book',
+        flex: 1
+    },
+    textParamRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        paddingVertical: 4
+    },
+    textParamInput: {
+        height: 40,
+        width: 150
+    },
+    responseContainer: {
+        marginTop: 16,
+        padding: 16,
+        borderRadius: 10
+    },
+    responseContainerHeaderRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        alignItems: 'flex-start'
+    },
+    responseTitle: {
+        fontSize: 14,
+        fontFamily: 'PPNeueMontreal-Book',
+        fontWeight: 'bold',
+        marginBottom: 8
+    },
+    responseText: {
+        fontSize: 12,
+        fontFamily: 'DroidSansMono'
+    }
+});

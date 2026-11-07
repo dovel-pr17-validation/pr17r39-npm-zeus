@@ -1,0 +1,223 @@
+import * as React from 'react';
+import { View, Text, Alert } from 'react-native';
+import { observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+import QRKit from 'react-native-qr-kit';
+
+import LoadingIndicator from '../components/LoadingIndicator';
+import Screen from '../components/Screen';
+
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import handleAnything from '../utils/handleAnything';
+import { ShareIntentPayload } from '../utils/ShareIntentProcessor';
+
+import { settingsStore } from '../stores/Stores';
+
+interface ShareIntentProcessingProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<'ShareIntentProcessing', ShareIntentPayload>;
+}
+
+interface ShareIntentProcessingState {
+    processing: boolean;
+    currentStep: string;
+}
+
+@observer
+class ShareIntentProcessing extends React.Component<
+    ShareIntentProcessingProps,
+    ShareIntentProcessingState
+> {
+    state = {
+        processing: true,
+        currentStep: localeString('utils.shareIntent.processing')
+    };
+
+    showInvalidImageAlert = (message: string) => {
+        const { navigation } = this.props;
+
+        Alert.alert(localeString('general.error'), message, [
+            {
+                text: localeString('general.ok'),
+                onPress: () => {
+                    if (navigation.canGoBack()) {
+                        navigation.goBack();
+                    } else {
+                        navigation.navigate('Wallet');
+                    }
+                }
+            }
+        ]);
+    };
+
+    async componentDidMount() {
+        const { route, navigation } = this.props;
+        const { qrData, base64Image, requiresAuth, requiresWalletSelection } =
+            route.params;
+
+        // Fail closed. This screen decodes whatever QR it is handed and
+        // navigates wherever that QR points, including Send with an invoice
+        // loaded and WalletConfiguration pre-filled from a link, so a caller
+        // that arrives without saying whether the payload was authenticated
+        // must be treated as not having authenticated it. Only an explicit
+        // false, from a caller that knows the user has unlocked or that no
+        // login is configured, skips the Lockscreen. The flag is also
+        // re-checked live: it was set when the intent was read, and the
+        // payload can wait in Wallet's pendingShareIntent across a
+        // background lock or a return to POS mode.
+        if (
+            requiresAuth !== false ||
+            settingsStore.externalInputAuthRequired()
+        ) {
+            this.setState({
+                currentStep: localeString('utils.shareIntent.authRequired')
+            });
+
+            // The Lockscreen continuation re-enters this screen with
+            // requiresAuth: false once the user is through. A pending wallet
+            // selection rides along: unlocking does not satisfy it.
+            const shareData: ShareIntentPayload = {
+                qrData,
+                base64Image,
+                requiresWalletSelection
+            };
+
+            navigation.replace('Lockscreen', {
+                modifySecurityScreen: '',
+                deletePin: false,
+                deleteDuressPin: false,
+                shareIntentData: shareData
+            });
+            return;
+        }
+
+        if (requiresWalletSelection) {
+            this.setState({
+                currentStep: localeString('utils.shareIntent.walletSelection')
+            });
+
+            // Auth is already satisfied to have got this far: say so, or the
+            // gate above would ask for the PIN again once a wallet is picked
+            const shareData: ShareIntentPayload = {
+                qrData,
+                base64Image,
+                requiresAuth: false
+            };
+
+            navigation.replace('Wallets', {
+                fromStartup: true,
+                shareIntentData: shareData
+            });
+            return;
+        }
+
+        await this.processQRCode(qrData, base64Image);
+    }
+
+    // The intent was cleared when processSharedQRImageFast read it. Clearing
+    // again here, after the decode and handleAnything, would discard a newer
+    // share that arrived in the meantime.
+    async processQRCode(qrData?: string, base64Image?: string) {
+        const { navigation } = this.props;
+
+        try {
+            this.setState({
+                currentStep: localeString('utils.shareIntent.extractingQRCode')
+            });
+            let finalQrData: string | null = null;
+
+            if (qrData) {
+                finalQrData = qrData;
+            } else if (base64Image) {
+                const result = await QRKit.decodeBase64(base64Image);
+
+                if (result?.success && result.data) {
+                    finalQrData = result.data;
+                } else {
+                    this.showInvalidImageAlert(
+                        localeString('utils.shareIntent.invalidImage')
+                    );
+                    return;
+                }
+            } else {
+                this.showInvalidImageAlert(
+                    localeString('utils.shareIntent.processingError')
+                );
+                return;
+            }
+
+            if (finalQrData) {
+                this.setState({
+                    currentStep: localeString(
+                        'utils.shareIntent.processingPayment'
+                    )
+                });
+                const response = await handleAnything(finalQrData);
+                if (response) {
+                    const [route, params] = response;
+
+                    navigation.replace(route, params);
+                } else {
+                    this.showInvalidImageAlert(
+                        localeString('utils.shareIntent.processingError')
+                    );
+                    return;
+                }
+            }
+        } catch (error) {
+            console.error(
+                '[ShareIntentProcessing] Error processing shared QR:',
+                error
+            );
+
+            this.showInvalidImageAlert(
+                localeString('utils.shareIntent.processingError')
+            );
+        }
+    }
+
+    render() {
+        const { currentStep } = this.state;
+
+        return (
+            <Screen>
+                <View
+                    style={{
+                        flex: 1,
+                        justifyContent: 'center',
+                        alignItems: 'center',
+                        padding: 20
+                    }}
+                >
+                    <LoadingIndicator />
+                    <Text
+                        style={{
+                            color: themeColor('text'),
+                            fontSize: 18,
+                            textAlign: 'center',
+                            marginTop: 20,
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {currentStep + '...'}
+                    </Text>
+                    <Text
+                        style={{
+                            color: themeColor('secondaryText'),
+                            fontSize: 14,
+                            textAlign: 'center',
+                            marginTop: 10,
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {localeString('utils.shareIntent.extractingQR')}
+                    </Text>
+                </View>
+            </Screen>
+        );
+    }
+}
+
+export default ShareIntentProcessing;

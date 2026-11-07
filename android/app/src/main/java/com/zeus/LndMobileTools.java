@@ -1,0 +1,825 @@
+package app.zeusln.zeus;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.core.content.ContextCompat;
+
+import android.Manifest;
+import android.app.ActivityManager;
+import android.os.Build;
+import android.database.sqlite.SQLiteDatabase;
+import android.os.FileObserver;
+import android.os.Process;
+import android.util.Base64;
+import android.util.Log;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.os.Environment;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.Handler;
+import android.os.Bundle;
+import android.os.IBinder;
+import android.os.RemoteException;
+
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.Arrays;
+
+import java.io.PrintWriter;
+import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
+import java.util.EnumSet;
+
+import com.facebook.react.bridge.Arguments;
+import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.ReactContextBaseJavaModule;
+import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.Promise;
+import com.facebook.react.bridge.ReadableArray;
+import com.facebook.react.bridge.ReadableType;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
+import com.facebook.react.modules.permissions.PermissionsModule;
+
+import com.jakewharton.processphoenix.ProcessPhoenix;
+import com.oblador.keychain.KeychainModule;
+
+// import org.torproject.jni.TorService;
+import com.reactnativecommunity.asyncstorage.ReactDatabaseSupplier;
+import com.reactnativecommunity.asyncstorage.AsyncLocalStorageUtil;
+
+// TODO break this class up
+class LndMobileTools extends ReactContextBaseJavaModule {
+  final String TAG = "LndMobileTools";
+
+  public LndMobileTools(ReactApplicationContext reactContext) {
+    super(reactContext);
+  }
+
+  private boolean getPersistentServicesEnabled(Context context) {
+    ReactDatabaseSupplier dbSupplier = ReactDatabaseSupplier.getInstance(context);
+    SQLiteDatabase db = dbSupplier.get();
+    String persistentServicesEnabled = AsyncLocalStorageUtil.getItemImpl(db, "persistentServicesEnabled");
+    if (persistentServicesEnabled != null) {
+      return persistentServicesEnabled.equals("true");
+    }
+    // Hyperlog.w(TAG, "Could not find persistentServicesEnabled in asyncStorage");
+    return false;
+  }
+
+  @Override
+  public String getName() {
+    return "LndMobileTools";
+  }
+
+  @ReactMethod
+  void writeConfig(String config, String lndDir, Promise promise) {
+    String filename;
+    if (lndDir.equals("lnd")) {
+      filename = getReactApplicationContext().getFilesDir().toString() + "/lnd.conf";
+    } else {
+      filename = getReactApplicationContext().getFilesDir().toString() + "/" + lndDir + "/lnd.conf";
+    }
+
+    try {
+      new File(filename).getParentFile().mkdirs();
+      PrintWriter out = new PrintWriter(filename);
+      out.println(config);
+      out.close();
+    } catch (Exception e) {
+      promise.reject("Couldn't write: " + filename, e);
+      return;
+    }
+    promise.resolve("File written: " + filename);
+  }
+
+  @ReactMethod
+  public void killLnd(Promise promise) {
+    boolean result = killLndProcess();
+    promise.resolve(result);
+  }
+
+  private boolean killLndProcess() {
+    String packageName = getReactApplicationContext().getPackageName();
+    ActivityManager am = (ActivityManager) getCurrentActivity().getSystemService(Context.ACTIVITY_SERVICE);
+    for (ActivityManager.RunningAppProcessInfo p : am.getRunningAppProcesses()) {
+      if (p.processName.equals(packageName + ":zeusLndMobile")) {
+        Process.killProcess(p.pid);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @ReactMethod
+  public void tailLog(Integer numberOfLines, String lndDir, String network, Promise promise) {
+    File file;
+    if (lndDir.equals("lnd")) {
+        file = new File(
+          getReactApplicationContext().getFilesDir().toString() +
+          "/logs/bitcoin/" +
+          network +
+          "/lnd.log"
+        );
+    } else {
+        file = new File(
+          getReactApplicationContext().getFilesDir().toString() +
+          "/" +
+          lndDir +
+          "/logs/bitcoin/" +
+          network +
+          "/lnd.log"
+        );
+    }
+
+    java.io.RandomAccessFile fileHandler = null;
+    try {
+      fileHandler = new java.io.RandomAccessFile(file, "r");
+      long fileLength = fileHandler.length() - 1;
+      StringBuilder sb = new StringBuilder();
+      int line = 0;
+
+      for(long filePointer = fileLength; filePointer != -1; filePointer--){
+        fileHandler.seek( filePointer );
+        int readByte = fileHandler.readByte();
+
+        if (readByte == 0xA) {
+          if (filePointer < fileLength) {
+            line = line + 1;
+          }
+        } else if (readByte == 0xD) {
+          if (filePointer < fileLength-1) {
+              line = line + 1;
+          }
+        }
+        if (line >= numberOfLines) {
+          break;
+        }
+        sb.append((char) readByte);
+      }
+
+      String lastLine = sb.reverse().toString();
+      promise.resolve(lastLine);
+    } catch (java.io.FileNotFoundException e) {
+      e.printStackTrace();
+      promise.reject(e);
+    } catch (java.io.IOException e) {
+      e.printStackTrace();
+      promise.reject(e);
+    }
+    finally {
+      if (fileHandler != null) {
+        try {
+          fileHandler.close();
+        } catch (java.io.IOException e) {}
+      }
+    }
+  }
+
+  private FileObserver logObserver;
+
+  @ReactMethod
+  public void observeLndLogFile(String lndDir, String network, Promise p) {
+    if (logObserver != null) {
+      p.resolve(true);
+      return;
+    }
+
+    File appDir = getReactApplicationContext().getFilesDir();
+
+    String logDir;
+    if (lndDir.equals("lnd")) {
+      logDir = appDir + "/logs/bitcoin/" + network;
+    } else {
+      logDir = appDir + "/" + lndDir + "/logs/bitcoin/" + network;
+    }
+
+    final String logFile = logDir + "/lnd.log";
+
+    FileInputStream stream = null;
+    while (true) {
+      try {
+        stream = new FileInputStream(logFile);
+      } catch (FileNotFoundException e) {
+        File dir = new File(logDir);
+        dir.mkdirs();
+        File f = new File(logFile);
+        try {
+          f.createNewFile();
+          continue;
+        } catch (IOException e1) {
+          e1.printStackTrace();
+          return;
+        }
+      }
+      break;
+    }
+
+    final InputStreamReader istream = new InputStreamReader(stream);
+    final BufferedReader buf = new BufferedReader(istream);
+    try {
+      readToEnd(buf, false);
+    } catch (IOException e) {
+      e.printStackTrace();
+      return;
+    }
+
+    logObserver = new FileObserver(logFile) {
+      @Override
+      public void onEvent(int event, String file) {
+        if(event != FileObserver.MODIFY) {
+          return;
+        }
+        try {
+          readToEnd(buf, true);
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+      }
+    };
+    logObserver.startWatching();
+    Log.i(TAG, "Started watching " + logFile);
+    p.resolve(true);
+  }
+
+  private void readToEnd(BufferedReader buf, boolean emit) throws IOException {
+    String s = "";
+    while ( (s = buf.readLine()) != null ) {
+      if (!emit) {
+        continue;
+      }
+      getReactApplicationContext()
+              .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
+              .emit("lndlog", s);
+    }
+  }
+
+  @ReactMethod
+  public void saveChannelsBackup(String base64Backups, Promise promise) {
+    MainActivity.Companion.setTmpChanBackup(Base64.decode(base64Backups, Base64.NO_WRAP));
+    SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
+
+    Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+    intent.addCategory(Intent.CATEGORY_OPENABLE);
+    intent.setType("text/plain");
+    intent.putExtra(Intent.EXTRA_TITLE, "zeus-channels-backup-" + dateFormat.format(new Date()) + ".bin");
+    getReactApplicationContext().getCurrentActivity().startActivityForResult(intent, MainActivity.Companion.getINTENT_EXPORTCHANBACKUP());
+    promise.resolve(true);
+  }
+
+  @ReactMethod
+  public void saveChannelBackupFile(String network, Promise promise) {
+    SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
+
+    Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+    intent.addCategory(Intent.CATEGORY_OPENABLE);
+    intent.setType("text/plain");
+    intent.putExtra(Intent.EXTRA_TITLE, "zeus-channels-backup-" + dateFormat.format(new Date()) + ".bin");
+    if (network == "testnet") {
+      getReactApplicationContext().getCurrentActivity().startActivityForResult(intent, MainActivity.Companion.getINTENT_EXPORTCHANBACKUPFILETESTNET());
+    } else {
+      getReactApplicationContext().getCurrentActivity().startActivityForResult(intent, MainActivity.Companion.getINTENT_EXPORTCHANBACKUPFILE());
+    }
+    promise.resolve(true);
+  }
+
+  @ReactMethod
+  public void DEBUG_getWalletPasswordFromKeychain(Promise promise) {
+    KeychainModule keychain = new KeychainModule(getReactApplicationContext());
+
+    WritableMap keychainOptions = Arguments.createMap();
+    WritableMap keychainOptionsAuthenticationPrompt = Arguments.createMap();
+    keychainOptionsAuthenticationPrompt.putString("title", "Authenticate to retrieve secret");
+    keychainOptionsAuthenticationPrompt.putString("cancel", "Cancel");
+    keychainOptions.putMap("authenticationPrompt", keychainOptionsAuthenticationPrompt);
+
+    keychain.getInternetCredentialsForServer("password", keychainOptions, new PromiseWrapper() {
+      @Override
+      public void onSuccess(@Nullable Object value) {
+        if (value != null) {
+          promise.resolve(((ReadableMap) value).getString("password"));
+          return;
+        }
+        promise.reject("fail2");
+      }
+
+      @Override
+      public void onFail(Throwable throwable) {
+        Log.d(TAG, "error", throwable);
+        promise.reject(throwable.getMessage());
+      }
+    });
+  }
+
+  @ReactMethod
+  public void DEBUG_deleteWallet(String network, Promise promise) {
+    String filename = getReactApplicationContext().getFilesDir().toString() + "/data/chain/bitcoin/" + network + "/wallet.db";
+    File file = new File(filename);
+    promise.resolve(file.delete());
+  }
+
+  @ReactMethod
+  public void DEBUG_deleteDatafolder(Promise promise) {
+    String filename = getReactApplicationContext().getFilesDir().toString() + "/data/";
+    File file = new File(filename);
+    deleteRecursive(file);
+    promise.resolve(null);
+  }
+
+  // Returns whether everything under fileOrDirectory was actually removed
+  boolean deleteRecursive(File fileOrDirectory) {
+    boolean success = true;
+    if (fileOrDirectory.isDirectory()) {
+      File[] children = fileOrDirectory.listFiles();
+      if (children != null) {
+        for (File child : children) {
+          success = deleteRecursive(child) && success;
+        }
+      }
+    }
+    return fileOrDirectory.delete() && success;
+  }
+
+  // Graph SQL database maintenance.
+  //
+  // The embedded LND fork stores the gossip graph in native-SQL tables inside
+  // lnd.sqlite. LND decides which migrations to run from the single highest
+  // version in migration_tracker, so deleting individual tracker rows never
+  // makes it re-run a migration. The pre-v13.2.1 reset dropped the graph
+  // tables and deleted tracker rows 9/10 while rows 11-18 remained, leaving
+  // databases LND could never open again (issue #4524). The reset now only
+  // DELETEs rows inside one transaction and treats migration_tracker and
+  // schema_migrations as LND-owned. Repair rebuilds the schema for wallets
+  // the old reset already damaged.
+  //
+  // The DDL below mirrors the lnd fork's migrations 000008_graph and
+  // 000009_graph_v2 and must stay in sync with the fork pinned in
+  // fetch-libraries-versions.json. If the fork's highest migration version
+  // moves past GRAPH_KNOWN_MAX_DB_VERSION, repair fails closed until these
+  // definitions are reviewed against the new migrations.
+  private static final int GRAPH_V2_MIGRATION_VERSION = 11;   // 000009_graph_v2
+  private static final int GRAPH_KNOWN_MAX_DB_VERSION = 18;   // 000015_chain_params
+  private static final int GRAPH_KNOWN_SCHEMA_VERSION = 15;   // golang-migrate version at db version 18
+
+  private static final String[] GRAPH_TABLES_CHILD_FIRST = {
+    "graph_channel_policy_extra_types",
+    "graph_channel_policies",
+    "graph_channel_features",
+    "graph_channel_extra_types",
+    "graph_source_nodes",
+    "graph_channels",
+    "graph_node_addresses",
+    "graph_node_features",
+    "graph_node_extra_types",
+    "graph_nodes",
+    "graph_zombie_channels",
+    "graph_prune_log",
+    "graph_closed_scids"
+  };
+
+  // Tables as created by 000008_graph, followed by the 000009_graph_v2
+  // column additions.
+  private static final String[] GRAPH_TABLE_DDL = {
+    "CREATE TABLE IF NOT EXISTS graph_nodes (" +
+      "id INTEGER PRIMARY KEY, " +
+      "version SMALLINT NOT NULL, " +
+      "pub_key BLOB NOT NULL, " +
+      "alias TEXT, " +
+      "last_update BIGINT, " +
+      "color VARCHAR, " +
+      "signature BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_node_extra_types (" +
+      "node_id BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "type BIGINT NOT NULL, " +
+      "value BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_node_features (" +
+      "node_id BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "feature_bit INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS graph_node_addresses (" +
+      "node_id BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "type SMALLINT NOT NULL, " +
+      "position INTEGER NOT NULL, " +
+      "address TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS graph_source_nodes (" +
+      "node_id BIGINT NOT NULL REFERENCES graph_nodes (id) ON DELETE CASCADE)",
+    "CREATE TABLE IF NOT EXISTS graph_channels (" +
+      "id INTEGER PRIMARY KEY, " +
+      "version SMALLINT NOT NULL, " +
+      "scid BLOB NOT NULL, " +
+      "node_id_1 BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "node_id_2 BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "outpoint TEXT NOT NULL, " +
+      "capacity BIGINT, " +
+      "bitcoin_key_1 BLOB, " +
+      "bitcoin_key_2 BLOB, " +
+      "node_1_signature BLOB, " +
+      "node_2_signature BLOB, " +
+      "bitcoin_1_signature BLOB, " +
+      "bitcoin_2_signature BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_channel_features (" +
+      "channel_id BIGINT NOT NULL REFERENCES graph_channels(id) ON DELETE CASCADE, " +
+      "feature_bit INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS graph_channel_extra_types (" +
+      "channel_id BIGINT NOT NULL REFERENCES graph_channels(id) ON DELETE CASCADE, " +
+      "type BIGINT NOT NULL, " +
+      "value BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_channel_policies (" +
+      "id INTEGER PRIMARY KEY, " +
+      "version SMALLINT NOT NULL, " +
+      "channel_id BIGINT NOT NULL REFERENCES graph_channels(id) ON DELETE CASCADE, " +
+      "node_id BIGINT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE, " +
+      "timelock INTEGER NOT NULL, " +
+      "fee_ppm BIGINT NOT NULL, " +
+      "base_fee_msat BIGINT NOT NULL, " +
+      "min_htlc_msat BIGINT NOT NULL, " +
+      "max_htlc_msat BIGINT, " +
+      "last_update BIGINT, " +
+      "disabled bool, " +
+      "inbound_base_fee_msat BIGINT, " +
+      "inbound_fee_rate_milli_msat BIGINT, " +
+      "message_flags SMALLINT CHECK (message_flags >= 0 AND message_flags <= 255), " +
+      "channel_flags SMALLINT CHECK (channel_flags >= 0 AND channel_flags <= 255), " +
+      "signature BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_channel_policy_extra_types (" +
+      "channel_policy_id BIGINT NOT NULL REFERENCES graph_channel_policies(id) ON DELETE CASCADE, " +
+      "type BIGINT NOT NULL, " +
+      "value BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_zombie_channels (" +
+      "scid BLOB NOT NULL, " +
+      "version SMALLINT NOT NULL, " +
+      "node_key_1 BLOB, " +
+      "node_key_2 BLOB)",
+    "CREATE TABLE IF NOT EXISTS graph_prune_log (" +
+      "block_height BIGINT PRIMARY KEY, " +
+      "block_hash BLOB NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS graph_closed_scids (" +
+      "scid BLOB PRIMARY KEY)",
+    "ALTER TABLE graph_nodes ADD COLUMN block_height BIGINT",
+    "ALTER TABLE graph_channels ADD COLUMN signature BLOB",
+    "ALTER TABLE graph_channels ADD COLUMN funding_pk_script BLOB",
+    "ALTER TABLE graph_channels ADD COLUMN merkle_root_hash BLOB",
+    "ALTER TABLE graph_channel_policies ADD COLUMN block_height BIGINT",
+    "ALTER TABLE graph_channel_policies ADD COLUMN disable_flags SMALLINT " +
+      "CHECK (disable_flags >= 0 AND disable_flags <= 255)"
+  };
+
+  // The index set after 000009_graph_v2 has been applied.
+  private static final String[] GRAPH_INDEX_DDL = {
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_nodes_unique ON graph_nodes (pub_key, version)",
+    "CREATE INDEX IF NOT EXISTS graph_node_last_update_idx ON graph_nodes(version, last_update, pub_key)",
+    "CREATE INDEX IF NOT EXISTS graph_node_block_height_idx ON graph_nodes (version, block_height, pub_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_node_extra_types_unique ON graph_node_extra_types (type, node_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_node_features_unique ON graph_node_features (node_id, feature_bit)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_node_addresses_unique ON graph_node_addresses (node_id, type, position)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_source_nodes_unique ON graph_source_nodes (node_id)",
+    "CREATE INDEX IF NOT EXISTS graph_channels_node_id_1_idx ON graph_channels(node_id_1, version)",
+    "CREATE INDEX IF NOT EXISTS graph_channels_node_id_2_idx ON graph_channels(node_id_2, version)",
+    "CREATE INDEX IF NOT EXISTS graph_channels_version_id_idx ON graph_channels(version, id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_channels_unique ON graph_channels(version, scid DESC)",
+    "CREATE INDEX IF NOT EXISTS graph_channels_version_outpoint_idx ON graph_channels(version, outpoint)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_channel_features_unique ON graph_channel_features (channel_id, feature_bit)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_channel_extra_types_unique ON graph_channel_extra_types (type, channel_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_channel_policies_unique ON graph_channel_policies (channel_id, node_id, version)",
+    "CREATE INDEX IF NOT EXISTS graph_channel_policy_last_update_idx ON graph_channel_policies(last_update)",
+    "CREATE INDEX IF NOT EXISTS graph_channel_policy_block_height_idx ON graph_channel_policies (version, block_height)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_channel_policy_extra_types_unique ON graph_channel_policy_extra_types (type, channel_policy_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS graph_zombie_channels_channel_id_version_idx ON graph_zombie_channels(scid, version)"
+  };
+
+  @ReactMethod
+  public void repairGraphDb(String lndDir, String network, Promise promise) {
+    graphDbMaintenance(lndDir, network, false, promise);
+  }
+
+  @ReactMethod
+  public void resetGraphDb(String lndDir, String network, Promise promise) {
+    graphDbMaintenance(lndDir, network, true, promise);
+  }
+
+  private void graphDbMaintenance(String lndDir, String network, boolean resetData, Promise promise) {
+    String basePath;
+    if (lndDir == null || lndDir.isEmpty() || lndDir.equals("lnd")) {
+      basePath = getReactApplicationContext().getFilesDir().toString();
+    } else {
+      basePath = getReactApplicationContext().getFilesDir().toString() + "/" + lndDir;
+    }
+    String dbPath = basePath + "/data/graph/" + network + "/lnd.sqlite";
+
+    File dbFile = new File(dbPath);
+    if (!dbFile.exists()) {
+      promise.resolve("noop");
+      return;
+    }
+
+    SQLiteDatabase db = null;
+    try {
+      db = SQLiteDatabase.openDatabase(dbPath, null, SQLiteDatabase.OPEN_READWRITE);
+
+      long trackerExists = android.database.DatabaseUtils.longForQuery(db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='migration_tracker'", null);
+      if (trackerExists == 0) {
+        // Pre-native-SQL database; the graph does not live here.
+        promise.resolve("noop");
+        return;
+      }
+
+      long dbVersion = android.database.DatabaseUtils.longForQuery(db,
+        "SELECT COALESCE(MAX(version), 0) FROM migration_tracker", null);
+
+      java.util.Set<String> presentTables = new java.util.HashSet<>();
+      android.database.Cursor cursor = db.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'graph!_%' ESCAPE '!'", null);
+      try {
+        while (cursor.moveToNext()) {
+          presentTables.add(cursor.getString(0));
+        }
+      } finally {
+        cursor.close();
+      }
+
+      java.util.List<String> missingTables = new ArrayList<>();
+      for (String table : GRAPH_TABLES_CHILD_FIRST) {
+        if (!presentTables.contains(table)) {
+          missingTables.add(table);
+        }
+      }
+      java.util.Set<String> unknownTables = new java.util.HashSet<>(presentTables);
+      unknownTables.removeAll(Arrays.asList(GRAPH_TABLES_CHILD_FIRST));
+
+      if (missingTables.isEmpty()) {
+        boolean knownSchema = dbVersion <= GRAPH_KNOWN_MAX_DB_VERSION && unknownTables.isEmpty();
+        if (!resetData && !knownSchema) {
+          promise.resolve("ok");
+          return;
+        }
+        if (resetData && !unknownTables.isEmpty()) {
+          promise.reject("error", "Refusing to reset graph db: unrecognized graph tables " +
+            unknownTables + ". Update the graph schema definitions to match the lnd fork.");
+          return;
+        }
+        db.beginTransaction();
+        try {
+          if (resetData) {
+            for (String table : GRAPH_TABLES_CHILD_FIRST) {
+              db.execSQL("DELETE FROM " + table);
+            }
+          }
+          if (knownSchema) {
+            // Restore any indexes a partially-run legacy reset dropped;
+            // no-ops on healthy databases.
+            for (String sql : GRAPH_INDEX_DDL) {
+              db.execSQL(sql);
+            }
+          }
+          db.setTransactionSuccessful();
+        } finally {
+          db.endTransaction();
+        }
+        promise.resolve(resetData ? "reset" : "ok");
+        return;
+      }
+
+      // Some graph tables are missing.
+      if (dbVersion < GRAPH_V2_MIGRATION_VERSION) {
+        // The graph migrations have not run yet; LND will create the
+        // schema itself on next start.
+        promise.resolve("noop");
+        return;
+      }
+      if (dbVersion > GRAPH_KNOWN_MAX_DB_VERSION || !unknownTables.isEmpty()) {
+        promise.reject("error", "Graph db is missing tables " + missingTables +
+          " but its schema (version " + dbVersion + ") is not recognized by this build; refusing to repair.");
+        return;
+      }
+
+      // migration_tracker says the graph schema exists but the tables are
+      // gone: this wallet was damaged by the pre-v13.2.1 reset. Rebuild the
+      // schema exactly as migrations 000008_graph + 000009_graph_v2 define
+      // it and restore the bookkeeping the legacy reset removed.
+      db.beginTransaction();
+      try {
+        for (String table : GRAPH_TABLES_CHILD_FIRST) {
+          db.execSQL("DROP TABLE IF EXISTS " + table);
+        }
+        for (String sql : GRAPH_TABLE_DDL) {
+          db.execSQL(sql);
+        }
+        for (String sql : GRAPH_INDEX_DDL) {
+          db.execSQL(sql);
+        }
+        db.execSQL("INSERT OR IGNORE INTO migration_tracker (version, migration_time) VALUES (9, CURRENT_TIMESTAMP)");
+        db.execSQL("INSERT OR IGNORE INTO migration_tracker (version, migration_time) VALUES (10, CURRENT_TIMESTAMP)");
+        db.execSQL("DELETE FROM schema_migrations");
+        db.execSQL("INSERT INTO schema_migrations (version, dirty) VALUES (" + GRAPH_KNOWN_SCHEMA_VERSION + ", 0)");
+        db.setTransactionSuccessful();
+      } finally {
+        db.endTransaction();
+      }
+      promise.resolve("repaired");
+    } catch (Exception e) {
+      promise.reject("error", e.getMessage());
+    } finally {
+      if (db != null) db.close();
+    }
+  }
+
+  @ReactMethod
+  public void DEBUG_deleteSpeedloaderLastrunFile(Promise promise) {
+    String filename = getReactApplicationContext().getCacheDir().toString() + "/lastrun";
+    File file = new File(filename);
+    promise.resolve(file.delete());
+  }
+
+  @ReactMethod
+  public void DEBUG_deleteSpeedloaderDgraphDirectory(Promise promise) {
+    String filename = getReactApplicationContext().getCacheDir().toString() + "/dgraph";
+    File file = new File(filename);
+    deleteRecursive(file);
+    promise.resolve(null);
+  }
+
+  @ReactMethod
+  public void deleteLndDirectory(String lndDir, Promise promise) {
+    // lndDir is a single path segment ZEUS generates (a UUID or the legacy
+    // "lnd"). Reject anything else so a stored value like ".." cannot point
+    // the recursive delete outside the wallet's own directory.
+    if (lndDir == null || !lndDir.matches("[A-Za-z0-9_-]+")) {
+      promise.reject("deleteLndDirectory", "Invalid LND directory: " + lndDir);
+      return;
+    }
+    File filesDir = getReactApplicationContext().getFilesDir();
+    boolean success = true;
+    if (lndDir.equals("lnd")) {
+      // Legacy wallets ran LND directly in the files-dir root, which also
+      // holds other wallets' directories, CDK databases, etc. Only delete
+      // LND's own artifacts there.
+      String[] lndArtifacts = { "data", "logs", "lnd.conf", "tls.cert", "tls.key" };
+      for (String artifact : lndArtifacts) {
+        File file = new File(filesDir, artifact);
+        if (file.exists()) {
+          success = deleteRecursive(file) && success;
+        }
+      }
+    } else {
+      File file = new File(filesDir, lndDir);
+      if (file.exists()) {
+        success = deleteRecursive(file);
+      }
+    }
+    if (success) {
+      promise.resolve(null);
+    } else {
+      // Surface real failures so the JS-side retry logic (deleteLndWallet
+      // callers) does not treat a partial deletion as success
+      promise.reject("deleteLndDirectory", "Failed to fully delete LND directory: " + lndDir);
+    }
+  }
+
+  @ReactMethod
+  public void DEBUG_deleteNeutrinoFiles(String lndDir, String network, boolean isSqlite, Promise promise) {
+    String basePath;
+    if (lndDir == null || lndDir.isEmpty() || lndDir.equals("lnd")) {
+      basePath = getReactApplicationContext().getFilesDir().toString();
+    } else {
+      basePath = getReactApplicationContext().getFilesDir().toString() + "/" + lndDir;
+    }
+    String chainFolder = basePath + "/data/chain/bitcoin/" + network;
+
+    String neutrinoDb = chainFolder + "/neutrino.db";
+    String blockHeadersBin = chainFolder + "/block_headers.bin";
+    String regHeadersBin = chainFolder + "/reg_filter_headers.bin";
+    File neutrinoDbFile = new File(neutrinoDb);
+    File blockHeadersBinFile = new File(blockHeadersBin);
+    File regHeadersBinFiles = new File(regHeadersBin);
+    boolean result1 = neutrinoDbFile.delete();
+    boolean result2 = blockHeadersBinFile.delete();
+    boolean result3 = regHeadersBinFiles.delete();
+    boolean result = result1 || result2 || result3;
+
+    if (isSqlite) {
+      new File(chainFolder + "/neutrino.sqlite").delete();
+      new File(chainFolder + "/neutrino.sqlite-shm").delete();
+      new File(chainFolder + "/neutrino.sqlite-wal").delete();
+    }
+
+    promise.resolve(result);
+  }
+
+  @ReactMethod
+  public void DEBUG_listProcesses(Promise promise) {
+    String processes = "";
+
+    String packageName = getReactApplicationContext().getPackageName();
+    ActivityManager am = (ActivityManager) getCurrentActivity().getSystemService(Context.ACTIVITY_SERVICE);
+    for (ActivityManager.RunningAppProcessInfo p : am.getRunningAppProcesses()) {
+      processes += p.processName + "\n";
+    }
+
+    promise.resolve(processes);
+  }
+
+  @ReactMethod
+  public void checkLndProcessExist(Promise promise) {
+    String packageName = getReactApplicationContext().getPackageName();
+    ActivityManager am = (ActivityManager) getReactApplicationContext().getSystemService(Context.ACTIVITY_SERVICE);
+    for (ActivityManager.RunningAppProcessInfo p : am.getRunningAppProcesses()) {
+      if (p.processName.equals(packageName + ":zeusLndMobile")) {
+        promise.resolve(true);
+        return;
+      }
+    }
+    promise.resolve(false);
+  }
+
+  @ReactMethod
+  public void deleteTLSCerts(Promise promise) {
+    String tlsKeyFilename = getReactApplicationContext().getFilesDir().toString() + "/tls.key";
+    File tlsKeyFile = new File(tlsKeyFilename);
+    boolean tlsKeyFileDeletion = tlsKeyFile.delete();
+
+    String tlsCertFilename = getReactApplicationContext().getFilesDir().toString() + "/tls.cert";
+    File tlsCertFile = new File(tlsCertFilename);
+    boolean tlsCertFileDeletion = tlsCertFile.delete();
+
+    promise.resolve(tlsKeyFileDeletion && tlsCertFileDeletion);
+  }
+
+  @ReactMethod
+  public void restartApp() {
+    // Intent stopTorIntent = new Intent(getReactApplicationContext(), TorService.class);
+    // stopTorIntent.setAction("org.torproject.android.intent.action.STOP");
+    // getReactApplicationContext().stopService(stopTorIntent);
+    Intent stopLndIntent = new Intent(getReactApplicationContext(), LndMobileService.class);
+    stopLndIntent.setAction("app.zeusln.zeus.android.intent.action.STOP");
+    getReactApplicationContext().startService(stopLndIntent);
+    ProcessPhoenix.triggerRebirth(getReactApplicationContext());
+  }
+
+  @ReactMethod
+  public void setPersistentMode(boolean enabled, Promise promise) {
+    try {
+      Intent intent = new Intent(getReactApplicationContext(), LndMobileService.class);
+      intent.setAction("app.zeusln.zeus.android.intent.action.APPLY_PERSISTENT_MODE");
+      intent.putExtra("enabled", enabled);
+      if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        getReactApplicationContext().startForegroundService(intent);
+      } else {
+        getReactApplicationContext().startService(intent);
+      }
+      promise.resolve(null);
+    } catch (Exception e) {
+      promise.reject("error", e.getMessage());
+    }
+  }
+
+  private void checkWriteExternalStoragePermission(@NonNull RequestWriteExternalStoragePermissionCallback successCallback,
+                                                   @NonNull Runnable failCallback,
+                                                   @NonNull Runnable failPermissionCheckcallback) {
+    PermissionsModule permissions = new PermissionsModule(getReactApplicationContext());
+
+    PromiseWrapper requestPromiseWrapper = new PromiseWrapper() {
+      @Override
+      public void onSuccess(@Nullable Object value) {
+        successCallback.success(value);
+      }
+
+      @Override
+      public void onFail(Throwable throwable) {
+        failCallback.run();
+      }
+    };
+
+    PromiseWrapper checkPromiseWrapper = new PromiseWrapper() {
+      @Override
+      void onSuccess(@Nullable Object value) {
+        permissions.requestPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, requestPromiseWrapper);
+      }
+
+      @Override
+      void onFail(Throwable throwable) {
+        failPermissionCheckcallback.run();
+      }
+    };
+
+    permissions.checkPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE, checkPromiseWrapper);
+  }
+
+  private interface RequestWriteExternalStoragePermissionCallback {
+    void success(@Nullable Object value);
+  }
+}

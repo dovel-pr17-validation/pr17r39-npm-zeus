@@ -1,0 +1,813 @@
+import url from 'url';
+import * as React from 'react';
+import BigNumber from 'bignumber.js';
+import { Alert, Image, StyleSheet, Text, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import querystring from 'querystring-es3';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Amount from '../../components/Amount';
+import AmountInput from '../../components/AmountInput';
+import Button from '../../components/Button';
+import Header from '../../components/Header';
+import Screen from '../../components/Screen';
+import TextInput from '../../components/TextInput';
+import { Row } from '../../components/layout/Row';
+import LoadingIndicator from '../../components/LoadingIndicator';
+
+import CashuStore from '../../stores/CashuStore';
+import ContactStore from '../../stores/ContactStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+import LnurlPayStore from '../../stores/LnurlPayStore';
+import UnitsStore from '../../stores/UnitsStore';
+
+import Contact from '../../models/Contact';
+
+import LnurlPayMetadata from './Metadata';
+
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { getRawAmountFromSats, getSatAmount } from '../../utils/AmountUtils';
+import Bolt11Utils from '../../utils/Bolt11Utils';
+import {
+    verifyLnurlPayInvoice,
+    isLnurlCallbackAllowed
+} from '../../utils/LnurlPayUtils';
+import { fetchLnurlUrl } from '../../utils/LnurlFetchUtils';
+import { ScrollView } from 'react-native-gesture-handler';
+
+interface LnurlPayProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    CashuStore: CashuStore;
+    ContactStore: ContactStore;
+    InvoicesStore: InvoicesStore;
+    LnurlPayStore: LnurlPayStore;
+    UnitsStore: UnitsStore;
+    route: Route<
+        'LnurlPay',
+        {
+            lnurlParams: any;
+            amount: any;
+            satAmount: any;
+            ecash: boolean;
+            lightningAddress?: string;
+        }
+    >;
+}
+
+interface LnurlPayState {
+    amount: string;
+    satAmount: string | number;
+    // Set once the amount could not be converted to fiat. The amount input
+    // then stays pinned to sats until the screen is closed.
+    fiatError?: string;
+    domain: string;
+    lightningAddress: string;
+    matchedContact: Contact | null;
+    comment: string;
+    loading: boolean;
+    // The route params are not a usable pay request. The constructor has
+    // shown the invalidParams alert, and render() shows only the header.
+    invalidParams?: boolean;
+}
+
+// The fields this screen reads. The Lightning address paths only check for
+// a callback before they open this screen, so a server can still send a
+// missing or broken amount range.
+const isValidPayRequest = (lnurl: any) =>
+    !!lnurl &&
+    typeof lnurl === 'object' &&
+    typeof lnurl.callback === 'string' &&
+    Number.isFinite(lnurl.minSendable) &&
+    Number.isFinite(lnurl.maxSendable) &&
+    // LUD-06: minSendable can not be less than 1 or more than maxSendable
+    lnurl.minSendable >= 1 &&
+    lnurl.minSendable <= lnurl.maxSendable;
+
+// A request whose min and max are equal is paid exactly as asked, so its
+// input is locked and is always shown and read back in sats, whatever unit
+// the wallet is on.
+const isFixedAmount = (lnurl: any) =>
+    !!lnurl &&
+    Number.isFinite(lnurl.minSendable) &&
+    lnurl.minSendable === lnurl.maxSendable;
+
+@inject(
+    'CashuStore',
+    'ContactStore',
+    'InvoicesStore',
+    'LnurlPayStore',
+    'UnitsStore'
+)
+@observer
+export default class LnurlPay extends React.Component<
+    LnurlPayProps,
+    LnurlPayState
+> {
+    constructor(props: LnurlPayProps) {
+        super(props);
+
+        try {
+            this.state = {
+                ...this.stateFromProps(props),
+                loading: false
+            };
+        } catch (err: any) {
+            this.state = {
+                amount: '',
+                satAmount: '',
+                domain: '',
+                lightningAddress: '',
+                matchedContact: null,
+                comment: '',
+                loading: false,
+                invalidParams: true
+            };
+
+            Alert.alert(
+                localeString('views.LnurlPay.LnurlPay.invalidParams'),
+                err.message,
+                [
+                    {
+                        text: localeString('general.ok'),
+                        onPress: () => this.props.navigation.goBack()
+                    }
+                ],
+                { cancelable: false }
+            );
+        }
+    }
+
+    // Recalculate the displayed amount in the current unit when the user
+    // navigates back (e.g. from AmountKeypad after switching units).
+    recalculateDisplayAmount = () => {
+        const { satAmount, fiatError } = this.state;
+        const fixed = isFixedAmount(this.props.route.params?.lnurlParams);
+        if (satAmount && satAmount != 0) {
+            const { amount: displayAmount, error } = getRawAmountFromSats(
+                satAmount,
+                fiatError || fixed ? 'sats' : undefined
+            );
+            // a sats fallback can equal the amount already shown (e.g. the
+            // unit was switched to fiat in the keypad without confirming),
+            // so a new error has to pin the input on its own
+            if (displayAmount !== this.state.amount || (error && !fiatError)) {
+                this.setState({
+                    amount: displayAmount,
+                    ...(error && { fiatError: error })
+                });
+            }
+        }
+    };
+
+    componentDidMount() {
+        this.props.navigation.addListener(
+            'focus',
+            this.recalculateDisplayAmount
+        );
+    }
+
+    componentWillUnmount() {
+        this.props.navigation.removeListener &&
+            this.props.navigation.removeListener(
+                'focus',
+                this.recalculateDisplayAmount
+            );
+    }
+
+    stateFromProps(props: LnurlPayProps) {
+        const { route, UnitsStore, ContactStore } = props;
+        const { resetUnits } = UnitsStore;
+        const {
+            lnurlParams: lnurl,
+            amount,
+            satAmount,
+            lightningAddress
+        } = route.params ?? {};
+
+        // Check before anything reads lnurl, so the alert shows this message
+        // instead of a TypeError
+        if (!isValidPayRequest(lnurl)) {
+            throw new Error(
+                localeString('views.LnurlPay.LnurlPay.errorInvalidRequest')
+            );
+        }
+
+        const fixed = isFixedAmount(lnurl);
+
+        // if requested amount is fixed,
+        // convert units to sats so conversion rate doesn't make things unpayable
+        if (fixed) {
+            resetUnits();
+        }
+
+        const minSendableSats = Math.floor(lnurl.minSendable / 1000);
+
+        let finalAmount: string;
+        let finalSatAmount: string | number;
+        let fiatError: string | undefined;
+
+        if (fixed) {
+            // Fixed amount: the request is paid exactly as asked, so prefill
+            // the locked input with the required amount and ignore any
+            // amount or satAmount handed in by the caller (Send forwards its
+            // own), which the server would reject. Asking for sats explicitly
+            // keeps the prefill correct whether or not resetUnits() above has
+            // run, so the value and the unit the input renders in are decided
+            // here and not by the global unit.
+            finalAmount = getRawAmountFromSats(minSendableSats, 'sats').amount;
+            finalSatAmount = minSendableSats;
+        } else if (satAmount && satAmount != 0) {
+            // If satAmount is provided, always derive display amount from it
+            // (ignore any `amount` param as it may be in a different unit)
+            const { amount: displayAmount, error } =
+                getRawAmountFromSats(satAmount);
+            finalAmount = displayAmount;
+            finalSatAmount = satAmount;
+            fiatError = error;
+        } else if (amount && amount != 0) {
+            // If only amount is provided, use it and derive satAmount
+            finalAmount = amount;
+            finalSatAmount = getSatAmount(amount);
+        } else {
+            // Variable amount: start empty so the user doesn't have to
+            // delete a prefilled value
+            finalAmount = '';
+            finalSatAmount = '';
+        }
+
+        // Find matching contact by Lightning Address
+        let matchedContact: Contact | null = null;
+        if (lightningAddress && ContactStore?.contacts) {
+            const normalizedAddress = lightningAddress.toLowerCase();
+            const found = ContactStore.contacts.find((contact: Contact) =>
+                contact.lnAddress?.some(
+                    (addr: string) =>
+                        addr && addr.toLowerCase() === normalizedAddress
+                )
+            );
+            if (found) {
+                matchedContact = new Contact(found);
+            }
+        }
+
+        return {
+            amount: finalAmount,
+            satAmount: finalSatAmount,
+            fiatError,
+            domain: lnurl.domain,
+            lightningAddress: lightningAddress || '',
+            matchedContact,
+            comment: ''
+        };
+    }
+
+    sendValues(satAmount: string | number) {
+        this.setState({ loading: true });
+
+        const { navigation, CashuStore, InvoicesStore, LnurlPayStore, route } =
+            this.props;
+        const { domain, comment, lightningAddress } = this.state;
+        const ecash = route.params?.ecash;
+        const lnurl = route.params?.lnurlParams;
+
+        // Never fetch a callback that would leak the amount/comment in
+        // cleartext or reach internal infrastructure (SSRF-by-callback).
+        const callbackCheck = isLnurlCallbackAllowed(lnurl.callback);
+        if (!callbackCheck.ok) {
+            this.setState({ loading: false });
+            Alert.alert(
+                localeString('views.LnurlPay.LnurlPay.invalidInvoice'),
+                localeString('views.LnurlPay.LnurlPay.unsafeCallback'),
+                [{ text: localeString('general.ok'), onPress: () => void 0 }],
+                { cancelable: false }
+            );
+            return;
+        }
+
+        const u = url.parse(lnurl.callback);
+        const qs = querystring.parse(u.query);
+        qs.amount = Number(
+            (parseFloat(satAmount.toString()) * 1000).toString()
+        );
+        // The exact msat we asked for; the returned invoice must match it.
+        const requestedAmountMsat = qs.amount;
+        qs.comment = comment;
+        u.search = querystring.stringify(qs);
+        u.query = querystring.stringify(qs);
+
+        fetchLnurlUrl(url.format(u))
+            .then((response: any) => {
+                try {
+                    const data = response.json();
+                    return data;
+                } catch (err) {
+                    return { status: 'ERROR', reason: response.text() };
+                }
+            })
+            .catch((err: any) => ({
+                status: 'ERROR',
+                reason: err.message
+            }))
+            .then((data: any) => {
+                if (data.status === 'ERROR') {
+                    this.setState({ loading: false });
+
+                    Alert.alert(
+                        `[error] ${domain} says:`,
+                        data.reason,
+                        [
+                            {
+                                text: localeString('general.ok'),
+                                onPress: () => void 0
+                            }
+                        ],
+                        { cancelable: false }
+                    );
+                    return;
+                }
+
+                const pr = data.pr;
+
+                // A response without an invoice is a service-side failure,
+                // even when it doesn't use the LNURL error envelope (e.g.
+                // LNbits answers a deleted paylink with
+                // {"detail": "Pay link does not exist."}). Surface it as the
+                // service's error rather than letting the binding check below
+                // misreport it as an invoice mismatch.
+                if (typeof pr !== 'string' || pr.length === 0) {
+                    this.setState({ loading: false });
+                    const serviceReason = [
+                        data.reason,
+                        data.detail,
+                        data.error,
+                        data.message
+                    ].find((v: any) => typeof v === 'string' && v.length > 0);
+                    Alert.alert(
+                        `[error] ${domain} says:`,
+                        serviceReason ||
+                            localeString('error.unexpectedResponse'),
+                        [
+                            {
+                                text: localeString('general.ok'),
+                                onPress: () => void 0
+                            }
+                        ],
+                        { cancelable: false }
+                    );
+                    return;
+                }
+
+                // Bind the invoice we are about to pay to the identity and
+                // amount the user reviewed: the description_hash must commit to
+                // the displayed metadata and the amount must match the request
+                // (LUD-06). Without this a malicious service can show one payee
+                // and invoice for something else entirely.
+                const invoiceCheck = verifyLnurlPayInvoice(
+                    pr,
+                    lnurl.metadata,
+                    new BigNumber(requestedAmountMsat)
+                );
+                if (!invoiceCheck.ok) {
+                    this.setState({ loading: false });
+                    Alert.alert(
+                        localeString('views.LnurlPay.LnurlPay.invalidInvoice'),
+                        localeString(
+                            'views.LnurlPay.LnurlPay.invoiceBindingFailed'
+                        ),
+                        [
+                            {
+                                text: localeString('general.ok'),
+                                onPress: () => void 0
+                            }
+                        ],
+                        { cancelable: false }
+                    );
+                    return;
+                }
+
+                const successAction = data.successAction || {
+                    tag: 'noop'
+                };
+
+                if (ecash) {
+                    // load up both the payment routes
+                    InvoicesStore.getPayReq(pr);
+                    CashuStore.getPayReq(pr).then(() => {
+                        this.setState({ loading: false });
+
+                        // CashuStore is shared with the NWC service and a
+                        // superseded getPayReq resolves silently, so the store
+                        // may hold another invoice by now. Use pr from here on.
+                        const payReqError =
+                            CashuStore.paymentRequest === pr
+                                ? CashuStore.getPayReqError
+                                : undefined;
+                        const isInsufficientFunds =
+                            typeof payReqError === 'string' &&
+                            payReqError
+                                .toLowerCase()
+                                .includes(
+                                    localeString(
+                                        'stores.CashuStore.notEnoughFunds'
+                                    ).toLowerCase()
+                                );
+
+                        if (payReqError && !isInsufficientFunds) {
+                            Alert.alert(
+                                localeString(
+                                    'views.LnurlPay.LnurlPay.invalidInvoice'
+                                ),
+                                payReqError,
+                                [
+                                    {
+                                        text: localeString('general.ok'),
+                                        onPress: () => void 0
+                                    }
+                                ],
+                                { cancelable: false }
+                            );
+                            return;
+                        }
+
+                        const decoded = Bolt11Utils.decode(pr);
+                        const payment_hash: string = decoded.payment_hash || '';
+                        const description_hash: string =
+                            decoded.description_hash || '';
+
+                        LnurlPayStore.keep(
+                            payment_hash,
+                            domain,
+                            lnurl.lnurlText,
+                            lnurl.metadata,
+                            description_hash,
+                            successAction,
+                            lightningAddress
+                        );
+
+                        navigation.navigate('ChoosePaymentMethod', {
+                            lightning: pr,
+                            locked: true
+                        });
+                    });
+                } else {
+                    InvoicesStore.getPayReq(pr).then(() => {
+                        this.setState({ loading: false });
+
+                        // a newer decode (deep link, NFC tap) replaced this
+                        // one: getPayReq dropped our answer, so pay_req and
+                        // getPayReqError are unset or belong to the other
+                        // invoice. Don't bind this LNURL's metadata and
+                        // success action to it; the newer request has its
+                        // own PaymentRequest
+                        if (
+                            InvoicesStore.paymentRequest !== pr ||
+                            (!InvoicesStore.pay_req &&
+                                !InvoicesStore.getPayReqError)
+                        ) {
+                            return;
+                        }
+
+                        if (InvoicesStore.getPayReqError) {
+                            Alert.alert(
+                                localeString(
+                                    'views.LnurlPay.LnurlPay.invalidInvoice'
+                                ),
+                                InvoicesStore.getPayReqError,
+                                [
+                                    {
+                                        text: localeString('general.ok'),
+                                        onPress: () => void 0
+                                    }
+                                ],
+                                { cancelable: false }
+                            );
+                            return;
+                        }
+
+                        const payment_hash: string =
+                            (InvoicesStore.pay_req &&
+                                InvoicesStore.pay_req.payment_hash) ||
+                            '';
+                        const description_hash: string =
+                            (InvoicesStore.pay_req &&
+                                InvoicesStore.pay_req.description_hash) ||
+                            '';
+
+                        LnurlPayStore.keep(
+                            payment_hash,
+                            domain,
+                            lnurl.lnurlText,
+                            lnurl.metadata,
+                            description_hash,
+                            successAction,
+                            lightningAddress
+                        );
+                        navigation.navigate('PaymentRequest');
+                    });
+                }
+            });
+    }
+
+    render() {
+        const { navigation, route } = this.props;
+        const {
+            amount,
+            satAmount,
+            domain,
+            lightningAddress,
+            matchedContact,
+            comment,
+            loading,
+            fiatError,
+            invalidParams
+        } = this.state;
+
+        const lnurl = route.params?.lnurlParams;
+
+        // The params failed the check in stateFromProps: the constructor has
+        // shown the invalidParams alert, and everything below reads lnurl.
+        // Show only the header.
+        if (invalidParams) {
+            return (
+                <Screen>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString('general.send'),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        navigation={navigation}
+                    />
+                </Screen>
+            );
+        }
+
+        const fixed = isFixedAmount(lnurl);
+
+        // Extract image from LNURL metadata
+        let metadataImage: string | null = null;
+        try {
+            const keypairs: Array<[string, string]> = JSON.parse(
+                lnurl.metadata
+            );
+            metadataImage =
+                keypairs
+                    .filter(([typ]) => typ.startsWith('image/'))
+                    .map(([typ, content]) => `data:${typ},${content}`)[0] ||
+                null;
+        } catch (err) {
+            console.log('Error parsing LNURL metadata:', err);
+        }
+
+        // Priority: LNURL metadata image > Contact photo
+        const displayImage = metadataImage
+            ? metadataImage
+            : matchedContact?.photo
+            ? matchedContact.getPhoto
+            : null;
+        const displayName = matchedContact?.name;
+        const displayAddress = lightningAddress || domain;
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('general.send'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                alignItems: 'center'
+                            }}
+                        >
+                            {loading && <LoadingIndicator size={30} />}
+                        </View>
+                    }
+                    navigation={navigation}
+                />
+                <ScrollView keyboardShouldPersistTaps="handled">
+                    {/* Lightning Address Header */}
+                    {displayAddress && (
+                        <View style={styles.headerSection}>
+                            {displayImage && (
+                                <Image
+                                    source={{ uri: displayImage }}
+                                    style={styles.profileImage}
+                                />
+                            )}
+                            {displayName && (
+                                <Text
+                                    style={[
+                                        styles.nameText,
+                                        { color: themeColor('text') }
+                                    ]}
+                                >
+                                    {displayName}
+                                </Text>
+                            )}
+                            <Text
+                                style={[
+                                    styles.addressText,
+                                    { color: themeColor('text') }
+                                ]}
+                            >
+                                {displayAddress}
+                            </Text>
+                            <View style={{ marginTop: 8 }}>
+                                <LnurlPayMetadata
+                                    metadata={lnurl.metadata}
+                                    showArrow={false}
+                                    hideImage={true}
+                                />
+                            </View>
+                        </View>
+                    )}
+
+                    <View style={styles.content}>
+                        <View style={{ marginTop: 4 }}>
+                            <Row align="flex-end">
+                                <Text
+                                    style={{
+                                        ...styles.text,
+                                        color: themeColor('secondaryText')
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.LnurlPay.LnurlPay.amount'
+                                    )}
+                                </Text>
+                                {fixed ? (
+                                    <Text
+                                        style={{
+                                            ...styles.text,
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {` (${localeString(
+                                            'views.ClinkPay.fixedAmount'
+                                        )})`}
+                                    </Text>
+                                ) : (
+                                    <>
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {' ('}
+                                        </Text>
+                                        <Amount
+                                            color="secondaryText"
+                                            sats={Math.ceil(
+                                                lnurl.minSendable / 1000
+                                            )}
+                                            defaultTextSize={true}
+                                        />
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {' - '}
+                                        </Text>
+                                        <Amount
+                                            color="secondaryText"
+                                            sats={Math.floor(
+                                                lnurl.maxSendable / 1000
+                                            )}
+                                            defaultTextSize={true}
+                                        />
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {')'}
+                                        </Text>
+                                    </>
+                                )}
+                            </Row>
+                        </View>
+                        <View style={{ marginTop: 0 }}>
+                            <AmountInput
+                                amount={amount}
+                                forceUnit={
+                                    fiatError || fixed ? 'sats' : undefined
+                                }
+                                hideUnitChangeButton={!!fiatError}
+                                fiatError={fiatError}
+                                locked={loading || fixed}
+                                onAmountChange={(
+                                    amount: string,
+                                    satAmount: string | number
+                                ) => {
+                                    this.setState({
+                                        amount,
+                                        satAmount
+                                    });
+                                }}
+                            />
+                        </View>
+
+                        {lnurl.commentAllowed > 0 ? (
+                            <>
+                                <Text
+                                    style={{
+                                        ...styles.text,
+                                        marginTop: 10,
+                                        color: themeColor('secondaryText')
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.LnurlPay.LnurlPay.commentWithLimit',
+                                        { count: lnurl.commentAllowed }
+                                    )}
+                                </Text>
+                                <TextInput
+                                    value={comment}
+                                    onChangeText={(text: string) => {
+                                        this.setState({ comment: text });
+                                    }}
+                                    locked={loading}
+                                />
+                            </>
+                        ) : null}
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString(
+                                    'views.LnurlPay.LnurlPay.confirm'
+                                )}
+                                titleStyle={{
+                                    color: themeColor('text')
+                                }}
+                                icon={{
+                                    name: 'send',
+                                    size: 25,
+                                    color: themeColor('text')
+                                }}
+                                onPress={() => {
+                                    this.sendValues(satAmount);
+                                }}
+                                buttonStyle={{
+                                    backgroundColor: themeColor('secondary')
+                                }}
+                                disabled={
+                                    loading || !satAmount || satAmount == 0
+                                }
+                            />
+                        </View>
+                    </View>
+                </ScrollView>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    content: { paddingHorizontal: 20 },
+    button: { paddingVertical: 15 },
+    headerSection: {
+        alignItems: 'center',
+        paddingVertical: 20,
+        paddingHorizontal: 20
+    },
+    profileImage: {
+        width: 100,
+        height: 100,
+        borderRadius: 50,
+        marginBottom: 15
+    },
+    nameText: {
+        fontSize: 24,
+        fontWeight: 'bold',
+        marginBottom: 5,
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    addressText: {
+        fontSize: 18,
+        fontFamily: 'PPNeueMontreal-Book'
+    }
+});

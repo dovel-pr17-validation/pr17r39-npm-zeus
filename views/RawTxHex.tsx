@@ -1,0 +1,131 @@
+import * as React from 'react';
+import { ScrollView, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import {
+    SuccessMessage,
+    ErrorMessage
+} from '../components/SuccessErrorMessage';
+import Button from '../components/Button';
+import CollapsedQR from '../components/CollapsedQR';
+import Header from '../components/Header';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Screen from '../components/Screen';
+
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import UrlUtils from '../utils/UrlUtils';
+
+import { nodeInfoStore } from '../stores/Stores';
+import TransactionsStore from '../stores/TransactionsStore';
+
+interface RawTxHexProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    TransactionsStore: TransactionsStore;
+    route: Route<
+        'RawTxHex',
+        {
+            value: string;
+            hideText: boolean;
+            logo: any;
+        }
+    >;
+}
+
+interface RawTxHexState {
+    value: string;
+    hideText: boolean;
+    logo: any;
+}
+
+@inject('TransactionsStore')
+@observer
+export default class RawTxHex extends React.PureComponent<
+    RawTxHexProps,
+    RawTxHexState
+> {
+    constructor(props: RawTxHexProps) {
+        super(props);
+
+        const value = props.route.params?.value ?? '';
+        const { hideText, logo } = props.route.params ?? {};
+
+        this.state = {
+            value,
+            hideText,
+            logo
+        };
+    }
+
+    render() {
+        const { navigation, TransactionsStore } = this.props;
+        const { value, hideText, logo } = this.state;
+        const {
+            broadcastRawTxToMempoolSpace,
+            broadcast_txid,
+            broadcast_err,
+            loading
+        } = TransactionsStore;
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Transaction.rawTxHex'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    containerStyle={{
+                        borderBottomWidth: 0
+                    }}
+                    navigation={navigation}
+                />
+                <ScrollView
+                    style={{ padding: 15 }}
+                    contentContainerStyle={{ alignItems: 'center' }}
+                >
+                    <View style={{ marginBottom: 15, width: '100%' }}>
+                        <CollapsedQR
+                            value={value}
+                            textBottom
+                            hideText={hideText}
+                            logo={logo}
+                        />
+                    </View>
+                    <Button
+                        title={localeString(
+                            'views.RawTxHex.broadcastToInstance',
+                            {
+                                instance: UrlUtils.getMempoolInstanceHost(
+                                    nodeInfoStore.nodeInfo
+                                )
+                            }
+                        )}
+                        onPress={() => broadcastRawTxToMempoolSpace(value)}
+                    />
+                    {loading && (
+                        <View style={{ marginTop: 20 }}>
+                            <LoadingIndicator />
+                        </View>
+                    )}
+                    {broadcast_txid && (
+                        <SuccessMessage
+                            message={broadcast_txid}
+                            onPress={() =>
+                                UrlUtils.goToBlockExplorerTXID(
+                                    broadcast_txid,
+                                    nodeInfoStore.nodeInfo.isTestNet
+                                )
+                            }
+                        />
+                    )}
+                    {broadcast_err && <ErrorMessage message={broadcast_err} />}
+                </ScrollView>
+            </Screen>
+        );
+    }
+}

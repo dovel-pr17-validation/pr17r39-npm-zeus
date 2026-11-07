@@ -1,0 +1,1024 @@
+import * as React from 'react';
+import {
+    Animated,
+    Dimensions,
+    FlatList,
+    PanResponder,
+    PanResponderInstance,
+    ScrollView,
+    StyleSheet,
+    TouchableOpacity,
+    Vibration,
+    View
+} from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { Icon } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import CashuPayment from './CashuPayment';
+
+import { showCopiedToast } from '../../components/CopiedToast';
+
+import Button from '../../components/Button';
+import Pill from '../../components/Pill';
+import Screen from '../../components/Screen';
+import Text from '../../components/Text';
+import Header from '../../components/Header';
+import LightningLoadingPattern from '../../components/LightningLoadingPattern';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import {
+    ErrorMessage,
+    WarningMessage
+} from '../../components/SuccessErrorMessage';
+import { Row } from '../../components/layout/Row';
+import { Spacer } from '../../components/layout/Spacer';
+import Accordion from '../../components/Accordion';
+
+import LightningAddressStore from '../../stores/LightningAddressStore';
+import SettingsStore from '../../stores/SettingsStore';
+
+import BackendUtils from '../../utils/BackendUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+import CaretUp from '../../assets/images/SVG/Caret Up.svg';
+import QR from '../../assets/images/SVG/QR.svg';
+import Gear from '../../assets/images/SVG/Gear.svg';
+import ZeusPayIcon from '../../assets/images/SVG/zeus-pay.svg';
+
+interface LightningAddressProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    LightningAddressStore: LightningAddressStore;
+    SettingsStore: SettingsStore;
+    route: Route<'LightningAddress', { skipStatus: boolean }>;
+}
+
+@inject('LightningAddressStore', 'SettingsStore')
+@observer
+export default class LightningAddress extends React.Component<
+    LightningAddressProps,
+    {}
+> {
+    private pan: Animated.ValueXY;
+    private panResponder: PanResponderInstance;
+    private scrollViewRef = React.createRef<ScrollView>();
+
+    isInitialFocus = true;
+
+    constructor(props: LightningAddressProps) {
+        super(props);
+        this.pan = new Animated.ValueXY();
+        this.panResponder = PanResponder.create({
+            onMoveShouldSetPanResponder: () => true,
+            onPanResponderMove: Animated.event(
+                [null, { dx: this.pan.x, dy: this.pan.y }],
+                { useNativeDriver: false }
+            ),
+            onPanResponderRelease: () => {
+                Animated.spring(this.pan, {
+                    toValue: { x: 0, y: 0 },
+                    useNativeDriver: false
+                }).start();
+                props.navigation.navigate('Activity', {
+                    animation: 'slide_from_bottom'
+                });
+            }
+        });
+    }
+
+    async componentDidMount() {
+        const { LightningAddressStore, navigation, route } = this.props;
+        const { status } = LightningAddressStore;
+
+        const skipStatus = route.params?.skipStatus;
+
+        if (!skipStatus) status().catch(this.handleStoreError);
+
+        // triggers when loaded from navigation or back action
+        navigation.addListener('focus', this.handleFocus);
+    }
+
+    componentWillUnmount() {
+        this.props.navigation.removeListener &&
+            this.props.navigation.removeListener('focus', this.handleFocus);
+    }
+
+    handleFocus = () => {
+        if (this.isInitialFocus) {
+            this.isInitialFocus = false;
+        } else {
+            this.props.LightningAddressStore.status().catch(
+                this.handleStoreError
+            );
+        }
+    };
+
+    // LightningAddressStore methods record failures in the store's observable
+    // error/error_msg state (which this view renders) and then re-throw, so
+    // fire-and-forget call sites must catch the rejection to avoid an
+    // unhandled promise rejection.
+    private handleStoreError = (error: unknown) =>
+        console.log('LightningAddressStore error', error);
+
+    copyLightningAddress = () => {
+        const { LightningAddressStore } = this.props;
+        const { lightningAddressHandle, lightningAddressDomain } =
+            LightningAddressStore;
+        Clipboard.setString(
+            `${lightningAddressHandle}@${lightningAddressDomain}`
+        );
+        Vibration.vibrate(50);
+        showCopiedToast();
+    };
+
+    render() {
+        const { navigation, LightningAddressStore, SettingsStore } = this.props;
+        const {
+            status,
+            redeemAllOpenPaymentsCashu,
+            lightningAddressHandle,
+            lightningAddressDomain,
+            lightningAddressType,
+            noffer,
+            zeusPlusExpiresAt,
+            paid,
+            error_msg,
+            loading,
+            redeeming,
+            redeemingAll
+        } = LightningAddressStore;
+
+        const { fontScale } = Dimensions.get('window');
+
+        const notEmbedded = !BackendUtils.isLocalWallet();
+        const isZaplocker = lightningAddressType === 'zaplocker';
+        const cashuEnabled = SettingsStore.settings?.ecash?.enableCashu;
+
+        const InfoButton = () => (
+            <View style={{ marginRight: 15 }}>
+                <Icon
+                    name="info"
+                    onPress={() => {
+                        if (lightningAddressType === 'cashu') {
+                            navigation.navigate('CashuLightningAddressInfo');
+                        } else if (lightningAddressType === 'nwc') {
+                            navigation.navigate('NWCAddressInfo');
+                        }
+                    }}
+                    color={themeColor('text')}
+                    underlayColor="transparent"
+                    size={30}
+                />
+            </View>
+        );
+
+        const SettingsButton = () => (
+            <TouchableOpacity
+                onPress={() => {
+                    if (isZaplocker) {
+                        navigation.navigate('LightningAddressSettings');
+                    } else if (lightningAddressType === 'cashu') {
+                        navigation.navigate('CashuLightningAddressSettings');
+                    } else if (lightningAddressType === 'nwc') {
+                        navigation.navigate('NWCAddressSettings');
+                    }
+                }}
+            >
+                <Gear
+                    style={{ alignSelf: 'center' }}
+                    fill={themeColor('text')}
+                />
+            </TouchableOpacity>
+        );
+
+        const QRButton = () => {
+            const address = `${lightningAddressHandle}@${lightningAddressDomain}`;
+            const logo = themeColor('invertQrIcons')
+                ? require('../../assets/images/pay_z_white.png')
+                : require('../../assets/images/pay_z_black.png');
+            return (
+                <TouchableOpacity
+                    onPress={() =>
+                        noffer
+                            ? navigation.navigate('LightningAddressQR', {
+                                  address,
+                                  noffer,
+                                  logo
+                              })
+                            : navigation.navigate('QR', {
+                                  value: `lightning:${address}`,
+                                  copyValue: address,
+                                  label: address,
+                                  hideText: true,
+                                  labelBottom: true,
+                                  logo
+                              })
+                    }
+                    style={{ margin: 10 }}
+                >
+                    <QR
+                        fill={themeColor('text')}
+                        style={{ alignSelf: 'center' }}
+                        width={30}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        const PortalButton = () => {
+            const url = `https://${lightningAddressDomain}/${lightningAddressHandle}`;
+            return (
+                <TouchableOpacity
+                    onPress={() => UrlUtils.goToUrl(url)}
+                    style={{ margin: 10 }}
+                >
+                    <Icon
+                        name="computer"
+                        color={themeColor('text')}
+                        underlayColor="transparent"
+                        size={40}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        const zeusPlus = zeusPlusExpiresAt || false;
+
+        return (
+            <Screen>
+                <View style={{ flex: 1 }}>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={
+                            <ZeusPayIcon
+                                fill={themeColor('text')}
+                                width={30}
+                                height={30}
+                            />
+                        }
+                        rightComponent={
+                            !loading && !redeeming && !redeemingAll ? (
+                                <Row>
+                                    {lightningAddressHandle && !isZaplocker && (
+                                        <InfoButton />
+                                    )}
+                                    {lightningAddressHandle && (
+                                        <SettingsButton />
+                                    )}
+                                </Row>
+                            ) : undefined
+                        }
+                        navigation={navigation}
+                    />
+                    <View style={{ flex: 1, margin: 5 }}>
+                        {redeeming && (
+                            <View
+                                style={[
+                                    styles.loadingPatternWrapper,
+                                    { pointerEvents: 'none' }
+                                ]}
+                            >
+                                <LightningLoadingPattern />
+                            </View>
+                        )}
+                        {redeemingAll && !redeeming && (
+                            <View
+                                style={[
+                                    styles.loadingPatternWrapper,
+                                    { pointerEvents: 'none' }
+                                ]}
+                            >
+                                <LightningLoadingPattern
+                                    color={themeColor('text')}
+                                />
+                            </View>
+                        )}
+                        {loading && <LoadingIndicator />}
+                        {!loading && !redeeming && !!error_msg && (
+                            <ErrorMessage message={error_msg} dismissable />
+                        )}
+                        {!loading &&
+                            !redeemingAll &&
+                            !redeeming &&
+                            lightningAddressHandle && (
+                                <View
+                                    style={{
+                                        marginTop: 30,
+                                        marginBottom: 30
+                                    }}
+                                >
+                                    <TouchableOpacity
+                                        onPress={this.copyLightningAddress}
+                                    >
+                                        <Row
+                                            style={{
+                                                alignSelf: 'center'
+                                            }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    fontFamily:
+                                                        'PPNeueMontreal-Book',
+                                                    fontSize: 26 / fontScale,
+                                                    color: themeColor('text'),
+                                                    textAlign: 'center'
+                                                }}
+                                            >
+                                                {`${lightningAddressHandle}@${lightningAddressDomain}`}
+                                            </Text>
+                                        </Row>
+                                    </TouchableOpacity>
+                                    <Row
+                                        style={{
+                                            alignSelf: 'center',
+                                            marginTop: 15
+                                        }}
+                                    >
+                                        {!zeusPlus && (
+                                            <TouchableOpacity
+                                                onPress={() =>
+                                                    navigation.navigate(
+                                                        'ZeusPayPlus'
+                                                    )
+                                                }
+                                            >
+                                                <Pill
+                                                    title={localeString(
+                                                        'views.Settings.LightningAddress.upgrade'
+                                                    )}
+                                                    width={200}
+                                                    height={30}
+                                                    backgroundColor={themeColor(
+                                                        'highlight'
+                                                    )}
+                                                    textColor={themeColor(
+                                                        'background'
+                                                    )}
+                                                    borderWidth={1}
+                                                />
+                                            </TouchableOpacity>
+                                        )}
+                                        {zeusPlus && (
+                                            <TouchableOpacity
+                                                onPress={() =>
+                                                    navigation.navigate(
+                                                        'ZeusPayPlus'
+                                                    )
+                                                }
+                                            >
+                                                <Pill
+                                                    title="ZEUS Pay+"
+                                                    width={100}
+                                                    height={30}
+                                                    borderColor={themeColor(
+                                                        'highlight'
+                                                    )}
+                                                    borderWidth={1}
+                                                />
+                                            </TouchableOpacity>
+                                        )}
+                                    </Row>
+                                    {isZaplocker && (
+                                        <View
+                                            style={{
+                                                marginTop: 20,
+                                                width: '100%'
+                                            }}
+                                        >
+                                            <WarningMessage
+                                                message={localeString(
+                                                    'zeuspay.zaplocker.retired'
+                                                )}
+                                            />
+                                            <Button
+                                                title={localeString(
+                                                    'zeuspay.zaplocker.retirement.switch'
+                                                )}
+                                                onPress={() =>
+                                                    navigation.navigate(
+                                                        'LightningAddressSettings'
+                                                    )
+                                                }
+                                                secondary
+                                            />
+                                        </View>
+                                    )}
+                                    <Row
+                                        style={{
+                                            alignSelf: 'center',
+                                            marginTop: 30
+                                        }}
+                                    >
+                                        <QRButton />
+                                        <PortalButton />
+                                    </Row>
+                                </View>
+                            )}
+                        {!loading &&
+                            !redeeming &&
+                            !redeemingAll &&
+                            !lightningAddressHandle && (
+                                <>
+                                    <View
+                                        style={{
+                                            flex: 1,
+                                            marginLeft: 5,
+                                            marginRight: 5
+                                        }}
+                                    >
+                                        <ScrollView
+                                            ref={this.scrollViewRef}
+                                            style={{ margin: 10 }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    ...styles.explainer,
+                                                    color: themeColor('text')
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'zeuspay.intro.explainer1'
+                                                )}
+                                            </Text>
+                                            <Text
+                                                style={{
+                                                    ...styles.explainer,
+                                                    color: themeColor('text')
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'zeuspay.intro.explainer2'
+                                                )}
+                                            </Text>
+
+                                            {BackendUtils.supportsCashuWallet() && (
+                                                <View
+                                                    style={styles.optionBlock}
+                                                >
+                                                    <Row justify="space-between">
+                                                        <Text
+                                                            style={{
+                                                                ...styles.explainer,
+                                                                fontWeight:
+                                                                    'bold',
+                                                                fontSize: 30,
+                                                                color: themeColor(
+                                                                    'text'
+                                                                )
+                                                            }}
+                                                        >
+                                                            {localeString(
+                                                                'general.ecash'
+                                                            )}
+                                                        </Text>
+                                                        <View
+                                                            style={{
+                                                                marginLeft: 15
+                                                            }}
+                                                        >
+                                                            <Pill
+                                                                title={localeString(
+                                                                    'general.custodial'
+                                                                ).toUpperCase()}
+                                                                textColor={themeColor(
+                                                                    'highlight'
+                                                                )}
+                                                                borderColor={themeColor(
+                                                                    'highlight'
+                                                                )}
+                                                                width={160}
+                                                                height={25}
+                                                            />
+                                                        </View>
+                                                    </Row>
+
+                                                    <Text
+                                                        style={{
+                                                            ...styles.explainer,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'zeuspay.intro.ecash.overview'
+                                                        )}
+                                                    </Text>
+
+                                                    <Accordion
+                                                        id="lightning-address-pros-cons-ecash"
+                                                        title={localeString(
+                                                            'zeuspay.intro.prosAndCons'
+                                                        )}
+                                                        headerLayout="form"
+                                                        embedded
+                                                        scrollRef={
+                                                            this.scrollViewRef
+                                                        }
+                                                        headerStyle={
+                                                            styles.prosConsToggle
+                                                        }
+                                                        renderFormTitle={() => (
+                                                            <Text
+                                                                style={{
+                                                                    ...styles.explainer,
+                                                                    fontWeight:
+                                                                        'bold',
+                                                                    color: themeColor(
+                                                                        'text'
+                                                                    )
+                                                                }}
+                                                            >
+                                                                {localeString(
+                                                                    'zeuspay.intro.prosAndCons'
+                                                                )}
+                                                            </Text>
+                                                        )}
+                                                    >
+                                                        <View
+                                                            style={
+                                                                styles.prosCons
+                                                            }
+                                                        >
+                                                            <Row justify="space-between">
+                                                                <View
+                                                                    style={
+                                                                        styles.prosConsColumn
+                                                                    }
+                                                                >
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.settledUponPayment'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.noExpiry'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.noLspChannelNeeded'
+                                                                        )}`}
+                                                                    </Text>
+                                                                </View>
+                                                                <View
+                                                                    style={
+                                                                        styles.prosConsColumn
+                                                                    }
+                                                                >
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🔴 ${localeString(
+                                                                            'general.custodial'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🔴 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.redeemInApp'
+                                                                        )}`}
+                                                                    </Text>
+                                                                </View>
+                                                            </Row>
+                                                        </View>
+                                                    </Accordion>
+                                                    <Row>
+                                                        <View
+                                                            style={{
+                                                                margin: 2,
+                                                                width: '50%'
+                                                            }}
+                                                        >
+                                                            <Button
+                                                                title={localeString(
+                                                                    'general.learnMore'
+                                                                )}
+                                                                onPress={() =>
+                                                                    navigation.navigate(
+                                                                        'CashuLightningAddressInfo'
+                                                                    )
+                                                                }
+                                                                secondary
+                                                            />
+                                                        </View>
+                                                        <View
+                                                            style={{
+                                                                margin: 2,
+                                                                width: '50%'
+                                                            }}
+                                                        >
+                                                            <Button
+                                                                title={
+                                                                    cashuEnabled
+                                                                        ? localeString(
+                                                                              'general.getStarted'
+                                                                          )
+                                                                        : localeString(
+                                                                              'zeuspay.enableEcash'
+                                                                          )
+                                                                }
+                                                                onPress={() =>
+                                                                    navigation.navigate(
+                                                                        cashuEnabled
+                                                                            ? 'CreateCashuLightningAddress'
+                                                                            : 'EcashSettings'
+                                                                    )
+                                                                }
+                                                            />
+                                                        </View>
+                                                    </Row>
+                                                </View>
+                                            )}
+
+                                            {notEmbedded && (
+                                                <View
+                                                    style={styles.optionBlock}
+                                                >
+                                                    <Row justify="space-between">
+                                                        <Text
+                                                            style={{
+                                                                ...styles.explainer,
+                                                                fontWeight:
+                                                                    'bold',
+                                                                fontSize: 30,
+                                                                color: themeColor(
+                                                                    'text'
+                                                                )
+                                                            }}
+                                                        >
+                                                            {localeString(
+                                                                'general.remote'
+                                                            )}
+                                                        </Text>
+                                                        <View
+                                                            style={{
+                                                                marginLeft: 15
+                                                            }}
+                                                        >
+                                                            <Pill
+                                                                title={localeString(
+                                                                    'general.selfCustodial'
+                                                                ).toUpperCase()}
+                                                                textColor={themeColor(
+                                                                    'success'
+                                                                )}
+                                                                borderColor={themeColor(
+                                                                    'success'
+                                                                )}
+                                                                width={160}
+                                                                height={25}
+                                                            />
+                                                        </View>
+                                                    </Row>
+
+                                                    <Text
+                                                        style={{
+                                                            ...styles.explainer,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'zeuspay.intro.nwc.overview'
+                                                        )}
+                                                    </Text>
+
+                                                    <Accordion
+                                                        id="lightning-address-pros-cons-remote"
+                                                        title={localeString(
+                                                            'zeuspay.intro.prosAndCons'
+                                                        )}
+                                                        headerLayout="form"
+                                                        embedded
+                                                        scrollRef={
+                                                            this.scrollViewRef
+                                                        }
+                                                        headerStyle={
+                                                            styles.prosConsToggle
+                                                        }
+                                                        renderFormTitle={() => (
+                                                            <Text
+                                                                style={{
+                                                                    ...styles.explainer,
+                                                                    fontWeight:
+                                                                        'bold',
+                                                                    color: themeColor(
+                                                                        'text'
+                                                                    )
+                                                                }}
+                                                            >
+                                                                {localeString(
+                                                                    'zeuspay.intro.prosAndCons'
+                                                                )}
+                                                            </Text>
+                                                        )}
+                                                    >
+                                                        <View
+                                                            style={
+                                                                styles.prosCons
+                                                            }
+                                                        >
+                                                            <Row justify="space-between">
+                                                                <View
+                                                                    style={
+                                                                        styles.prosConsColumn
+                                                                    }
+                                                                >
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'general.selfCustodial'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.automaticallyAccepted'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🟢 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.noLspChannelNeeded'
+                                                                        )}`}
+                                                                    </Text>
+                                                                </View>
+                                                                <View
+                                                                    style={
+                                                                        styles.prosConsColumn
+                                                                    }
+                                                                >
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.explainer,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`🔴 ${localeString(
+                                                                            'zeuspay.intro.prosAndCons.remotePlusNwc'
+                                                                        )}`}
+                                                                    </Text>
+                                                                </View>
+                                                            </Row>
+                                                        </View>
+                                                    </Accordion>
+                                                    <Row>
+                                                        <View
+                                                            style={{
+                                                                marginTop: 10,
+                                                                marginBottom: 10,
+                                                                width: '100%'
+                                                            }}
+                                                        >
+                                                            <Button
+                                                                title={localeString(
+                                                                    'general.getStarted'
+                                                                )}
+                                                                onPress={() =>
+                                                                    navigation.navigate(
+                                                                        'CreateNWCLightningAddress'
+                                                                    )
+                                                                }
+                                                            />
+                                                        </View>
+                                                    </Row>
+                                                </View>
+                                            )}
+                                        </ScrollView>
+                                    </View>
+                                </>
+                            )}
+                        {lightningAddressHandle && (
+                            <>
+                                {!loading &&
+                                    !redeeming &&
+                                    !redeemingAll &&
+                                    paid.length === 0 && (
+                                        <TouchableOpacity
+                                            style={{
+                                                margin: 15,
+                                                alignItems: 'center'
+                                            }}
+                                            onPress={() =>
+                                                status().catch(
+                                                    this.handleStoreError
+                                                )
+                                            }
+                                        >
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {lightningAddressType === 'nwc'
+                                                    ? localeString(
+                                                          'views.Settings.LightningAddress.noNeedToRedeem'
+                                                      )
+                                                    : localeString(
+                                                          'views.Settings.LightningAddress.noPaymentsToRedeem'
+                                                      )}
+                                            </Text>
+                                        </TouchableOpacity>
+                                    )}
+
+                                {!loading && !redeeming && !redeemingAll && (
+                                    <>
+                                        <FlatList
+                                            data={paid}
+                                            renderItem={({
+                                                item,
+                                                index
+                                            }: {
+                                                item: any;
+                                                index: number;
+                                            }) => {
+                                                if (
+                                                    lightningAddressType ===
+                                                    'cashu'
+                                                ) {
+                                                    return (
+                                                        <CashuPayment
+                                                            index={index}
+                                                            item={item}
+                                                            navigation={
+                                                                navigation
+                                                            }
+                                                        />
+                                                    );
+                                                }
+                                                return null;
+                                            }}
+                                            ListFooterComponent={
+                                                <Spacer height={100} />
+                                            }
+                                            onRefresh={() =>
+                                                status().catch(
+                                                    this.handleStoreError
+                                                )
+                                            }
+                                            refreshing={loading}
+                                            keyExtractor={(_, index) =>
+                                                `${index}`
+                                            }
+                                        />
+                                        {paid && paid.length > 0 && (
+                                            <Button
+                                                title={localeString(
+                                                    'views.Settings.LightningAddress.redeemAll'
+                                                )}
+                                                onPress={() =>
+                                                    redeemAllOpenPaymentsCashu().catch(
+                                                        this.handleStoreError
+                                                    )
+                                                }
+                                            />
+                                        )}
+                                        {lightningAddressType === 'nwc' && (
+                                            <Animated.View
+                                                style={{
+                                                    flex: 1,
+                                                    maxHeight: 80,
+                                                    justifyContent: 'flex-end',
+                                                    alignSelf: 'center',
+                                                    bottom: 10,
+                                                    paddingTop: 40,
+                                                    paddingBottom: 35,
+                                                    width: '100%',
+                                                    transform: [
+                                                        {
+                                                            translateY:
+                                                                this.pan.y
+                                                        }
+                                                    ],
+                                                    alignItems: 'center'
+                                                }}
+                                                {...this.panResponder
+                                                    .panHandlers}
+                                            >
+                                                <TouchableOpacity
+                                                    onPress={() =>
+                                                        this.props.navigation.navigate(
+                                                            'Activity',
+                                                            {
+                                                                animation:
+                                                                    'slide_from_bottom'
+                                                            }
+                                                        )
+                                                    }
+                                                    accessibilityLabel={localeString(
+                                                        'general.activity'
+                                                    )}
+                                                >
+                                                    <CaretUp
+                                                        fill={themeColor(
+                                                            'text'
+                                                        )}
+                                                    />
+                                                </TouchableOpacity>
+                                            </Animated.View>
+                                        )}
+                                    </>
+                                )}
+                            </>
+                        )}
+                    </View>
+                </View>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    loadingPatternWrapper: {
+        position: 'absolute',
+        /* eslint-disable zeus/no-negative-layout-offset -- TODO #2794 */
+        top: -50,
+        left: -5,
+        right: -5,
+        /* eslint-enable zeus/no-negative-layout-offset */
+        bottom: 0
+    },
+    explainer: {
+        fontSize: 18,
+        marginBottom: 10,
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    optionBlock: {
+        marginTop: 10,
+        marginBottom: 12
+    },
+    prosConsToggle: {
+        marginBottom: 8
+    },
+    prosCons: {
+        alignSelf: 'center',
+        marginTop: 15,
+        marginBottom: 40
+    },
+    prosConsColumn: {
+        alignItems: 'flex-start',
+        flexDirection: 'column',
+        width: '47%',
+        height: '100%'
+    }
+});

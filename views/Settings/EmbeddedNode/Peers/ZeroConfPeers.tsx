@@ -1,0 +1,213 @@
+import * as React from 'react';
+import { FlatList, ScrollView, View } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import { Row } from '../../../../components/layout/Row';
+import Button from '../../../../components/Button';
+import Text from '../../../../components/Text';
+import TextInput from '../../../../components/TextInput';
+import Screen from '../../../../components/Screen';
+import Header from '../../../../components/Header';
+
+import SettingsStore from '../../../../stores/SettingsStore';
+
+import { localeString } from '../../../../utils/LocaleUtils';
+import { themeColor } from '../../../../utils/ThemeUtils';
+import ValidationUtils from '../../../../utils/ValidationUtils';
+
+interface ZeroConfPeersProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+}
+
+interface ZeroConfPeersState {
+    zeroConfPeers: Array<string>;
+    addPeer: string;
+    isPubkeyValid: boolean;
+}
+
+@inject('SettingsStore')
+@observer
+export default class ZeroConfPeers extends React.Component<
+    ZeroConfPeersProps,
+    ZeroConfPeersState
+> {
+    state = {
+        zeroConfPeers: this.props.SettingsStore.settings.zeroConfPeers || [],
+        addPeer: '',
+        isPubkeyValid: true
+    };
+
+    remove = (arrOriginal: Array<string>, elementToRemove: any) => {
+        return arrOriginal.filter(function (el) {
+            return el !== elementToRemove;
+        });
+    };
+
+    render() {
+        const { navigation, SettingsStore } = this.props;
+        const { zeroConfPeers, addPeer, isPubkeyValid } = this.state;
+        const { updateSettings }: any = SettingsStore;
+
+        return (
+            <Screen>
+                <View style={{ flex: 1 }}>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString(
+                                'views.Settings.EmbeddedNode.ZeroConfPeers.title'
+                            ),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        navigation={navigation}
+                    />
+                    <ScrollView style={{ margin: 5 }}>
+                        <View style={{ margin: 10 }}>
+                            <Text>
+                                {localeString(
+                                    'views.Settings.EmbeddedNode.Peers.addPeer'
+                                )}
+                            </Text>
+                            <Row align="flex-end">
+                                <TextInput
+                                    placeholder="031b301307574bbe9b9ac7b79cbe1700e31e544513eae0b5d7497483083f99e581"
+                                    onChangeText={(text: string) =>
+                                        this.setState({
+                                            addPeer: text,
+                                            isPubkeyValid:
+                                                text === '' ||
+                                                ValidationUtils.validateNodePubkey(
+                                                    text
+                                                )
+                                        })
+                                    }
+                                    value={addPeer}
+                                    style={{ flex: 1 }}
+                                    autoCapitalize="none"
+                                    autoCorrect={false}
+                                    textColor={
+                                        isPubkeyValid
+                                            ? themeColor('text')
+                                            : themeColor('warning')
+                                    }
+                                    error={!isPubkeyValid}
+                                />
+                                <View
+                                    style={{
+                                        alignSelf: 'flex-end',
+                                        width: 60,
+                                        height: 60
+                                    }}
+                                >
+                                    <Button
+                                        icon={{
+                                            name: 'plus',
+                                            type: 'font-awesome',
+                                            size: 25,
+                                            color:
+                                                !addPeer || !isPubkeyValid
+                                                    ? themeColor(
+                                                          'secondaryText'
+                                                      )
+                                                    : themeColor('text')
+                                        }}
+                                        iconOnly
+                                        onPress={() => {
+                                            if (!addPeer || !isPubkeyValid)
+                                                return;
+                                            const newZeroConfPeers = [
+                                                ...zeroConfPeers,
+                                                addPeer
+                                            ];
+                                            this.setState({
+                                                zeroConfPeers: newZeroConfPeers,
+                                                addPeer: '',
+                                                isPubkeyValid: true
+                                            });
+                                            updateSettings({
+                                                zeroConfPeers: newZeroConfPeers
+                                            });
+                                        }}
+                                    />
+                                </View>
+                            </Row>
+                            <Text>
+                                {localeString(
+                                    'views.Settings.EmbeddedNode.Peers.peersList'
+                                )}
+                            </Text>
+                            {zeroConfPeers && zeroConfPeers.length > 0 ? (
+                                <FlatList
+                                    data={zeroConfPeers}
+                                    renderItem={({ item }: any) => (
+                                        <Row align="flex-end">
+                                            <TextInput
+                                                value={item}
+                                                style={{ flex: 1 }}
+                                                autoCapitalize="none"
+                                                locked
+                                            />
+                                            <View
+                                                style={{
+                                                    alignSelf: 'flex-end',
+                                                    width: 60,
+                                                    height: 60
+                                                }}
+                                            >
+                                                <Button
+                                                    icon={{
+                                                        name: 'minus',
+                                                        type: 'font-awesome',
+                                                        size: 25,
+                                                        color: themeColor(
+                                                            'text'
+                                                        )
+                                                    }}
+                                                    iconOnly
+                                                    onPress={() => {
+                                                        const newZeroConfPeers =
+                                                            this.remove(
+                                                                zeroConfPeers,
+                                                                item
+                                                            );
+                                                        this.setState({
+                                                            zeroConfPeers:
+                                                                newZeroConfPeers
+                                                        });
+                                                        updateSettings({
+                                                            zeroConfPeers:
+                                                                newZeroConfPeers
+                                                        });
+                                                    }}
+                                                />
+                                            </View>
+                                        </Row>
+                                    )}
+                                    keyExtractor={(item: any, index: number) =>
+                                        `${item.txid}-${index}`
+                                    }
+                                    onEndReachedThreshold={50}
+                                    scrollEnabled={false}
+                                />
+                            ) : (
+                                <Text
+                                    style={{
+                                        color: themeColor('secondaryText'),
+                                        marginTop: 15
+                                    }}
+                                >{`${localeString(
+                                    'general.noneSelected'
+                                )}.`}</Text>
+                            )}
+                        </View>
+                    </ScrollView>
+                </View>
+            </Screen>
+        );
+    }
+}

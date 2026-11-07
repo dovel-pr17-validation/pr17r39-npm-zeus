@@ -1,0 +1,832 @@
+import React from 'react';
+import {
+    View,
+    StyleSheet,
+    ScrollView,
+    TouchableOpacity,
+    Text
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+
+import Screen from '../../../components/Screen';
+import Header from '../../../components/Header';
+import { Body } from '../../../components/text/Body';
+import Button from '../../../components/Button';
+import LoadingIndicator from '../../../components/LoadingIndicator';
+import KeyValue from '../../../components/KeyValue';
+import Amount from '../../../components/Amount';
+import { ErrorMessage } from '../../../components/SuccessErrorMessage';
+
+import ModalStore from '../../../stores/ModalStore';
+
+import { confirmAction } from '../../../utils/ActionUtils';
+import DateTimeUtils from '../../../utils/DateTimeUtils';
+import NostrConnectUtils from '../../../utils/NostrConnectUtils';
+import { reAuthNavigation } from '../../../utils/NavigationUtils';
+import { themeColor } from '../../../utils/ThemeUtils';
+import { localeString } from '../../../utils/LocaleUtils';
+
+import NostrWalletConnectStore from '../../../stores/NostrWalletConnectStore';
+
+import NWCConnection from '../../../models/NWCConnection';
+import EditIcon from '../../../assets/images/SVG/Edit.svg';
+import Checkmark from '../../../assets/images/SVG/Checkmark.svg';
+import ClockIcon from '../../../assets/images/SVG/Clock.svg';
+
+interface NWCConnectionDetailsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<'NWCConnectionDetails', { connectionId: string }>;
+    NostrWalletConnectStore: NostrWalletConnectStore;
+    ModalStore: ModalStore;
+}
+
+interface NWCConnectionDetailsState {
+    loading: boolean;
+    regenerating: boolean;
+    deleting: boolean;
+    connection: NWCConnection | null;
+    error: string | null;
+}
+
+@inject('NostrWalletConnectStore', 'ModalStore')
+@observer
+export default class NWCConnectionDetails extends React.Component<
+    NWCConnectionDetailsProps,
+    NWCConnectionDetailsState
+> {
+    private unsubscribeFocus?: () => void;
+    private isUnmounted = false;
+    constructor(props: NWCConnectionDetailsProps) {
+        super(props);
+        this.state = {
+            loading: false,
+            regenerating: false,
+            deleting: false,
+            connection: null,
+            error: null
+        };
+    }
+
+    componentDidMount() {
+        const { navigation } = this.props;
+        this.unsubscribeFocus = navigation.addListener(
+            'focus',
+            this.loadConnection
+        );
+    }
+    componentDidUpdate(
+        _prevProps: NWCConnectionDetailsProps,
+        prevState: NWCConnectionDetailsState
+    ) {
+        const { connection } = this.state;
+        if (
+            connection?.hasWarnings &&
+            connection.hasWarnings !== prevState.connection?.hasWarnings
+        ) {
+            this.showWarning();
+        }
+    }
+
+    showWarning = () => {
+        const { connection } = this.state;
+        const { ModalStore } = this.props;
+
+        if (connection?.hasWarnings) {
+            const primary = connection.primaryWarning;
+            ModalStore.toggleInfoModal({
+                title: localeString('general.warning'),
+                text: localeString(primary?.translationKey!),
+                buttons: [
+                    {
+                        title: localeString('general.iUnderstand'),
+                        callback: this.clearWarning
+                    }
+                ]
+            });
+        }
+    };
+
+    clearWarning = async () => {
+        const { connection } = this.state;
+        const { NostrWalletConnectStore } = this.props;
+        if (!connection) return;
+        const primaryMessage = connection.primaryWarning;
+        try {
+            await NostrWalletConnectStore.clearWarnings(
+                connection.id,
+                primaryMessage?.type!
+            );
+        } catch (error) {
+            console.error('Failed to clear budget warning:', error);
+        }
+    };
+
+    loadConnection = async () => {
+        const { NostrWalletConnectStore } = this.props;
+        const { connectionId } = this.props.route.params;
+        if (!connectionId) {
+            this.setState({
+                loading: false,
+                error: localeString(
+                    'stores.NostrWalletConnectStore.error.connectionNotFound'
+                )
+            });
+            return;
+        }
+        this.setState({ loading: true });
+        try {
+            const { connection } = NostrWalletConnectStore.getConnection({
+                connectionId
+            });
+            if (connection) {
+                await NostrWalletConnectStore.getActivities(connectionId);
+                const refreshed = NostrWalletConnectStore.getConnection({
+                    connectionId
+                }).connection;
+                this.setState({
+                    connection: refreshed || connection,
+                    loading: false
+                });
+            } else {
+                this.setState({
+                    loading: false,
+                    error: localeString(
+                        'stores.NostrWalletConnectStore.error.connectionNotFound'
+                    )
+                });
+            }
+        } catch (error) {
+            console.error('Failed to load connection:', error);
+            this.setState({
+                loading: false,
+                error:
+                    (error as Error).message ||
+                    localeString(
+                        'stores.NostrWalletConnectStore.error.failedToLoadConnections'
+                    )
+            });
+        }
+    };
+
+    componentWillUnmount() {
+        this.isUnmounted = true;
+        if (this.unsubscribeFocus) {
+            this.unsubscribeFocus();
+        }
+    }
+
+    editConnection = (connectionId: string) => {
+        this.props.navigation.navigate('AddOrEditNWCConnection', {
+            connectionId,
+            isEdit: true
+        });
+    };
+
+    viewConnectionSecret = (connectionId: string) => {
+        // The pairing URL is a bearer credential for this connection's
+        // permissions, so re-displaying it on demand is gated behind the
+        // same re-auth prompt used for other secret reveals (e.g. the seed).
+        reAuthNavigation(this.props.navigation, 'NWCConnectionQR', {
+            connectionId
+        });
+    };
+
+    buildConnectionParams = (connection: NWCConnection): any => {
+        const params: any = {
+            id: connection.id,
+            name: connection.name,
+            relayUrl: connection.relayUrl,
+            permissions: connection.permissions,
+            budgetRenewal: connection.budgetRenewal || 'never',
+            totalSpendSats: connection.totalSpendSats,
+            lastBudgetReset: connection.lastBudgetReset,
+            activity: connection.activity,
+            createdAt: connection.createdAt
+        };
+        if (connection.maxAmountSats && connection.maxAmountSats > 0) {
+            params.budgetAmount = connection.maxAmountSats;
+        }
+
+        if (connection.expiresAt) {
+            params.expiresAt = connection.expiresAt;
+        }
+        if (connection.customExpiryValue && connection.customExpiryUnit) {
+            params.customExpiryValue = connection.customExpiryValue;
+            params.customExpiryUnit = connection.customExpiryUnit;
+        }
+
+        return params;
+    };
+
+    confirmRegenerateConnection = () => {
+        const { connection } = this.state;
+        if (!connection) {
+            this.setState({
+                error: localeString(
+                    'stores.NostrWalletConnectStore.error.connectionNotFound'
+                )
+            });
+            return;
+        }
+        confirmAction(
+            localeString(
+                'views.Settings.NostrWalletConnect.regenerateConnection'
+            ),
+            localeString(
+                'views.Settings.NostrWalletConnect.regenerateConnection.confirm'
+            ),
+            {
+                text: localeString(
+                    'views.Settings.NostrWalletConnect.regenerateConnection'
+                ),
+                onPress: () => {
+                    this.regenerateConnection();
+                }
+            },
+            {
+                text: localeString('general.cancel'),
+                onPress: () => void 0,
+                isPreferred: true
+            }
+        );
+    };
+
+    regenerateConnection = async () => {
+        const { NostrWalletConnectStore, navigation } = this.props;
+        const { connection } = this.state;
+
+        if (!connection) {
+            this.setState({
+                error: localeString(
+                    'stores.NostrWalletConnectStore.error.connectionNotFound'
+                )
+            });
+            return;
+        }
+        this.setState({ regenerating: true, error: null });
+        try {
+            await NostrWalletConnectStore.deleteConnection(connection.id);
+            const params = this.buildConnectionParams(connection);
+            const nostrUrl = await NostrWalletConnectStore.createConnection(
+                params
+            );
+            if (nostrUrl && !this.isUnmounted) {
+                const createdConnection =
+                    NostrWalletConnectStore.connections[0];
+                navigation.navigate('NWCConnectionQR', {
+                    connectionId: createdConnection.id,
+                    nostrUrl
+                });
+            }
+        } catch (error) {
+            console.error('Failed to regenerate connection:', error);
+            this.setState({
+                error:
+                    (error as Error).message ||
+                    'Failed to regenerate connection',
+                regenerating: false
+            });
+        } finally {
+            this.setState({ regenerating: false });
+        }
+    };
+
+    deleteConnection = (connection: NWCConnection) => {
+        const { NostrWalletConnectStore, navigation } = this.props;
+        confirmAction(
+            localeString('views.Settings.NostrWalletConnect.deleteConnection'),
+            localeString(
+                'views.Settings.NostrWalletConnect.deleteConnection.confirm'
+            ),
+            {
+                text: localeString(
+                    'views.Settings.NostrWalletConnect.deleteConnection'
+                ),
+                style: 'destructive',
+                onPress: () => {
+                    this.setState({ deleting: true, error: null });
+                    NostrWalletConnectStore.deleteConnection(connection.id)
+                        .then(() => {
+                            if (!this.isUnmounted) {
+                                navigation.goBack();
+                            }
+                        })
+                        .catch((error) => {
+                            console.error(
+                                'Failed to delete connection:',
+                                error
+                            );
+                            if (!this.isUnmounted) {
+                                this.setState({
+                                    error: 'Failed to delete connection',
+                                    deleting: false
+                                });
+                            }
+                        });
+                }
+            },
+            {
+                text: localeString('general.cancel'),
+                onPress: () => void 0,
+                isPreferred: true
+            }
+        );
+    };
+    render() {
+        const { navigation, NostrWalletConnectStore } = this.props;
+        const { loading, regenerating, deleting, error, connection } =
+            this.state;
+        const { loading: storeLoading, waitingForInFlightHandlers } =
+            NostrWalletConnectStore;
+        const showInFlightWait =
+            waitingForInFlightHandlers && (deleting || regenerating);
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={
+                        connection
+                            ? {
+                                  text: regenerating
+                                      ? localeString(
+                                            'views.Settings.NostrWalletConnect.regeneratingConnection'
+                                        )
+                                      : connection.name,
+                                  style: {
+                                      color: themeColor('text'),
+                                      fontFamily: 'PPNeueMontreal-Book'
+                                  }
+                              }
+                            : undefined
+                    }
+                    rightComponent={
+                        loading || storeLoading || regenerating || deleting ? (
+                            <View style={{ marginRight: 10 }}>
+                                <LoadingIndicator size={30} />
+                            </View>
+                        ) : (
+                            <View style={styles.headerActions}>
+                                {connection?.hasPaymentPermissions() && (
+                                    <TouchableOpacity
+                                        onPress={() =>
+                                            navigation.navigate(
+                                                'NWCConnectionActivity',
+                                                { connectionId: connection?.id }
+                                            )
+                                        }
+                                        style={styles.headerActionButton}
+                                    >
+                                        <ClockIcon
+                                            color={themeColor('text')}
+                                            width={30}
+                                            height={30}
+                                        />
+                                    </TouchableOpacity>
+                                )}
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        this.editConnection(
+                                            connection?.id ?? ''
+                                        )
+                                    }
+                                    style={styles.headerActionButton}
+                                >
+                                    <EditIcon
+                                        fill={themeColor('text')}
+                                        width={30}
+                                        height={30}
+                                    />
+                                </TouchableOpacity>
+                            </View>
+                        )
+                    }
+                    navigation={navigation}
+                />
+
+                {error ? (
+                    <ErrorMessage
+                        message={
+                            error ||
+                            localeString(
+                                'stores.NostrWalletConnectStore.error.connectionNotFound'
+                            )
+                        }
+                        dismissable
+                    />
+                ) : connection ? (
+                    <View style={{ flex: 1 }}>
+                        <ScrollView
+                            style={styles.container}
+                            showsVerticalScrollIndicator={false}
+                        >
+                            <View>
+                                <View style={styles.section}>
+                                    <View style={styles.sectionTitle}>
+                                        <Text
+                                            style={{
+                                                color: themeColor('text')
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.Settings.NostrWalletConnect.connectionDetails'
+                                            )}
+                                        </Text>
+                                    </View>
+
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'general.status'
+                                        )}
+                                        valueIndicatorColor={
+                                            connection.isExpired
+                                                ? themeColor('delete')
+                                                : themeColor('success')
+                                        }
+                                        value={
+                                            connection.isExpired
+                                                ? localeString(
+                                                      'channel.expirationStatus.expired'
+                                                  )
+                                                : localeString('general.active')
+                                        }
+                                    />
+
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Settings.NostrWalletConnect.created'
+                                        )}
+                                        value={DateTimeUtils.listFormattedDateShort(
+                                            connection.createdAt.getTime() /
+                                                1000
+                                        )}
+                                    />
+
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Settings.NostrWalletConnect.lastUsed'
+                                        )}
+                                        value={
+                                            connection.lastUsed
+                                                ? DateTimeUtils.listFormattedDateShort(
+                                                      connection.lastUsed.getTime() /
+                                                          1000
+                                                  )
+                                                : localeString(
+                                                      'models.Invoice.never'
+                                                  )
+                                        }
+                                    />
+
+                                    {connection.maxAmountSats ? (
+                                        <KeyValue
+                                            keyValue={localeString(
+                                                'views.Settings.NostrWalletConnect.budget'
+                                            )}
+                                            value={
+                                                <View
+                                                    style={{
+                                                        flexDirection: 'row',
+                                                        alignItems: 'center',
+                                                        flexShrink: 1,
+                                                        gap: 4
+                                                    }}
+                                                >
+                                                    <Amount
+                                                        sats={
+                                                            connection.maxAmountSats
+                                                        }
+                                                        toggleable
+                                                    />
+                                                    {connection.budgetRenewal !==
+                                                        'never' && (
+                                                        <Text
+                                                            style={{
+                                                                fontFamily:
+                                                                    'PPNeueMontreal-Book',
+                                                                color: themeColor(
+                                                                    'text'
+                                                                )
+                                                            }}
+                                                        >
+                                                            {`(${connection.budgetRenewal})`}
+                                                        </Text>
+                                                    )}
+                                                </View>
+                                            }
+                                        />
+                                    ) : null}
+
+                                    {connection.maxAmountSats && (
+                                        <>
+                                            <KeyValue
+                                                keyValue={localeString(
+                                                    'views.Settings.NostrWalletConnect.totalSpent'
+                                                )}
+                                                value={
+                                                    <Amount
+                                                        sats={
+                                                            connection.totalSpendSats
+                                                        }
+                                                        toggleable
+                                                        debit
+                                                    />
+                                                }
+                                            />
+
+                                            <KeyValue
+                                                keyValue={localeString(
+                                                    'views.Settings.NostrWalletConnect.totalReceived'
+                                                )}
+                                                value={
+                                                    <Amount
+                                                        credit
+                                                        sats={
+                                                            connection.totalReceivedActivitySats
+                                                        }
+                                                        toggleable
+                                                    />
+                                                }
+                                            />
+
+                                            <KeyValue
+                                                keyValue={localeString(
+                                                    'views.Settings.NostrWalletConnect.remainingBudget'
+                                                )}
+                                                value={
+                                                    <Amount
+                                                        sats={
+                                                            connection.remainingBudget
+                                                        }
+                                                        toggleable
+                                                    />
+                                                }
+                                            />
+                                        </>
+                                    )}
+
+                                    {connection.expiresAt && (
+                                        <KeyValue
+                                            keyValue={localeString(
+                                                'general.expiresAt'
+                                            )}
+                                            value={DateTimeUtils.formatDate(
+                                                connection.expiresAt
+                                            )}
+                                        />
+                                    )}
+
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Settings.NostrWalletConnect.connectionId'
+                                        )}
+                                        value={connection.id}
+                                        showCopyIcon
+                                    />
+
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Settings.NostrWalletConnect.publicKey'
+                                        )}
+                                        value={connection.pubkey}
+                                        showCopyIcon
+                                    />
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'nostr.relayUrl'
+                                        )}
+                                        value={connection.relayUrl}
+                                        showCopyIcon
+                                    />
+
+                                    {connection.description && (
+                                        <KeyValue
+                                            keyValue={localeString(
+                                                'views.Settings.NostrWalletConnect.description'
+                                            )}
+                                            value={connection.description}
+                                        />
+                                    )}
+                                </View>
+                                <View style={styles.section}>
+                                    <View style={styles.sectionTitle}>
+                                        <Body bold>
+                                            {localeString(
+                                                'views.Settings.NostrWalletConnect.permissions'
+                                            )}
+                                        </Body>
+                                        <Body>
+                                            ({connection.permissions.length} of{' '}
+                                            {
+                                                NostrConnectUtils.getAvailablePermissions()
+                                                    .length
+                                            }
+                                            )
+                                        </Body>
+                                    </View>
+
+                                    <View style={styles.permissionsList}>
+                                        {NostrConnectUtils.getAvailablePermissions()
+                                            .sort((a, b) => {
+                                                const aActive =
+                                                    connection.permissions.includes(
+                                                        a.key
+                                                    );
+                                                const bActive =
+                                                    connection.permissions.includes(
+                                                        b.key
+                                                    );
+                                                if (aActive && !bActive)
+                                                    return -1;
+                                                if (!aActive && bActive)
+                                                    return 1;
+                                                return 0;
+                                            })
+                                            .map((permissionOption) => {
+                                                const isActive =
+                                                    connection.permissions.includes(
+                                                        permissionOption.key
+                                                    );
+                                                return (
+                                                    <View
+                                                        key={
+                                                            permissionOption.key
+                                                        }
+                                                        style={
+                                                            styles.permissionItem
+                                                        }
+                                                    >
+                                                        <View
+                                                            style={{
+                                                                opacity:
+                                                                    isActive
+                                                                        ? 1
+                                                                        : 0.3
+                                                            }}
+                                                        >
+                                                            <Checkmark
+                                                                fill={
+                                                                    isActive
+                                                                        ? themeColor(
+                                                                              'success'
+                                                                          )
+                                                                        : themeColor(
+                                                                              'secondaryText'
+                                                                          )
+                                                                }
+                                                                width={16}
+                                                                height={16}
+                                                                style={
+                                                                    styles.permissionIcon
+                                                                }
+                                                            />
+                                                        </View>
+                                                        <Text
+                                                            style={[
+                                                                styles.permissionText,
+                                                                {
+                                                                    color: isActive
+                                                                        ? themeColor(
+                                                                              'text'
+                                                                          )
+                                                                        : themeColor(
+                                                                              'secondaryText'
+                                                                          )
+                                                                }
+                                                            ]}
+                                                        >
+                                                            {NostrConnectUtils.getPermissionShortDescription(
+                                                                permissionOption.key
+                                                            )}
+                                                        </Text>
+                                                    </View>
+                                                );
+                                            })}
+                                    </View>
+                                </View>
+                            </View>
+                        </ScrollView>
+
+                        <View style={styles.bottomContainer}>
+                            {showInFlightWait && (
+                                <View style={styles.inFlightWaitContainer}>
+                                    <LoadingIndicator size={24} />
+                                    <Text
+                                        style={[
+                                            styles.inFlightWaitText,
+                                            {
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }
+                                        ]}
+                                    >
+                                        {localeString(
+                                            'views.Settings.NostrWalletConnect.waitingToFinishPendingRequest'
+                                        )}
+                                    </Text>
+                                </View>
+                            )}
+                            <Button
+                                title={localeString(
+                                    'views.Settings.NostrWalletConnect.viewConnectionSecret'
+                                )}
+                                onPress={() =>
+                                    this.viewConnectionSecret(connection.id)
+                                }
+                                disabled={regenerating || deleting}
+                                secondary
+                                noUppercase
+                            />
+                            <Button
+                                title={localeString(
+                                    'views.Settings.NostrWalletConnect.regenerateConnection'
+                                )}
+                                onPress={this.confirmRegenerateConnection}
+                                disabled={regenerating || deleting}
+                                secondary={regenerating}
+                                noUppercase
+                            />
+                            <Button
+                                title={localeString(
+                                    'views.Settings.NostrWalletConnect.deleteConnection'
+                                )}
+                                onPress={() =>
+                                    this.deleteConnection(connection)
+                                }
+                                warning
+                                disabled={loading || deleting || regenerating}
+                                secondary={deleting}
+                                noUppercase
+                            />
+                        </View>
+                    </View>
+                ) : null}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+        paddingHorizontal: 20,
+        paddingTop: 10
+    },
+    headerActionButton: {
+        padding: 8
+    },
+    headerActions: {
+        flexDirection: 'row',
+        alignItems: 'center'
+    },
+    section: {
+        marginBottom: 15
+    },
+    sectionTitle: {
+        flexDirection: 'row',
+        gap: 4,
+        marginBottom: 12
+    },
+    permissionsList: {
+        flex: 1,
+        marginTop: 6
+    },
+    permissionItem: {
+        paddingVertical: 10,
+        marginBottom: 4,
+        borderRadius: 10,
+        marginTop: 4,
+        flexDirection: 'row',
+        alignItems: 'center'
+    },
+    permissionIcon: {
+        marginRight: 8
+    },
+    permissionText: {
+        fontSize: 14,
+        fontFamily: 'PPNeueMontreal-Book',
+        textTransform: 'capitalize',
+        fontWeight: '500'
+    },
+    bottomContainer: {
+        paddingHorizontal: 20,
+        paddingVertical: 15,
+        gap: 10
+    },
+    inFlightWaitContainer: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: 10,
+        paddingVertical: 4
+    },
+    inFlightWaitText: {
+        flexShrink: 1,
+        fontSize: 14,
+        fontFamily: 'PPNeueMontreal-Book',
+        textAlign: 'center'
+    }
+});

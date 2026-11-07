@@ -1,0 +1,357 @@
+import * as React from 'react';
+import { FlatList, View, Text, TouchableOpacity } from 'react-native';
+import { ButtonGroup } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+
+import Header from '../../components/Header';
+import { ErrorMessage } from '../../components/SuccessErrorMessage';
+import { Spacer } from '../../components/layout/Spacer';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import Screen from '../../components/Screen';
+
+import Pie from '../../assets/images/SVG/Pie.svg';
+
+import FeeStore from '../../stores/FeeStore';
+
+import BackendUtils from '../../utils/BackendUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { nodeInfoStore } from '../../stores/Stores';
+
+import { RoutingListItem } from './RoutingListItem';
+import { RoutingHeader } from './RoutingHeader';
+
+interface RoutingProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    FeeStore: FeeStore;
+    route?: Route<
+        'Routing',
+        { filterChanIdIn?: string; filterChanIdOut?: string }
+    >;
+}
+
+interface RoutingState {
+    selectedIndex: number;
+    filterChanIdIn?: string;
+    filterChanIdOut?: string;
+}
+
+const HOURS: { [key: number]: number } = {
+    0: 24,
+    1: 24 * 7,
+    2: 24 * 30,
+    3: 24 * 90,
+    4: 24 * 180,
+    5: 24 * 365
+};
+
+@inject('FeeStore')
+@observer
+export default class Routing extends React.PureComponent<
+    RoutingProps,
+    RoutingState
+> {
+    state: RoutingState = {
+        selectedIndex: 0
+    };
+
+    componentDidMount() {
+        const { FeeStore, route } = this.props;
+        const filterChanIdIn = route?.params?.filterChanIdIn;
+        const filterChanIdOut = route?.params?.filterChanIdOut;
+
+        FeeStore.getFees();
+        if (BackendUtils.supportsForwardingHistory()) {
+            if (filterChanIdIn || filterChanIdOut) {
+                this.setState({ filterChanIdIn, filterChanIdOut });
+            }
+            FeeStore.getForwardingHistory(
+                HOURS[0],
+                filterChanIdIn,
+                filterChanIdOut
+            );
+        }
+    }
+
+    private refetchHistory = (selectedIndex: number) => {
+        const { getForwardingHistory } = this.props.FeeStore;
+        const supportsChannelFilter =
+            BackendUtils.supportsForwardingHistoryChannelFilter(
+                nodeInfoStore.nodeInfo?.version
+            );
+        getForwardingHistory(
+            HOURS[selectedIndex],
+            supportsChannelFilter ? this.state.filterChanIdIn : undefined,
+            supportsChannelFilter ? this.state.filterChanIdOut : undefined
+        );
+    };
+
+    renderItem = ({ item }: { item: any }) => {
+        const { navigation } = this.props;
+        return (
+            <TouchableOpacity
+                onPress={() =>
+                    navigation.navigate('RoutingEvent', {
+                        routingEvent: item
+                    })
+                }
+            >
+                <RoutingListItem
+                    title={localeString('views.Routing.received')}
+                    fee={item.feeSat}
+                    amountOut={item.amtOut}
+                    date={item.getDateShort}
+                />
+            </TouchableOpacity>
+        );
+    };
+
+    render() {
+        const { FeeStore, navigation } = this.props;
+        const { selectedIndex, filterChanIdIn, filterChanIdOut } = this.state;
+        const supportsChannelFilter =
+            BackendUtils.supportsForwardingHistoryChannelFilter(
+                nodeInfoStore.nodeInfo?.version
+            );
+        const {
+            dayEarned,
+            weekEarned,
+            monthEarned,
+            totalEarned,
+            earnedDuringTimeframe,
+            forwardingEvents,
+            forwardingHistoryError,
+            getForwardingHistory
+        } = FeeStore;
+
+        const loading = FeeStore.loading || FeeStore.loadingFees;
+
+        const headerString =
+            forwardingEvents.length > 0
+                ? `${localeString('general.routing')} (${
+                      forwardingEvents.length
+                  })`
+                : localeString('general.routing');
+
+        const clearFilter = () => {
+            this.setState({
+                filterChanIdIn: undefined,
+                filterChanIdOut: undefined
+            });
+            getForwardingHistory(HOURS[selectedIndex]);
+        };
+
+        const FeeBadge = ({
+            navigation
+        }: {
+            navigation: NativeStackNavigationProp<any, any>;
+        }) => (
+            <TouchableOpacity onPress={() => navigation.navigate('SetFees')}>
+                <Pie stroke={themeColor('highlight')} />
+            </TouchableOpacity>
+        );
+
+        const oneDButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 0
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                D
+            </Text>
+        );
+        const oneWButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 1
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                1W
+            </Text>
+        );
+        const oneMButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 2
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                1M
+            </Text>
+        );
+        const threeMButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 3
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                3M
+            </Text>
+        );
+        const sixMButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 4
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                6M
+            </Text>
+        );
+        const oneYButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        selectedIndex === 5
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                1Y
+            </Text>
+        );
+
+        const buttons: any = [
+            { element: oneDButton },
+            { element: oneWButton },
+            { element: oneMButton },
+            { element: threeMButton },
+            { element: sixMButton },
+            { element: oneYButton }
+        ];
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: headerString,
+                        style: { color: themeColor('text') }
+                    }}
+                    rightComponent={
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                alignItems: 'center'
+                            }}
+                        >
+                            {supportsChannelFilter &&
+                                (filterChanIdIn || filterChanIdOut) && (
+                                    <TouchableOpacity
+                                        onPress={clearFilter}
+                                        style={{ marginRight: 10 }}
+                                    >
+                                        <Text
+                                            style={{
+                                                color: themeColor('text'),
+                                                fontSize: 12
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.Routing.clearFilter'
+                                            )}
+                                        </Text>
+                                    </TouchableOpacity>
+                                )}
+                            <FeeBadge navigation={navigation} />
+                        </View>
+                    }
+                    navigation={navigation}
+                />
+                <RoutingHeader
+                    dayEarned={dayEarned}
+                    weekEarned={weekEarned}
+                    monthEarned={monthEarned}
+                    totalEarned={totalEarned}
+                    timeframeEarned={earnedDuringTimeframe}
+                    fullSize={!BackendUtils.supportsForwardingHistory()}
+                />
+                {BackendUtils.supportsForwardingHistory() && (
+                    <View style={{ flex: 1 }}>
+                        <ButtonGroup
+                            onPress={(selectedIndex: number) => {
+                                this.refetchHistory(selectedIndex);
+                                this.setState({ selectedIndex });
+                            }}
+                            selectedIndex={selectedIndex}
+                            buttons={buttons}
+                            selectedButtonStyle={{
+                                backgroundColor: themeColor('highlight'),
+                                borderRadius: 12
+                            }}
+                            containerStyle={{
+                                backgroundColor: themeColor('secondary'),
+                                borderRadius: 12,
+                                borderColor: themeColor('secondary')
+                            }}
+                            innerBorderStyle={{
+                                color: themeColor('secondary')
+                            }}
+                        />
+                        {loading && (
+                            <View style={{ marginTop: 40 }}>
+                                <LoadingIndicator />
+                            </View>
+                        )}
+                        {forwardingEvents.length > 0 && !loading && (
+                            <FlatList
+                                data={forwardingEvents}
+                                renderItem={this.renderItem}
+                                ListFooterComponent={<Spacer height={100} />}
+                                onRefresh={() => {
+                                    this.refetchHistory(
+                                        this.state.selectedIndex
+                                    );
+                                }}
+                                refreshing={false}
+                                keyExtractor={(item, index) =>
+                                    `${item.getTime}-${index}`
+                                }
+                            />
+                        )}
+                        {forwardingEvents.length === 0 && !loading && (
+                            <Text
+                                style={{
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    color: themeColor('text'),
+                                    alignSelf: 'center',
+                                    top: 100
+                                }}
+                            >
+                                {localeString('views.Routing.noEvents')}
+                            </Text>
+                        )}
+                        {forwardingHistoryError && !loading && (
+                            <ErrorMessage
+                                message={localeString(
+                                    'views.NodeInfo.ForwardingHistory.error'
+                                )}
+                            />
+                        )}
+                    </View>
+                )}
+            </Screen>
+        );
+    }
+}

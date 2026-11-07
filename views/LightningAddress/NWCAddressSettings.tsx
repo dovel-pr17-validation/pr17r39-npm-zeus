@@ -1,0 +1,351 @@
+import * as React from 'react';
+import { ScrollView, View, Alert } from 'react-native';
+import { Icon, ListItem } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Button from '../../components/Button';
+import DropdownSetting from '../../components/DropdownSetting';
+import Header from '../../components/Header';
+import Screen from '../../components/Screen';
+import Switch from '../../components/Switch';
+import Text from '../../components/Text';
+import { ErrorMessage } from '../../components/SuccessErrorMessage';
+import LoadingIndicator from '../../components/LoadingIndicator';
+
+import SettingsStore, {
+    NOTIFICATIONS_PREF_KEYS
+} from '../../stores/SettingsStore';
+import LightningAddressStore from '../../stores/LightningAddressStore';
+
+import BackendUtils from '../../utils/BackendUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+
+import ZeusPayPlusSettings from '../../views/LightningAddress/ZeusPayPlusSettings';
+
+interface NWCAddressSettingsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+    LightningAddressStore: LightningAddressStore;
+}
+
+interface NWCAddressSettingsState {
+    allowComments: boolean | undefined;
+    zapReceiptsEnabled: boolean;
+    notifications: number;
+}
+
+@inject('SettingsStore', 'LightningAddressStore')
+@observer
+export default class NWCAddressSettings extends React.Component<
+    NWCAddressSettingsProps,
+    NWCAddressSettingsState
+> {
+    constructor(props: NWCAddressSettingsProps) {
+        super(props);
+
+        const { SettingsStore } = this.props;
+        const { settings } = SettingsStore;
+
+        this.state = {
+            allowComments: settings.lightningAddress?.allowComments
+                ? true
+                : false,
+            zapReceiptsEnabled:
+                settings.lightningAddress?.zapReceiptsEnabled !== false,
+            notifications:
+                settings.lightningAddress?.notifications !== undefined
+                    ? settings.lightningAddress.notifications
+                    : 1
+        };
+    }
+
+    confirmDelete = () => {
+        Alert.alert(
+            localeString('views.Settings.LightningAddress.deleteAddress'),
+            localeString(
+                'views.Settings.LightningAddress.deleteAddressConfirm'
+            ),
+            [
+                {
+                    text: localeString('general.cancel'),
+                    style: 'cancel'
+                },
+                {
+                    text: localeString('general.delete'),
+                    onPress: () => {
+                        const { LightningAddressStore } = this.props;
+                        LightningAddressStore.deleteAddress()
+                            .then(() => {
+                                this.props.navigation.goBack();
+                            })
+                            .catch((e) =>
+                                console.log(
+                                    'Error deleting Lightning address',
+                                    e
+                                )
+                            );
+                    },
+                    style: 'destructive'
+                }
+            ]
+        );
+    };
+
+    render() {
+        const { navigation, SettingsStore, LightningAddressStore } = this.props;
+        const { allowComments, zapReceiptsEnabled, notifications } = this.state;
+        const { settings, updateSettingsGroup } = SettingsStore;
+        const { loading, update, error_msg } = LightningAddressStore;
+
+        return (
+            <Screen>
+                <View style={{ flex: 1 }}>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString(
+                                'views.Settings.LightningAddressSettings.title'
+                            ),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        rightComponent={
+                            loading ? (
+                                <View>
+                                    <LoadingIndicator size={30} />
+                                </View>
+                            ) : undefined
+                        }
+                        navigation={navigation}
+                    />
+                    <ScrollView style={{ paddingHorizontal: 15, marginTop: 5 }}>
+                        {error_msg && (
+                            <ErrorMessage message={error_msg} dismissable />
+                        )}
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                marginTop: 20
+                            }}
+                        >
+                            <View style={{ flex: 1 }}>
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontFamily: 'PPNeueMontreal-Book',
+                                        fontSize: 17
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.LightningAddressSettings.allowComments'
+                                    )}
+                                </Text>
+                            </View>
+                            <View
+                                style={{ alignSelf: 'center', marginLeft: 5 }}
+                            >
+                                <Switch
+                                    value={allowComments ?? true}
+                                    disabled={loading}
+                                    onValueChange={async (value: boolean) => {
+                                        const next = value;
+                                        this.setState({
+                                            allowComments: next
+                                        });
+                                        try {
+                                            await update({
+                                                allow_comments: next
+                                            });
+                                            await updateSettingsGroup(
+                                                'lightningAddress',
+                                                {
+                                                    allowComments: next
+                                                }
+                                            );
+                                        } catch (e) {
+                                            this.setState({
+                                                allowComments: !next
+                                            });
+                                        }
+                                    }}
+                                />
+                            </View>
+                        </View>
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                marginTop: 20
+                            }}
+                        >
+                            <View style={{ flex: 1 }}>
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontFamily: 'PPNeueMontreal-Book',
+                                        fontSize: 17
+                                    }}
+                                    infoModalText={[
+                                        localeString(
+                                            'views.Settings.LightningAddressSettings.zapReceiptsExplainer1'
+                                        ),
+                                        localeString(
+                                            'views.Settings.LightningAddressSettings.zapReceiptsExplainer2'
+                                        )
+                                    ]}
+                                >
+                                    {localeString(
+                                        'views.Settings.LightningAddressSettings.zapReceiptsEnabled'
+                                    )}
+                                </Text>
+                            </View>
+                            <View
+                                style={{ alignSelf: 'center', marginLeft: 5 }}
+                            >
+                                <Switch
+                                    value={zapReceiptsEnabled}
+                                    disabled={loading}
+                                    onValueChange={async (value: boolean) => {
+                                        const next = value;
+                                        this.setState({
+                                            zapReceiptsEnabled: next
+                                        });
+                                        try {
+                                            await update({
+                                                zap_receipts_enabled: next
+                                            });
+                                            await updateSettingsGroup(
+                                                'lightningAddress',
+                                                {
+                                                    zapReceiptsEnabled: next
+                                                }
+                                            );
+                                        } catch (e) {
+                                            this.setState({
+                                                zapReceiptsEnabled: !next
+                                            });
+                                        }
+                                    }}
+                                />
+                            </View>
+                        </View>
+                        <View style={{ marginTop: 20 }}>
+                            <DropdownSetting
+                                title={localeString(
+                                    'views.Settings.LightningAddressSettings.notifications'
+                                )}
+                                titleColor={themeColor('text')}
+                                selectedValue={notifications}
+                                onValueChange={async (value: number) => {
+                                    const prev = notifications;
+                                    this.setState({ notifications: value });
+                                    try {
+                                        await update({
+                                            notifications: value
+                                        });
+                                        await updateSettingsGroup(
+                                            'lightningAddress',
+                                            {
+                                                notifications: value
+                                            }
+                                        );
+                                        if (value === 1) {
+                                            LightningAddressStore.updatePushCredentials().catch(
+                                                (e) =>
+                                                    console.log(
+                                                        'Failed to update push credentials',
+                                                        e
+                                                    )
+                                            );
+                                        }
+                                    } catch (e) {
+                                        this.setState({ notifications: prev });
+                                    }
+                                }}
+                                values={NOTIFICATIONS_PREF_KEYS}
+                                disabled={loading}
+                            />
+                        </View>
+                        <ListItem
+                            containerStyle={{
+                                backgroundColor: 'transparent',
+                                padding: 0,
+                                marginTop: 30
+                            }}
+                            onPress={() =>
+                                navigation.navigate(
+                                    'CreateNWCLightningAddress',
+                                    { updateConnection: true }
+                                )
+                            }
+                        >
+                            <ListItem.Content>
+                                <ListItem.Title
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontFamily: 'PPNeueMontreal-Book'
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.LightningAddress.changeConnectionString'
+                                    )}
+                                </ListItem.Title>
+                            </ListItem.Content>
+                            <Icon
+                                name="keyboard-arrow-right"
+                                color={themeColor('text')}
+                            />
+                        </ListItem>
+                        <ZeusPayPlusSettings navigation={navigation} />
+                        {BackendUtils.supportsCashuWallet() &&
+                            settings?.ecash?.enableCashu && (
+                                <ListItem
+                                    containerStyle={{
+                                        backgroundColor: 'transparent',
+                                        padding: 0,
+                                        marginTop: 30
+                                    }}
+                                    onPress={() =>
+                                        navigation.navigate(
+                                            'CreateCashuLightningAddress',
+                                            { switchTo: true }
+                                        )
+                                    }
+                                >
+                                    <ListItem.Content>
+                                        <ListItem.Title
+                                            style={{
+                                                color: themeColor('text'),
+                                                fontFamily:
+                                                    'PPNeueMontreal-Book'
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.Settings.LightningAddress.switchToCashu'
+                                            )}
+                                        </ListItem.Title>
+                                    </ListItem.Content>
+                                    <Icon
+                                        name="keyboard-arrow-right"
+                                        color={themeColor('text')}
+                                    />
+                                </ListItem>
+                            )}
+                        <View style={{ marginTop: 40, marginBottom: 20 }}>
+                            <Button
+                                title={localeString(
+                                    'views.Settings.LightningAddress.deleteAddress'
+                                )}
+                                onPress={this.confirmDelete}
+                                warning
+                            />
+                        </View>
+                    </ScrollView>
+                </View>
+            </Screen>
+        );
+    }
+}

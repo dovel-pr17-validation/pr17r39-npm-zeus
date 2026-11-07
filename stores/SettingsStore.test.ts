@@ -1,0 +1,1760 @@
+// Regression coverage for the updateSettings lost-update race (KEY-006
+// review follow-up): updateSettings is a read-merge-write against the
+// persisted settings blob, so two concurrent callers could each read the
+// same snapshot and the later write would clobber the earlier one. The
+// worst case is a background settings write straddling a wallet deletion:
+// its stale snapshot still contains the deleted node, so committing it
+// resurrects the node config, seed phrase and wallet password included,
+// after the wallet's keychain material and data directories are gone.
+// updateSettings now serializes updates through an internal queue and
+// accepts a functional updater so deletion computes the new nodes array
+// inside the critical section.
+
+jest.mock('react-native-biometrics', () => ({ BiometryType: {} }));
+jest.mock('react-native-blob-util', () => ({
+    fs: {
+        dirs: { LibraryDir: '/lib', DocumentDir: '/docs' }
+    }
+}));
+jest.mock('react-native-encrypted-storage', () => ({
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(undefined),
+    removeItem: jest.fn().mockResolvedValue(undefined)
+}));
+
+jest.mock('../utils/BackendUtils', () => ({
+    __esModule: true,
+    default: {
+        clearCachedCalls: jest.fn(),
+        initLNC: jest.fn(),
+        connect: jest.fn(),
+        isConnected: jest.fn()
+    }
+}));
+jest.mock('../utils/BiometricUtils', () => ({
+    getSupportedBiometryType: jest.fn().mockResolvedValue(undefined)
+}));
+jest.mock('../utils/LocaleUtils');
+jest.mock('../utils/MigrationUtils', () => ({
+    keychainDesyncMigration: jest.fn().mockResolvedValue(undefined),
+    keychainCloudSyncMigration: jest.fn().mockResolvedValue(undefined),
+    purgeRescueKeyFiles: jest.fn().mockResolvedValue(undefined),
+    // getSettings adopts the return value (the queue's authoritative
+    // object when consolidation routes through updateSettings), so the
+    // stub must hand the settings back rather than resolve undefined
+    runSettingsMigrations: jest
+        .fn()
+        .mockImplementation(async (settings: any) => settings),
+    legacySettingsMigrations: jest.fn().mockResolvedValue({}),
+    storageMigrationV2: jest.fn().mockResolvedValue(undefined)
+}));
+jest.mock('../utils/TorUtils', () => ({
+    doTorRequest: jest.fn(),
+    RequestMethod: {}
+}));
+// utils/ThemeUtils reads the selected theme from the settingsStore
+// singleton; a stand-in keeps the real Stores graph out of this suite
+jest.mock('./Stores', () => ({
+    settingsStore: { settings: {} }
+}));
+jest.mock('../utils/LdkNodeUtils', () => ({
+    DEFAULT_SCORER_URL: 'https://scorer.default',
+    DEFAULT_VSS_SERVER: '',
+    getDefaultEsploraServer: jest.fn().mockReturnValue(''),
+    getDefaultRgsServer: jest.fn().mockReturnValue('')
+}));
+
+// In-memory keychain-backed storage: getItem returns the persisted string
+// or false, setItem stringifies objects, matching storage/index.ts. Every
+// call resolves through the microtask queue, so unserialized concurrent
+// read-merge-write cycles genuinely interleave (both reads complete before
+// either write) and the lost update reproduces without the queue.
+jest.mock('../storage', () => {
+    const backing: Record<string, string> = {};
+    return {
+        _backing: backing,
+        getItem: jest.fn(async (key: string) => backing[key] ?? false),
+        setItem: jest.fn(async (key: string, value: any) => {
+            backing[key] =
+                typeof value === 'string' ? value : JSON.stringify(value);
+            return true;
+        }),
+        removeItem: jest.fn(async (key: string) => {
+            delete backing[key];
+            return true;
+        }),
+        KEY_PREFIX: 'zeus:',
+        getRawItem: jest.fn(async () => null)
+    };
+});
+
+import { reaction } from 'mobx';
+
+import SettingsStore, {
+    DEFAULT_SETTINGS,
+    PosEnabled,
+    DEFAULT_LSP_MAINNET,
+    DEFAULT_LSP_MUTINYNET,
+    DEFAULT_LSP_TESTNET,
+    DEFAULT_LSPS1_HOST_MAINNET,
+    DEFAULT_LSPS1_HOST_MUTINYNET,
+    DEFAULT_LSPS1_HOST_TESTNET,
+    DEFAULT_LSPS1_PUBKEY_MAINNET,
+    DEFAULT_LSPS1_PUBKEY_MUTINYNET,
+    DEFAULT_LSPS1_PUBKEY_TESTNET,
+    DEFAULT_LSPS1_REST_MAINNET,
+    DEFAULT_LSPS1_REST_MUTINYNET,
+    DEFAULT_LSPS1_REST_TESTNET,
+    DEFAULT_THEME,
+    RETIRED_THEMES,
+    SETTINGS_WRITE_DEBOUNCE_MS,
+    STORAGE_KEY,
+    THEME_KEYS,
+    getLspConfigForNetwork,
+    isOlympusPeer
+} from './SettingsStore';
+import { themeColor } from '../utils/ThemeUtils';
+
+const StorageMock: any = jest.requireMock('../storage');
+
+const seedSettings = (settings: any) => {
+    StorageMock._backing[STORAGE_KEY] = JSON.stringify(settings);
+};
+
+const persistedSettings = () => JSON.parse(StorageMock._backing[STORAGE_KEY]);
+
+let logSpy: jest.SpyInstance;
+let errorSpy: jest.SpyInstance;
+
+beforeEach(() => {
+    for (const key of Object.keys(StorageMock._backing)) {
+        delete StorageMock._backing[key];
+    }
+    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+});
+
+afterEach(() => {
+    // getSettings swallows load failures (console.error, then falls
+    // through with defaults), which has repeatedly let a stale
+    // MigrationUtils mock pass this suite without ever completing the
+    // load path; fail loudly instead
+    expect(
+        errorSpy.mock.calls.filter(
+            ([message]) => message === 'Could not load settings'
+        )
+    ).toEqual([]);
+    errorSpy.mockRestore();
+    logSpy.mockRestore();
+});
+
+describe('SettingsStore DEFAULT_SETTINGS', () => {
+    // Object-valued top-level groups DEFAULT_SETTINGS is expected to have.
+    // MigrationUtils.test.ts hand-copies these groups into its own mock, so
+    // a group added here without updating that mock would go unexercised by
+    // the migration backfill tests. Pin the list so that drift fails CI.
+    const EXPECTED_GROUP_KEYS = [
+        'privacy',
+        'display',
+        'pos',
+        'payments',
+        'invoices',
+        'channels',
+        'swaps',
+        'lightningAddress',
+        'bolt12Address',
+        'ecash',
+        'networking'
+    ];
+
+    it('has exactly the expected object-valued top-level groups', () => {
+        const groupKeys = Object.keys(DEFAULT_SETTINGS).filter((key) => {
+            const value = (DEFAULT_SETTINGS as any)[key];
+            return (
+                value !== null &&
+                typeof value === 'object' &&
+                !Array.isArray(value)
+            );
+        });
+        expect(groupKeys.sort()).toEqual([...EXPECTED_GROUP_KEYS].sort());
+    });
+
+    it('initializes settings equal to DEFAULT_SETTINGS', () => {
+        const store = new SettingsStore();
+        // supportedBiometryType is set to `undefined` in the DEFAULT_SETTINGS
+        // literal, which JSON.parse(JSON.stringify(...)) drops entirely from
+        // the clone; toEqual treats an absent key the same as an undefined
+        // one, so this still holds.
+        expect(store.settings).toEqual(DEFAULT_SETTINGS);
+    });
+
+    it('does not let mutating a store instance affect the shared default', () => {
+        const store = new SettingsStore();
+        store.settings.privacy.lurkerMode = true;
+        expect(DEFAULT_SETTINGS.privacy.lurkerMode).toBe(false);
+
+        const otherStore = new SettingsStore();
+        expect(otherStore.settings.privacy.lurkerMode).toBe(false);
+    });
+});
+
+// The native LNC dial retries on its own until it connects and cannot be
+// cancelled, so connect() must not init or dial a second time when its
+// budget runs out: a second client on the same mailbox session evicts the
+// first, and neither connects until the app restarts.
+describe('SettingsStore.connect (LNC)', () => {
+    const BackendUtilsMock: any = jest.requireMock(
+        '../utils/BackendUtils'
+    ).default;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        BackendUtilsMock.initLNC.mockReset().mockResolvedValue(undefined);
+        BackendUtilsMock.connect.mockReset().mockResolvedValue(undefined);
+        BackendUtilsMock.isConnected.mockReset().mockResolvedValue(false);
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+    });
+
+    const settle = async (ms: number) => {
+        await jest.advanceTimersByTimeAsync(ms);
+    };
+
+    it('resolves once the session is up', async () => {
+        const store = new SettingsStore();
+        BackendUtilsMock.isConnected
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
+
+        const result = store.connect();
+        await settle(1000);
+
+        expect(await result).toBeUndefined();
+        expect(store.error).toBe(false);
+        expect(store.loading).toBe(false);
+    });
+
+    it.each([true, false])(
+        'does not publish a stale dial result (connected: %s)',
+        async (connected) => {
+            const store = new SettingsStore();
+            store.pairingPhrase = 'phrase-a';
+            const result = store.connect();
+            await settle(0);
+            store.pairingPhrase = 'phrase-b';
+            store.setConnectingStatus(true);
+            store.errorMsg = 'new wallet state';
+            BackendUtilsMock.isConnected.mockResolvedValue(connected);
+            await settle(61000);
+            await result;
+            expect(store.errorMsg).toBe('new wallet state');
+            expect(store.error).toBe(false);
+            expect(store.loading).toBe(true);
+            expect(store.connecting).toBe(true);
+        }
+    );
+
+    it('reports a timeout without dialing again', async () => {
+        const store = new SettingsStore();
+
+        const result = store.connect();
+        await settle(61000);
+
+        expect(await result).toBe('stores.SettingsStore.lncConnectError');
+        expect(store.error).toBe(true);
+        expect(store.loading).toBe(false);
+        expect(BackendUtilsMock.initLNC).toHaveBeenCalledTimes(1);
+        expect(BackendUtilsMock.connect).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['implementation', 'mailbox', 'selection', 'reconnect'])(
+        'invalidates an LNC owner when %s changes',
+        async (change) => {
+            const store = new SettingsStore();
+            store.implementation = 'lightning-node-connect';
+            const isCurrent = store.getConnectionGuard();
+            expect(isCurrent()).toBe(true);
+            if (change === 'implementation') store.implementation = 'lnd';
+            if (change === 'mailbox') store.customMailboxServer = 'other:443';
+            if (change === 'selection') store.settings.selectedNode = 3;
+            if (change === 'reconnect') store.setConnectingStatus(true);
+            expect(isCurrent()).toBe(false);
+        }
+    );
+
+    it('does not connect a new backend after selection changes during initialization', async () => {
+        const store = new SettingsStore();
+        BackendUtilsMock.initLNC.mockImplementation(async () => {
+            store.implementation = 'lnd';
+            store.setConnectingStatus(true);
+        });
+        await store.connect();
+        expect(BackendUtilsMock.connect).not.toHaveBeenCalled();
+        expect(store.loading).toBe(true);
+    });
+
+    it('ignores a connection probe that finishes after selection changes', async () => {
+        const store = new SettingsStore();
+        let finish!: (connected: boolean) => void;
+        BackendUtilsMock.isConnected.mockImplementation(
+            () =>
+                new Promise((resolve) => {
+                    finish = resolve;
+                })
+        );
+        const pending = store.connect();
+        await settle(500);
+        store.setConnectingStatus(true);
+        store.errorMsg = 'new wallet state';
+        finish(true);
+        await pending;
+        expect(store.errorMsg).toBe('new wallet state');
+        expect(store.loading).toBe(true);
+    });
+
+    it('waits the full minute before giving up', async () => {
+        const store = new SettingsStore();
+        let done = false;
+        store.connect().then(() => (done = true));
+
+        await settle(59000);
+        expect(done).toBe(false);
+        await settle(2000);
+        expect(done).toBe(true);
+    });
+
+    it('returns a dial rejection without waiting', async () => {
+        const store = new SettingsStore();
+        BackendUtilsMock.connect.mockResolvedValue('invalid mailbox');
+
+        expect(await store.connect()).toBe('invalid mailbox');
+        expect(store.errorMsg).toBe('invalid mailbox');
+        expect(BackendUtilsMock.isConnected).not.toHaveBeenCalled();
+    });
+
+    it('surfaces an initLNC failure as the error', async () => {
+        const store = new SettingsStore();
+        BackendUtilsMock.initLNC.mockRejectedValue(
+            new Error('keychain read failed')
+        );
+
+        expect(await store.connect()).toBe('keychain read failed');
+        expect(store.error).toBe(true);
+        expect(BackendUtilsMock.connect).not.toHaveBeenCalled();
+    });
+
+    it('clears a timeout error once the session comes up later', async () => {
+        const store = new SettingsStore();
+
+        const result = store.connect();
+        await settle(61000);
+        await result;
+        expect(store.error).toBe(true);
+
+        store.clearConnectError();
+
+        expect(store.error).toBe(false);
+        expect(store.errorMsg).toBe('');
+        expect(BackendUtilsMock.connect).toHaveBeenCalledTimes(1);
+    });
+});
+
+// The error screen's retry calls setConnectingStatus(true) while an earlier
+// fetchData may still be running, so a reconnect must clear the error and
+// free the lock, and the earlier run must not free the retry's lock.
+describe('SettingsStore reconnect and fetch lock', () => {
+    const BackendUtilsMock: any = jest.requireMock(
+        '../utils/BackendUtils'
+    ).default;
+
+    beforeEach(() => {
+        BackendUtilsMock.clearCachedCalls.mockReset();
+    });
+
+    it('does not hand out the lock twice', () => {
+        const store = new SettingsStore();
+
+        expect(store.acquireFetchLock()).not.toBeNull();
+        expect(store.acquireFetchLock()).toBeNull();
+    });
+
+    it('frees the lock for the owner', () => {
+        const store = new SettingsStore();
+        const seq = store.acquireFetchLock()!;
+
+        store.releaseFetchLock(seq);
+
+        expect(store.fetchLock).toBe(false);
+        expect(store.acquireFetchLock()).not.toBeNull();
+    });
+
+    it('clears the connect error and cached calls on reconnect', () => {
+        const store = new SettingsStore();
+        store.error = true;
+        store.errorMsg = 'connection refused';
+        store.lndFolderMissing = true;
+
+        store.setConnectingStatus(true);
+
+        expect(store.connecting).toBe(true);
+        expect(store.error).toBe(false);
+        expect(store.errorMsg).toBe('');
+        expect(store.lndFolderMissing).toBe(false);
+        expect(BackendUtilsMock.clearCachedCalls).toHaveBeenCalledTimes(1);
+    });
+
+    it('frees a held lock on reconnect', () => {
+        const store = new SettingsStore();
+        store.acquireFetchLock();
+
+        store.setConnectingStatus(true);
+
+        expect(store.fetchLock).toBe(false);
+        expect(store.acquireFetchLock()).not.toBeNull();
+    });
+
+    it('keeps the lock of the run started by the reconnect', () => {
+        const store = new SettingsStore();
+        const staleSeq = store.acquireFetchLock()!;
+
+        store.setConnectingStatus(true);
+        const currentSeq = store.acquireFetchLock()!;
+        store.releaseFetchLock(staleSeq);
+
+        expect(store.fetchLock).toBe(true);
+        expect(store.acquireFetchLock()).toBeNull();
+
+        store.releaseFetchLock(currentSeq);
+        expect(store.fetchLock).toBe(false);
+    });
+
+    it('leaves the error and the lock alone when connecting ends', () => {
+        const store = new SettingsStore();
+        store.acquireFetchLock();
+        store.error = true;
+        store.errorMsg = 'connection refused';
+
+        store.setConnectingStatus(false);
+
+        expect(store.connecting).toBe(false);
+        expect(store.error).toBe(true);
+        expect(store.errorMsg).toBe('connection refused');
+        expect(store.fetchLock).toBe(true);
+        expect(BackendUtilsMock.clearCachedCalls).not.toHaveBeenCalled();
+    });
+});
+
+// A persistent node or NWC service keeps this store alive across Android
+// activities; a new App root must start the session as a cold start does.
+describe('SettingsStore.startNewRootSession', () => {
+    const loggedInStore = (settings: any, posStatus = 'inactive') => {
+        const store = new SettingsStore();
+        store.settings = settings;
+        store.setLoginStatus(true);
+        store.setPosStatus(posStatus);
+        return store;
+    };
+
+    it('requires the PIN again when one is set', () => {
+        const store = loggedInStore({ pin: '1234' });
+
+        store.startNewRootSession();
+
+        expect(store.loginRequired()).toBe(true);
+        expect(store.sessionStarted()).toBe(false);
+    });
+
+    it('requires the passphrase again when one is set', () => {
+        const store = loggedInStore({ passphrase: 'hunter2' });
+
+        store.startNewRootSession();
+
+        expect(store.loginRequired()).toBe(true);
+    });
+
+    it('does not require a login when no login method is configured', () => {
+        const store = loggedInStore({});
+
+        store.startNewRootSession();
+
+        expect(store.loginRequired()).toBeFalsy();
+    });
+
+    it.each(['inactive', 'active'])(
+        'returns POS status %s to unselected so Wallet reopens POS',
+        (posStatus) => {
+            const store = loggedInStore(
+                { pin: '1234', pos: { posEnabled: PosEnabled.Standalone } },
+                posStatus
+            );
+
+            store.startNewRootSession();
+
+            expect(store.posStatus).toBe('unselected');
+            expect(store.sessionStarted()).toBe(false);
+        }
+    );
+});
+
+describe('SettingsStore.posViewActive', () => {
+    const storeWith = (posEnabled: PosEnabled, posStatus: string) => {
+        const store = new SettingsStore();
+        store.settings = { pos: { posEnabled } } as any;
+        store.setPosStatus(posStatus);
+        return store;
+    };
+
+    it.each([
+        [PosEnabled.Standalone, 'active', true],
+        [PosEnabled.Square, 'active', true],
+        // Wallet moves 'unselected' to 'active' when POS is enabled
+        [PosEnabled.Standalone, 'unselected', true],
+        // the owner unlocked the full wallet
+        [PosEnabled.Standalone, 'inactive', false],
+        [PosEnabled.Disabled, 'unselected', false],
+        [PosEnabled.Disabled, 'active', false]
+    ])('POS %s with status %s: %s', (posEnabled, posStatus, expected) => {
+        expect(storeWith(posEnabled, posStatus).posViewActive()).toBe(expected);
+    });
+
+    it('is false before settings load', () => {
+        expect(new SettingsStore().posViewActive()).toBe(false);
+    });
+
+    // A new App root mounts Wallet's tab navigator at once when the node is
+    // still connected, so it must already pick the POS tabs, as a cold start
+    // does once connecting ends
+    it('shows the POS tabs for a new App root after the owner unlocked the wallet', () => {
+        const store = storeWith(PosEnabled.Standalone, 'inactive');
+
+        store.startNewRootSession();
+
+        expect(store.posViewActive()).toBe(true);
+    });
+});
+
+describe('SettingsStore.updateSettings', () => {
+    it('serializes concurrent updates so neither is lost', async () => {
+        seedSettings({ fiat: 'USD', locale: 'en' });
+        const store = new SettingsStore();
+
+        // Fired without awaiting in between: both would read the same
+        // snapshot if updates were not queued, and the later write would
+        // drop the earlier one's key.
+        const [first, second] = await Promise.all([
+            store.updateSettings({ fiat: 'EUR' }),
+            store.updateSettings({ locale: 'cs' })
+        ]);
+
+        expect(first.fiat).toEqual('EUR');
+        expect(second.fiat).toEqual('EUR');
+        expect(second.locale).toEqual('cs');
+
+        const persisted = persistedSettings();
+        expect(persisted.fiat).toEqual('EUR');
+        expect(persisted.locale).toEqual('cs');
+    });
+
+    it('does not resurrect a deleted node from a straddling write', async () => {
+        const embeddedNode = {
+            implementation: 'embedded-lnd',
+            lndDir: 'lnd',
+            seedPhrase: ['abandon', 'ability', 'able'],
+            walletPassword: 'hunter2',
+            certVerification: false,
+            dismissCustodialWarning: true
+        };
+        const remoteNode = {
+            implementation: 'lnd',
+            host: 'example.com',
+            certVerification: true,
+            dismissCustodialWarning: true
+        };
+        seedSettings({
+            nodes: [embeddedNode, remoteNode],
+            selectedNode: 1,
+            fiat: 'USD'
+        });
+        const store = new SettingsStore();
+
+        // A background write starts before the deletion and would finish
+        // after it; the deletion uses a functional updater so the new
+        // nodes array is computed inside the critical section.
+        await Promise.all([
+            store.updateSettings({ fiat: 'EUR' }),
+            store.updateSettings((currentSettings: any) => ({
+                nodes: (currentSettings.nodes || []).filter(
+                    (_: any, i: number) => i !== 0
+                ),
+                selectedNode: 0,
+                justDeletedWallet: false
+            }))
+        ]);
+
+        const persisted = persistedSettings();
+        expect(persisted.fiat).toEqual('EUR');
+        expect(persisted.nodes).toHaveLength(1);
+        expect(persisted.nodes[0].host).toEqual('example.com');
+        // The deleted node's key material must not survive anywhere in
+        // the persisted blob.
+        expect(StorageMock._backing[STORAGE_KEY]).not.toContain('abandon');
+        expect(StorageMock._backing[STORAGE_KEY]).not.toContain('hunter2');
+    });
+
+    it('keeps memory consistent with disk when the write is blocked', async () => {
+        seedSettings({ fiat: 'USD', locale: 'en' });
+        const store = new SettingsStore();
+        // Load once so the store holds the seeded settings before the
+        // blocked write, mirroring a wipe that latches mid-session.
+        await store.getSettings();
+
+        // Storage.setItem returns false while the data-wipe write latch
+        // is engaged (storage/index.ts blockWrites).
+        StorageMock.setItem.mockImplementationOnce(async () => false);
+        const result = await store.updateSettings({ fiat: 'EUR' });
+
+        // The unpersisted update must not surface anywhere: not in the
+        // returned settings, not in memory, not in derived state.
+        expect(result.fiat).toEqual('USD');
+        expect(store.settings.fiat).toEqual('USD');
+        expect(store.triggerSettingsRefresh).toEqual(false);
+        expect(persistedSettings().fiat).toEqual('USD');
+
+        // Once writes land again, updates flow through as normal.
+        const after = await store.updateSettings({ fiat: 'CAD' });
+        expect(after.fiat).toEqual('CAD');
+        expect(store.settings.fiat).toEqual('CAD');
+        expect(persistedSettings().fiat).toEqual('CAD');
+    });
+
+    it('keeps processing queued updates after one rejects', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+
+        await expect(
+            store.updateSettings(() => {
+                throw new Error('boom');
+            })
+        ).rejects.toThrow('boom');
+
+        const result = await store.updateSettings({ fiat: 'CAD' });
+        expect(result.fiat).toEqual('CAD');
+        expect(persistedSettings().fiat).toEqual('CAD');
+        expect(store.settingsUpdateInProgress).toEqual(false);
+    });
+});
+
+// Settings views used to build nested group writes from the settings they
+// rendered with (`{ ...settings.invoices, memo }`). A write built while an
+// earlier one was still queued copied the old value of whatever that
+// earlier write changed and reverted it (#4903). updateSettingsGroup does
+// the merge inside the queue instead.
+describe('SettingsStore.updateSettingsGroup', () => {
+    it('reverts an earlier queued write when the group is spread from render-time settings', async () => {
+        // Documents the bug the helper exists for
+        seedSettings({ invoices: { memo: '', routeHints: false } });
+        const store = new SettingsStore();
+        await store.getSettings();
+        const rendered: any = store.settings;
+
+        await Promise.all([
+            store.updateSettings({
+                invoices: { ...rendered.invoices, routeHints: true }
+            }),
+            store.updateSettings({
+                invoices: { ...rendered.invoices, memo: 'X' }
+            })
+        ]);
+
+        expect(persistedSettings().invoices).toEqual({
+            memo: 'X',
+            routeHints: false
+        });
+    });
+
+    it('keeps a field changed by an earlier queued write', async () => {
+        seedSettings({ invoices: { memo: '', routeHints: false } });
+        const store = new SettingsStore();
+        await store.getSettings();
+
+        await Promise.all([
+            store.updateSettingsGroup('invoices', { routeHints: true }),
+            store.updateSettingsGroup('invoices', { memo: 'X' })
+        ]);
+
+        expect(persistedSettings().invoices).toEqual({
+            memo: 'X',
+            routeHints: true
+        });
+        expect(store.settings.invoices).toEqual({
+            memo: 'X',
+            routeHints: true
+        });
+    });
+
+    it('leaves other groups and top-level keys alone', async () => {
+        seedSettings({
+            fiat: 'USD',
+            privacy: { clipboard: true },
+            invoices: { memo: '' }
+        });
+        const store = new SettingsStore();
+
+        await store.updateSettingsGroup('invoices', { memo: 'coffee' });
+
+        const persisted = persistedSettings();
+        expect(persisted.fiat).toEqual('USD');
+        expect(persisted.privacy).toEqual({ clipboard: true });
+        expect(persisted.invoices).toEqual({ memo: 'coffee' });
+    });
+
+    it('creates the group when it is missing', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+
+        await store.updateSettingsGroup('networking', {
+            disableOfflineCheck: true
+        });
+
+        expect(persistedSettings().networking).toEqual({
+            disableOfflineCheck: true
+        });
+    });
+
+    it('passes the group as it is inside the queue to a function patch', async () => {
+        seedSettings({ channels: { min_confs: 1 } });
+        const store = new SettingsStore();
+        const seen: any[] = [];
+
+        await Promise.all([
+            store.updateSettingsGroup('channels', { min_confs: 3 }),
+            store.updateSettingsGroup('channels', (current: any) => {
+                seen.push(current);
+                return { min_confs: current.min_confs + 1 };
+            })
+        ]);
+
+        expect(seen).toEqual([{ min_confs: 3 }]);
+        expect(persistedSettings().channels).toEqual({ min_confs: 4 });
+    });
+});
+
+describe('SettingsStore.updateSelectedNode', () => {
+    it('keeps a change an earlier queued write made to the nodes', async () => {
+        // Saving a custom Esplora server, then an RGS server while the
+        // first write is still queued (#4904 review)
+        seedSettings({
+            selectedNode: 1,
+            nodes: [{ implementation: 'lnd' }, { implementation: 'ldk-node' }]
+        });
+        const store = new SettingsStore();
+        await store.getSettings();
+
+        const results = await Promise.all([
+            store.updateSelectedNode({ ldkEsploraServer: 'https://e' }),
+            store.updateSelectedNode({ ldkRgsServer: 'https://r' })
+        ]);
+
+        expect(results).toEqual([true, true]);
+        expect(persistedSettings().nodes).toEqual([
+            { implementation: 'lnd' },
+            {
+                implementation: 'ldk-node',
+                ldkEsploraServer: 'https://e',
+                ldkRgsServer: 'https://r'
+            }
+        ]);
+    });
+
+    it('updates the node selected inside the queue', async () => {
+        seedSettings({
+            selectedNode: 0,
+            nodes: [{ implementation: 'lnd' }, { implementation: 'ldk-node' }]
+        });
+        const store = new SettingsStore();
+        await store.getSettings();
+
+        await Promise.all([
+            store.updateSettings({ selectedNode: 1 }),
+            store.updateSelectedNode({ ldkScorerUrl: 'https://s' })
+        ]);
+
+        expect(persistedSettings().nodes).toEqual([
+            { implementation: 'lnd' },
+            { implementation: 'ldk-node', ldkScorerUrl: 'https://s' }
+        ]);
+    });
+
+    it('resolves false and adds no node when none is selected', async () => {
+        seedSettings({ nodes: [] });
+        const store = new SettingsStore();
+
+        expect(
+            await store.updateSelectedNode({ dismissCustodialWarning: true })
+        ).toBe(false);
+        expect(persistedSettings().nodes).toEqual([]);
+    });
+});
+
+describe('SettingsStore.ldkScorerUrl', () => {
+    const loadWithNode = async (node: any) => {
+        seedSettings({ selectedNode: 0, nodes: [node] });
+        const store = new SettingsStore();
+        await store.getSettings();
+        return store;
+    };
+
+    it('uses the default when the node has no scorer URL', async () => {
+        const store = await loadWithNode({ implementation: 'ldk-node' });
+        expect(store.ldkScorerUrl).toBe('https://scorer.default');
+    });
+
+    it('keeps a custom scorer URL', async () => {
+        const store = await loadWithNode({
+            implementation: 'ldk-node',
+            ldkScorerUrl: 'https://s'
+        });
+        expect(store.ldkScorerUrl).toBe('https://s');
+    });
+
+    it('keeps a blank scorer URL on load and after saving', async () => {
+        const store = await loadWithNode({
+            implementation: 'ldk-node',
+            ldkScorerUrl: ''
+        });
+        expect(store.ldkScorerUrl).toBe('');
+
+        await store.updateSelectedNode({ ldkScorerUrl: 'https://s' });
+        expect(store.ldkScorerUrl).toBe('https://s');
+        await store.updateSelectedNode({ ldkScorerUrl: '' });
+        expect(store.ldkScorerUrl).toBe('');
+    });
+});
+
+describe('SettingsStore LndHub session token', () => {
+    const hubA = {
+        implementation: 'lndhub',
+        lndhubUrl: 'https://hub-a.example.com',
+        username: 'alice',
+        password: 'a'
+    };
+    const hubB = {
+        implementation: 'lndhub',
+        lndhubUrl: 'https://hub-b.example.com',
+        username: 'bob',
+        password: 'b'
+    };
+
+    const loggedIn = async (settings: any) => {
+        seedSettings(settings);
+        const store = new SettingsStore();
+        await store.getSettings();
+        // What login() stores after a successful /auth
+        store.accessToken = 'token-a';
+        store.refreshToken = 'refresh-a';
+        return store;
+    };
+
+    it('keeps the token across a write that does not change the node', async () => {
+        const store = await loggedIn({ selectedNode: 0, nodes: [hubA, hubB] });
+
+        await store.updateSettings({ fiat: 'EUR' });
+
+        expect(store.accessToken).toBe('token-a');
+        expect(store.refreshToken).toBe('refresh-a');
+    });
+
+    it('keeps the token when the selected node is only reordered', async () => {
+        const store = await loggedIn({ selectedNode: 0, nodes: [hubA, hubB] });
+
+        await store.updateSettings({ selectedNode: 1, nodes: [hubB, hubA] });
+
+        expect(store.accessToken).toBe('token-a');
+    });
+
+    it('clears the token when switching to another wallet', async () => {
+        const store = await loggedIn({ selectedNode: 0, nodes: [hubA, hubB] });
+
+        await store.updateSettings({ selectedNode: 1 });
+
+        expect(store.lndhubUrl).toBe('https://hub-b.example.com');
+        expect(store.accessToken).toBe('');
+        expect(store.refreshToken).toBe('');
+    });
+
+    it('clears the token when switching to a non-lndhub wallet', async () => {
+        const store = await loggedIn({
+            selectedNode: 0,
+            nodes: [hubA, { implementation: 'lnd', host: 'node.example.com' }]
+        });
+
+        await store.updateSettings({ selectedNode: 1 });
+
+        expect(store.accessToken).toBe('');
+    });
+
+    // One field at a time, so each comparison in the clear condition is
+    // pinned on its own
+    it.each([
+        ['implementation', 'lnd'],
+        ['host', 'https://node.example.com'],
+        ['port', '8080'],
+        ['lndhubUrl', 'https://hub-c.example.com'],
+        ['username', 'mallory'],
+        ['password', 'changed']
+    ])(
+        'clears the token when the active wallet changes %s',
+        async (field, value) => {
+            const store = await loggedIn({ selectedNode: 0, nodes: [hubA] });
+
+            await store.updateSettings({
+                nodes: [{ ...hubA, [field]: value }]
+            });
+
+            expect(store.accessToken).toBe('');
+            expect(store.refreshToken).toBe('');
+        }
+    );
+
+    it('clears the token when no wallet is left', async () => {
+        const store = await loggedIn({ selectedNode: 0, nodes: [hubA] });
+
+        await store.updateSettings({ nodes: [] });
+
+        expect(store.accessToken).toBe('');
+    });
+
+    // Deleting the active wallet slides the next one into its index with
+    // no reconnect in between, so the index cannot tell the two apart
+    it('drops a login answered after the active wallet was deleted', async () => {
+        seedSettings({ selectedNode: 0, nodes: [hubA, hubB] });
+        const store = new SettingsStore();
+        await store.getSettings();
+        let answer: (data: any) => void = () => {};
+        jest.requireMock('../utils/BackendUtils').default.login = jest.fn(
+            () => new Promise((resolve) => (answer = resolve))
+        );
+
+        const login = store.login({ login: 'alice', password: 'a' } as any);
+        await store.updateSettings({ selectedNode: 0, nodes: [hubB] });
+        answer({ access_token: 'token-a', refresh_token: 'refresh-a' });
+        await login;
+
+        expect(store.lndhubUrl).toBe('https://hub-b.example.com');
+        expect(store.accessToken).toBe('');
+        expect(store.refreshToken).toBe('');
+    });
+
+    it.each([
+        ['lnd', 'host'],
+        ['lnd', 'port'],
+        ['lndhub', 'lndhubUrl'],
+        ['lndhub', 'username'],
+        ['lndhub', 'password']
+    ])(
+        'invalidates the connection guard when an %s wallet with another %s takes the same index',
+        async (implementation, field) => {
+            const deleted = { implementation, [field]: 'a' };
+            const next = { implementation, [field]: 'b' };
+            seedSettings({ selectedNode: 0, nodes: [deleted, next] });
+            const store = new SettingsStore();
+            await store.getSettings();
+            const isCurrent = store.getConnectionGuard();
+
+            await store.updateSettings({ fiat: 'EUR' });
+            expect(isCurrent()).toBe(true);
+
+            await store.updateSettings({ selectedNode: 0, nodes: [next] });
+            expect(isCurrent()).toBe(false);
+        }
+    );
+
+    // Two embedded wallets differ only in their data directory, which
+    // updateNodeProperties does not compare, so deleteNodeConfig ends the
+    // deleted wallet's connection itself
+    it('keeps the connection guard when an embedded wallet takes the same index, until invalidateConnection', async () => {
+        const deleted = { implementation: 'embedded-lnd', lndDir: 'lnd-a' };
+        const next = { implementation: 'embedded-lnd', lndDir: 'lnd-b' };
+        seedSettings({ selectedNode: 0, nodes: [deleted, next] });
+        const store = new SettingsStore();
+        await store.getSettings();
+        const isCurrent = store.getConnectionGuard();
+
+        await store.updateSettings({ selectedNode: 0, nodes: [next] });
+        expect(isCurrent()).toBe(true);
+
+        const connecting = store.connecting;
+        store.invalidateConnection();
+        expect(isCurrent()).toBe(false);
+        expect(store.connecting).toBe(connecting);
+    });
+});
+
+describe('SettingsStore.updateSettingsGroupDebounced', () => {
+    const { AppState } = require('react-native');
+    let appStateHandler: ((state: string) => void) | undefined;
+
+    beforeEach(() => {
+        jest.useFakeTimers();
+        appStateHandler = undefined;
+        jest.spyOn(AppState, 'addEventListener').mockImplementation(
+            (_event: any, handler: any) => {
+                appStateHandler = handler;
+                return { remove: jest.fn() } as any;
+            }
+        );
+    });
+
+    afterEach(() => {
+        jest.useRealTimers();
+        (AppState.addEventListener as jest.Mock).mockRestore();
+    });
+
+    const writes = () =>
+        StorageMock.setItem.mock.calls.filter(
+            ([key]: [string]) => key === STORAGE_KEY
+        );
+
+    it('persists only the last value once typing stops', async () => {
+        seedSettings({ invoices: { memo: '' } });
+        const store = new SettingsStore();
+        StorageMock.setItem.mockClear();
+
+        store.updateSettingsGroupDebounced('invoices', { memo: 'c' });
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS - 1);
+        store.updateSettingsGroupDebounced('invoices', { memo: 'co' });
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS - 1);
+        store.updateSettingsGroupDebounced('invoices', { memo: 'coffee' });
+        expect(writes()).toHaveLength(0);
+
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+
+        expect(writes()).toHaveLength(1);
+        expect(persistedSettings().invoices).toEqual({ memo: 'coffee' });
+    });
+
+    it('merges pending fields from different inputs into one write', async () => {
+        seedSettings({ invoices: { memo: '', receiverName: '' } });
+        const store = new SettingsStore();
+        StorageMock.setItem.mockClear();
+
+        store.updateSettingsGroupDebounced('invoices', { memo: 'coffee' });
+        store.updateSettingsGroupDebounced('invoices', {
+            receiverName: 'Satoshi'
+        });
+        store.updateSettingsGroupDebounced('pos', { taxPercentage: '8' });
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+
+        expect(writes()).toHaveLength(1);
+        expect(persistedSettings().invoices).toEqual({
+            memo: 'coffee',
+            receiverName: 'Satoshi'
+        });
+        expect(persistedSettings().pos).toEqual({ taxPercentage: '8' });
+    });
+
+    it('writes immediately on flush and does not write again later', async () => {
+        seedSettings({ invoices: { memo: '' } });
+        const store = new SettingsStore();
+        StorageMock.setItem.mockClear();
+
+        store.updateSettingsGroupDebounced('invoices', { memo: 'coffee' });
+        await store.flushPendingSettings();
+
+        expect(persistedSettings().invoices).toEqual({ memo: 'coffee' });
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+        expect(writes()).toHaveLength(1);
+    });
+
+    it('resolves a flush with nothing pending without writing', async () => {
+        seedSettings({ invoices: { memo: '' } });
+        const store = new SettingsStore();
+        StorageMock.setItem.mockClear();
+
+        await expect(store.flushPendingSettings()).resolves.toBeUndefined();
+        expect(writes()).toHaveLength(0);
+    });
+
+    it('lands a pending patch before a later immediate write to the same field', async () => {
+        // InvoicesSettings: the expiry input (debounced) and the time
+        // period dropdown (immediate) both write expirySeconds
+        seedSettings({
+            invoices: {
+                expiry: '1',
+                timePeriod: 'Hours',
+                expirySeconds: '3600'
+            }
+        });
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', {
+            expiry: '5',
+            expirySeconds: '18000'
+        });
+        await store.updateSettingsGroup('invoices', {
+            timePeriod: 'Days',
+            expirySeconds: '432000'
+        });
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+
+        expect(persistedSettings().invoices).toEqual({
+            expiry: '5',
+            timePeriod: 'Days',
+            expirySeconds: '432000'
+        });
+    });
+
+    const failNextWrite = () =>
+        StorageMock.setItem.mockImplementationOnce(async () => {
+            throw new Error('keychain unavailable');
+        });
+
+    it('keeps a patch whose write failed for the next flush', async () => {
+        seedSettings({ invoices: { memo: '', receiverName: '' } });
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', {
+            memo: 'coffee',
+            receiverName: 'Satoshi'
+        });
+        failNextWrite();
+        await expect(store.flushPendingSettings()).rejects.toThrow(
+            'keychain unavailable'
+        );
+        expect(persistedSettings().invoices).toEqual({
+            memo: '',
+            receiverName: ''
+        });
+
+        await store.flushPendingSettings();
+
+        expect(persistedSettings().invoices).toEqual({
+            memo: 'coffee',
+            receiverName: 'Satoshi'
+        });
+        expect(errorSpy).toHaveBeenCalledWith(
+            'Could not persist pending settings',
+            expect.any(Error)
+        );
+    });
+
+    it('lets a newer pending value win over a restored one', async () => {
+        seedSettings({ invoices: { memo: '', receiverName: '' } });
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', {
+            memo: 'cof',
+            receiverName: 'Satoshi'
+        });
+        failNextWrite();
+        const failed = store.flushPendingSettings();
+        // typed while the failing write was in the queue
+        store.updateSettingsGroupDebounced('invoices', { memo: 'coffee' });
+        await expect(failed).rejects.toThrow('keychain unavailable');
+
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+
+        expect(persistedSettings().invoices).toEqual({
+            memo: 'coffee',
+            receiverName: 'Satoshi'
+        });
+    });
+
+    it('drops a failed patch when a later update was queued behind it', async () => {
+        seedSettings({
+            invoices: {
+                expiry: '1',
+                timePeriod: 'Hours',
+                expirySeconds: '3600'
+            }
+        });
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', {
+            expiry: '5',
+            expirySeconds: '18000'
+        });
+        failNextWrite();
+        const failed = store.flushPendingSettings();
+        const later = store.updateSettingsGroup('invoices', {
+            timePeriod: 'Days',
+            expirySeconds: '86400'
+        });
+        await expect(failed).rejects.toThrow('keychain unavailable');
+        await later;
+
+        await store.flushPendingSettings();
+        await jest.advanceTimersByTimeAsync(SETTINGS_WRITE_DEBOUNCE_MS);
+
+        expect(persistedSettings().invoices).toEqual({
+            expiry: '1',
+            timePeriod: 'Days',
+            expirySeconds: '86400'
+        });
+    });
+
+    it('flushes when the app leaves the foreground', async () => {
+        seedSettings({ invoices: { memo: '' } });
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', { memo: 'coffee' });
+        expect(appStateHandler).toBeDefined();
+        appStateHandler!('background');
+        // Let the queued write run without reaching the debounce delay
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(persistedSettings().invoices).toEqual({ memo: 'coffee' });
+    });
+
+    it('registers one AppState listener per store', () => {
+        const store = new SettingsStore();
+
+        store.updateSettingsGroupDebounced('invoices', { memo: 'a' });
+        store.updateSettingsGroupDebounced('invoices', { memo: 'ab' });
+
+        expect(AppState.addEventListener).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('SettingsStore.updateSettings loading flag', () => {
+    it('does not set loading while a write runs', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+        await store.getSettings();
+        const seen: boolean[] = [];
+        StorageMock.getItem.mockImplementationOnce(async (key: string) => {
+            seen.push(store.loading);
+            return StorageMock._backing[key] ?? false;
+        });
+        StorageMock.setItem.mockImplementationOnce(
+            async (key: string, value: any) => {
+                seen.push(store.loading);
+                StorageMock._backing[key] = JSON.stringify(value);
+                return true;
+            }
+        );
+
+        await store.updateSettings({ fiat: 'EUR' });
+
+        expect(seen).toEqual([false, false]);
+        expect(store.loading).toEqual(false);
+    });
+});
+
+// triggerSettingsRefresh makes the Wallet screen run a full node refetch on
+// its next focus, which costs the user a noticeable loading time.
+// Writes that re-persist what is already stored must not arm it.
+describe('SettingsStore.updateSettings refresh flag', () => {
+    it('stays unarmed when a write re-persists an identical value', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+
+        await store.updateSettings({ fiat: 'USD' });
+
+        expect(store.triggerSettingsRefresh).toEqual(false);
+    });
+
+    it('is armed when a write changes a value', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+
+        await store.updateSettings({ fiat: 'EUR' });
+
+        expect(store.triggerSettingsRefresh).toEqual(true);
+    });
+
+    it('stays unarmed when a functional update resolves to the stored values', async () => {
+        // Functional updaters are resolved inside the queue, so the no-op
+        // check has to run on their result. A filter that removes nothing
+        // returns a new but equal array.
+        seedSettings({
+            nodes: [{ implementation: 'lnd', host: 'example.com' }],
+            selectedNode: 0
+        });
+        const store = new SettingsStore();
+
+        await store.updateSettings((currentSettings: any) => ({
+            nodes: currentSettings.nodes.filter(() => true),
+            selectedNode: currentSettings.selectedNode
+        }));
+
+        expect(store.triggerSettingsRefresh).toEqual(false);
+    });
+
+    it('stays unarmed when an undefined value is written for an absent key', async () => {
+        // JSON.stringify drops the key, so nothing changes on disk.
+        seedSettings({});
+        const store = new SettingsStore();
+
+        await store.updateSettings({ fiat: undefined });
+
+        expect(store.triggerSettingsRefresh).toEqual(false);
+        expect(persistedSettings()).not.toHaveProperty('fiat');
+    });
+
+    it('is armed and clears the key when undefined overwrites a stored value', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+
+        await store.updateSettings({ fiat: undefined });
+
+        expect(store.triggerSettingsRefresh).toEqual(true);
+        expect(store.settings.fiat).toBeUndefined();
+        expect(persistedSettings()).not.toHaveProperty('fiat');
+    });
+
+    // Bookkeeping keys and the one-shot flags the refresh itself resets
+    // only take effect on the next node start, so a change to them alone
+    // must not cost another refetch (#4751).
+    it.each([
+        ['authenticationAttempts', 0, 1],
+        ['supportedBiometryType', 'Biometrics', 'FaceID'],
+        ['initialLoad', true, false],
+        ['resetExpressGraphSyncOnStartup', true, false],
+        ['rescan', true, false],
+        ['recovery', true, false]
+    ])(
+        'stays unarmed when only %s changes',
+        async (key, storedValue, newValue) => {
+            seedSettings({ [key]: storedValue });
+            const store = new SettingsStore();
+
+            await store.updateSettings({ [key]: newValue });
+
+            expect(store.triggerSettingsRefresh).toEqual(false);
+            expect(persistedSettings()[key]).toEqual(newValue);
+        }
+    );
+
+    it('is armed when an exempt key changes together with another key', async () => {
+        // Restoring a wallet writes the new node along with recovery and
+        // initialLoad; the node change still needs the refetch.
+        seedSettings({ nodes: [], recovery: false, initialLoad: true });
+        const store = new SettingsStore();
+
+        await store.updateSettings({
+            nodes: [{ implementation: 'embedded-lnd', lndDir: 'lnd' }],
+            selectedNode: 0,
+            recovery: true,
+            initialLoad: false
+        });
+
+        expect(store.triggerSettingsRefresh).toEqual(true);
+    });
+
+    // Turning POS on relies on this flag alone: the refetch on the next
+    // Wallet focus is what navigates into POS mode.
+    it('is armed when POS gets enabled', async () => {
+        seedSettings({ pos: { posEnabled: 'disabled', merchantName: '' } });
+        const store = new SettingsStore();
+
+        await store.updateSettings({
+            pos: { posEnabled: 'standalone', merchantName: '' }
+        });
+
+        expect(store.triggerSettingsRefresh).toEqual(true);
+    });
+
+    it('stays unarmed when a POS write changes nothing while POS is enabled', async () => {
+        // POS settings writes spread the whole pos group, posEnabled
+        // included, so saving an unchanged field re-persists it.
+        seedSettings({
+            pos: { posEnabled: 'standalone', merchantName: 'Shop' }
+        });
+        const store = new SettingsStore();
+
+        await store.updateSettings({
+            pos: { posEnabled: 'standalone', merchantName: 'Shop' }
+        });
+
+        expect(store.triggerSettingsRefresh).toEqual(false);
+    });
+
+    it('stays unarmed and clears the key when biometrics are removed', async () => {
+        // Biometrics removed in the OS settings: writing undefined is how
+        // the stored sensor type gets cleared.
+        seedSettings({ supportedBiometryType: 'Biometrics' });
+        const store = new SettingsStore();
+
+        await store.updateSettings({ supportedBiometryType: undefined });
+
+        expect(store.triggerSettingsRefresh).toEqual(false);
+        expect(store.settings.supportedBiometryType).toBeUndefined();
+        expect(persistedSettings()).not.toHaveProperty('supportedBiometryType');
+    });
+});
+
+describe('SettingsStore.getSettings', () => {
+    afterEach(() => {
+        StorageMock.getRawItem.mockReset();
+        StorageMock.getRawItem.mockResolvedValue(null);
+    });
+
+    it('falls back to the synchronizable blob when the local partition is empty', async () => {
+        // Desync migration not yet complete: nothing in local storage, the
+        // real blob still lives only in the synchronizable partition. A user
+        // with wallets must never be routed to onboarding on such a boot.
+        const node = {
+            implementation: 'lnd',
+            host: 'example.com',
+            certVerification: true,
+            dismissCustodialWarning: true
+        };
+        StorageMock.getRawItem.mockImplementation(
+            async (server: string, cloudSync: boolean) =>
+                cloudSync && server === `zeus:${STORAGE_KEY}`
+                    ? JSON.stringify({ nodes: [node], selectedNode: 0 })
+                    : null
+        );
+        const store = new SettingsStore();
+
+        const settings = await store.getSettings();
+
+        expect(settings.nodes?.length).toEqual(1);
+        expect(settings.nodes?.[0].host).toEqual('example.com');
+        // Read-only fallback: the local partition must not be written
+        expect(StorageMock._backing[STORAGE_KEY]).toBeUndefined();
+    });
+
+    // getSettings used to reassign this.settings with a fresh JSON.parse
+    // result on every call, so every observer of the settings reference
+    // re-ran on each of the several loads per boot/focus even though
+    // nothing changed. Each no-op swap blocked the JS thread for
+    // 330-480 ms on a Galaxy S20+ (measured in review of #4594).
+    it('does not refire settings reactions when the stored blob is unchanged', async () => {
+        seedSettings({ fiat: 'USD', locale: 'en' });
+        const store = new SettingsStore();
+        await store.getSettings();
+
+        let fired = 0;
+        const dispose = reaction(
+            () => store.settings,
+            () => fired++
+        );
+        await store.getSettings();
+        await store.getSettings();
+        dispose();
+
+        expect(fired).toEqual(0);
+    });
+
+    it('still swaps the settings when the stored blob changed', async () => {
+        seedSettings({ fiat: 'USD' });
+        const store = new SettingsStore();
+        await store.getSettings();
+
+        let fired = 0;
+        const dispose = reaction(
+            () => store.settings,
+            () => fired++
+        );
+        seedSettings({ fiat: 'EUR' });
+        await store.getSettings();
+        dispose();
+
+        expect(fired).toEqual(1);
+        expect(store.settings.fiat).toEqual('EUR');
+    });
+});
+
+// Clipboard readers gate on settingsLoaded, because until a load completes
+// settings holds the in-memory defaults (privacy.clipboard: true)
+describe('SettingsStore.settingsLoaded', () => {
+    const EncryptedStorageMock: any = jest.requireMock(
+        'react-native-encrypted-storage'
+    );
+    const MigrationUtilsMock: any = jest.requireMock('../utils/MigrationUtils');
+
+    it('is false before getSettings runs', () => {
+        expect(new SettingsStore().settingsLoaded).toBe(false);
+    });
+
+    it('is set after loading stored settings', async () => {
+        seedSettings({ privacy: { clipboard: false } });
+        const store = new SettingsStore();
+
+        await store.getSettings();
+
+        expect(store.settingsLoaded).toBe(true);
+        expect(store.settings.privacy?.clipboard).toBe(false);
+    });
+
+    it('is set after migrating legacy settings', async () => {
+        EncryptedStorageMock.getItem.mockResolvedValueOnce(
+            JSON.stringify({ privacy: { clipboard: false } })
+        );
+        const store = new SettingsStore();
+
+        await store.getSettings();
+
+        expect(MigrationUtilsMock.legacySettingsMigrations).toHaveBeenCalled();
+        expect(store.settingsLoaded).toBe(true);
+    });
+
+    it('is set on a fresh install with nothing stored', async () => {
+        // onboarding relies on the defaults, clipboard reading included
+        const store = new SettingsStore();
+
+        await store.getSettings();
+
+        expect(store.settingsLoaded).toBe(true);
+        expect(store.settings.privacy?.clipboard).toBe(true);
+    });
+
+    it('stays false when loading throws', async () => {
+        seedSettings({ privacy: { clipboard: false } });
+        MigrationUtilsMock.keychainDesyncMigration.mockRejectedValueOnce(
+            new Error('keychain unavailable')
+        );
+        const store = new SettingsStore();
+
+        await store.getSettings();
+
+        expect(errorSpy).toHaveBeenCalledWith(
+            'Could not load settings',
+            expect.any(Error)
+        );
+        // the suite-wide afterEach fails on this expected error; clear it
+        // before the assertions below so a failure there stays local
+        errorSpy.mockClear();
+        expect(store.settingsLoaded).toBe(false);
+        // the defaults are still in place, so the flag is the only thing
+        // keeping clipboard readers from ignoring the stored opt-out
+        expect(store.settings.privacy?.clipboard).toBe(true);
+    });
+});
+
+// The LSP settings screens decide whether to show Reset by comparing the
+// field against these defaults, so they must never follow the saved value.
+describe('getLspConfigForNetwork', () => {
+    const custom = {
+        flow: 'https://flow.example.com',
+        rest: 'https://lsps1.example.com',
+        host: '127.0.0.1:9735'
+    };
+    const customSettings: any = {};
+    for (const net of ['Mainnet', 'Testnet', 'Mutinynet']) {
+        customSettings[`lsp${net}`] = custom.flow;
+        customSettings[`lsps1Rest${net}`] = custom.rest;
+        customSettings[`lsps1Host${net}`] = custom.host;
+    }
+
+    it.each([
+        [
+            'mainnet',
+            DEFAULT_LSP_MAINNET,
+            DEFAULT_LSPS1_REST_MAINNET,
+            DEFAULT_LSPS1_HOST_MAINNET,
+            DEFAULT_LSPS1_PUBKEY_MAINNET
+        ],
+        [
+            'testnet',
+            DEFAULT_LSP_TESTNET,
+            DEFAULT_LSPS1_REST_TESTNET,
+            DEFAULT_LSPS1_HOST_TESTNET,
+            DEFAULT_LSPS1_PUBKEY_TESTNET
+        ],
+        [
+            'mutinynet',
+            DEFAULT_LSP_MUTINYNET,
+            DEFAULT_LSPS1_REST_MUTINYNET,
+            DEFAULT_LSPS1_HOST_MUTINYNET,
+            DEFAULT_LSPS1_PUBKEY_MUTINYNET
+        ]
+    ])(
+        'keeps %s defaults while settings hold custom values',
+        (network, flow, rest, host, pubkey) => {
+            const config = getLspConfigForNetwork(customSettings, network);
+
+            expect(config.flowHost).toEqual(custom.flow);
+            expect(config.lsps1Rest).toEqual(custom.rest);
+            expect(config.lsps1Host).toEqual(custom.host);
+
+            expect(config.defaultFlowHost).toEqual(flow);
+            expect(config.defaultLsps1Rest).toEqual(rest);
+            expect(config.defaultLsps1Host).toEqual(host);
+            expect(config.defaultPubkey).toEqual(pubkey);
+        }
+    );
+});
+
+describe('SettingsStore.externalInputAuthRequired', () => {
+    const withPin = () => {
+        const store = new SettingsStore();
+        store.settings = { pin: '1234' } as any;
+        return store;
+    };
+
+    it('requires auth when logged out', () => {
+        expect(withPin().externalInputAuthRequired()).toBe(true);
+    });
+
+    it('does not require auth when logged in outside POS', () => {
+        const store = withPin();
+        store.setLoginStatus(true);
+        store.setPosStatus('inactive');
+        expect(store.externalInputAuthRequired()).toBe(false);
+    });
+
+    // The Lockscreen's POS waiver sets loggedIn with no PIN, so a POS
+    // terminal that has been resumed once reads as logged in
+    it('requires auth when logged in but POS is active', () => {
+        const store = withPin();
+        store.setLoginStatus(true);
+        store.setPosStatus('active');
+        expect(store.loginRequired()).toBe(false);
+        expect(store.externalInputAuthRequired()).toBe(true);
+    });
+
+    it('does not require auth when no login is configured', () => {
+        const store = new SettingsStore();
+        store.settings = {} as any;
+        store.setPosStatus('active');
+        expect(store.externalInputAuthRequired()).toBe(false);
+    });
+});
+
+describe('SettingsStore.sessionStarted', () => {
+    it('is false on a cold start', () => {
+        expect(new SettingsStore().sessionStarted()).toBe(false);
+    });
+
+    it('is false on a till whose settings loaded before POS mode started', () => {
+        const store = new SettingsStore();
+        store.settings = {
+            pin: '1234',
+            pos: { posEnabled: PosEnabled.Standalone }
+        } as any;
+        expect(store.posStatus).toBe('unselected');
+        expect(store.sessionStarted()).toBe(false);
+    });
+
+    it('is true once logged in', () => {
+        const store = new SettingsStore();
+        store.setLoginStatus(true);
+        expect(store.sessionStarted()).toBe(true);
+    });
+
+    it('is true once POS mode is active, without a login', () => {
+        const store = new SettingsStore();
+        store.setPosStatus('active');
+        expect(store.sessionStarted()).toBe(true);
+    });
+
+    it('is false again after the background lock outside POS', () => {
+        const store = new SettingsStore();
+        store.setLoginStatus(true);
+        store.setPosStatus('inactive');
+        store.setLoginStatus(false);
+        expect(store.sessionStarted()).toBe(false);
+    });
+});
+
+describe('SettingsStore.isPosEnabled', () => {
+    const withPos = (pos: any) => {
+        const store = new SettingsStore();
+        store.settings = { pos } as any;
+        return store;
+    };
+
+    it('is false when there are no POS settings', () => {
+        expect(withPos(undefined).isPosEnabled()).toBe(false);
+    });
+
+    it('is false when posEnabled is unset', () => {
+        expect(withPos({}).isPosEnabled()).toBe(false);
+    });
+
+    it('is false when POS is disabled', () => {
+        expect(
+            withPos({ posEnabled: PosEnabled.Disabled }).isPosEnabled()
+        ).toBe(false);
+    });
+
+    it('is true for Standalone and Square', () => {
+        expect(
+            withPos({ posEnabled: PosEnabled.Standalone }).isPosEnabled()
+        ).toBe(true);
+        expect(withPos({ posEnabled: PosEnabled.Square }).isPosEnabled()).toBe(
+            true
+        );
+    });
+});
+
+// Open Channel names the LSPS1 peer it dials, so it has to tell ZEUS's own
+// node from one the user pointed elsewhere.
+describe('isOlympusPeer', () => {
+    it('is true on the shipped defaults', () => {
+        expect(isOlympusPeer({} as any, 'mainnet')).toEqual(true);
+        expect(isOlympusPeer({} as any, 'testnet')).toEqual(true);
+        expect(isOlympusPeer({} as any, 'mutinynet')).toEqual(true);
+    });
+
+    it('is false when the pubkey is customized', () => {
+        expect(
+            isOlympusPeer({ lsps1PubkeyMainnet: '02abc' } as any, 'mainnet')
+        ).toEqual(false);
+    });
+
+    // the handshake is keyed on the pubkey, so a custom address for the same
+    // node is still Olympus
+    it('is true when only the host is customized', () => {
+        expect(
+            isOlympusPeer(
+                { lsps1HostMainnet: '127.0.0.1:9735' } as any,
+                'mainnet'
+            )
+        ).toEqual(true);
+    });
+
+    it('reads the network it is asked about', () => {
+        const settings: any = { lsps1PubkeyTestnet: '02abc' };
+        expect(isOlympusPeer(settings, 'testnet')).toEqual(false);
+        expect(isOlympusPeer(settings, 'mainnet')).toEqual(true);
+    });
+});
+
+// Every theme the Display picker offers needs a palette in
+// utils/ThemeUtils.ts. themeColor() falls through to the Dark palette for
+// any other value, so a picker entry without a palette silently renders
+// as Dark (d3f15bc9f removed five palettes but left their entries here).
+describe('THEME_KEYS', () => {
+    const { settingsStore } = jest.requireMock('./Stores');
+    const backgroundFor = (theme: string) => {
+        settingsStore.settings = { display: { theme } };
+        return themeColor('background');
+    };
+
+    it.each(
+        THEME_KEYS.filter(({ value }) => value !== 'dark').map(
+            ({ key, value }) => [key, value]
+        )
+    )('has a palette for %s', (_key, value) => {
+        // 'dark' is the fallback palette itself, hence skipped above
+        expect(backgroundFor(value)).not.toEqual(
+            backgroundFor('no-such-theme')
+        );
+    });
+
+    // utils/MigrationUtils.test.ts mocks RETIRED_THEMES and DEFAULT_THEME,
+    // so these pin the real constants the v3 migration uses
+    it('offers DEFAULT_THEME', () => {
+        expect(THEME_KEYS.map(({ value }) => value)).toContain(DEFAULT_THEME);
+    });
+
+    it('retires the five removed themes and offers none of them', () => {
+        expect(RETIRED_THEMES).toEqual([
+            'junkie',
+            'bpm',
+            'desert',
+            'mint',
+            'watermelon'
+        ]);
+        const offered = THEME_KEYS.map(({ value }) => value);
+        for (const theme of RETIRED_THEMES) {
+            expect(offered).not.toContain(theme);
+        }
+    });
+});

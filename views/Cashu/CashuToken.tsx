@@ -1,0 +1,716 @@
+import * as React from 'react';
+import { Alert, StyleSheet, ScrollView, View, Share } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { ButtonGroup } from '@rneui/themed';
+
+import CashuStore from '../../stores/CashuStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+import ModalStore from '../../stores/ModalStore';
+import { activityStore, settingsStore } from '../../stores/Stores';
+
+import Amount from '../../components/Amount';
+import AnimatedQRDisplay from '../../components/AnimatedQRDisplay';
+import Button from '../../components/Button';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import Screen from '../../components/Screen';
+import {
+    SuccessMessage,
+    WarningMessage,
+    ErrorMessage
+} from '../../components/SuccessErrorMessage';
+import Text from '../../components/Text';
+
+import CashuToken from '../../models/CashuToken';
+
+import { confirmAction } from '../../utils/ActionUtils';
+import { ZEUS_ECASH_GIFT_URL } from '../../utils/AddressUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import { getButtonGroupStyles } from '../../utils/buttonGroupStyles';
+import DateTimeUtils from '../../utils/DateTimeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+interface CashuTokenProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    CashuStore: CashuStore;
+    ChannelsStore: ChannelsStore;
+    ModalStore?: ModalStore;
+    route: Route<
+        'CashuToken',
+        {
+            token?: string;
+            decoded: CashuToken;
+            startOnQrTab?: boolean;
+            offlineSpent?: boolean;
+        }
+    >;
+}
+
+interface CashuTokenState {
+    updatedToken?: CashuToken;
+    success: boolean;
+    errorMessage: string;
+    warningMessage: string;
+    infoIndex: number;
+    isTokenTooLarge: boolean;
+}
+
+const MAX_TOKEN_LENGTH = 1000;
+
+@inject('CashuStore', 'ChannelsStore', 'ModalStore')
+@observer
+export default class CashuTokenView extends React.Component<
+    CashuTokenProps,
+    CashuTokenState
+> {
+    checkInterval: ReturnType<typeof setInterval> | null = null;
+
+    state = {
+        updatedToken: undefined,
+        success: false,
+        errorMessage: '',
+        warningMessage: '',
+        infoIndex: 0,
+        isTokenTooLarge: false
+    };
+
+    private stopCheckingInterval = () => {
+        if (this.checkInterval) {
+            clearInterval(this.checkInterval);
+            this.checkInterval = null;
+        }
+    };
+
+    // Same confirmation as the Add Mint view before a cleartext http://
+    // mint is contacted: the token names the mint, and the token's proofs
+    // and our invoice would be sent to it unencrypted
+    private confirmCleartextMint = (mint: string): Promise<boolean> =>
+        new Promise((resolve) => {
+            if (!UrlUtils.isCleartextHttpTransport(mint)) {
+                resolve(true);
+                return;
+            }
+            confirmAction(
+                localeString('general.warning'),
+                localeString('views.Cashu.AddMint.cleartextHttpWarning'),
+                {
+                    text: localeString('general.proceed'),
+                    style: 'destructive',
+                    onPress: () => resolve(true)
+                },
+                {
+                    text: localeString('general.cancel'),
+                    onPress: () => resolve(false),
+                    isPreferred: true
+                }
+            );
+        });
+
+    async componentDidMount() {
+        const { route, CashuStore } = this.props;
+        const {
+            checkTokenSpent,
+            markTokenSpent,
+            clearToken,
+            initializeWallet,
+            cashuWallets,
+            mintUrls
+        } = CashuStore!!;
+
+        clearToken();
+        const decoded = route.params?.decoded;
+        const token = route.params?.token || decoded?.encodedToken;
+        const { spent, mint } = decoded;
+        const offlineSpent = route.params?.offlineSpent;
+
+        if (token) {
+            this.setState({ isTokenTooLarge: token.length > MAX_TOKEN_LENGTH });
+        }
+
+        if (route.params?.startOnQrTab) {
+            this.setState({ infoIndex: 1 });
+        }
+
+        if (spent || offlineSpent) {
+            this.setState({
+                errorMessage: localeString('cashu.offlineSpent.tokenSpent')
+            });
+            return;
+        }
+
+        // Only contact the mint for an unspent token when the user already
+        // trusts it (it is in their added mints). A token is a bearer
+        // instrument whose mint field is attacker-chosen, so merely viewing a
+        // scanned/pasted token from an unknown mint must not add that mint,
+        // initialize a wallet for it, or poll it for proof state: doing so
+        // would leak the viewer's IP/timing and the receipt-correlating proof
+        // Y values to an attacker-controlled server without consent. Contact
+        // is deferred to the explicit Add Mint / Receive actions. This mirrors
+        // the cashu.me wallet, which decodes tokens offline and only reaches an
+        // untrusted mint on an explicit user action.
+        const haveMint = mintUrls.includes(mint);
+
+        if (!spent && haveMint) {
+            if (__DEV__) {
+                console.log('token not spent last time checked, checking...', {
+                    decoded
+                });
+            }
+
+            if (!cashuWallets[mint]) {
+                await initializeWallet(mint);
+            }
+            // Set up a periodic check every 5 seconds
+            this.checkInterval = setInterval(async () => {
+                const isSpent = await checkTokenSpent(decoded);
+
+                if (isSpent) {
+                    const updatedToken = await markTokenSpent(decoded);
+                    this.setState({
+                        updatedToken
+                    });
+                    this.stopCheckingInterval();
+                    activityStore.getActivityAndFilter(
+                        settingsStore.settings.locale
+                    );
+                }
+            }, 5000);
+        }
+    }
+
+    componentWillUnmount() {
+        this.stopCheckingInterval();
+    }
+
+    shareGiftLink = async (token: string) => {
+        const giftUrl = `${ZEUS_ECASH_GIFT_URL}${token}`;
+        try {
+            await Share.share({
+                message: giftUrl
+            });
+        } catch (error) {
+            console.log('Error sharing gift link:', error);
+        }
+    };
+
+    handlePendingPress = () => {
+        this.props.ModalStore!.toggleInfoModal({
+            title: localeString('views.Wallet.pendingBalanceIcon.title'),
+            text: localeString(
+                'views.Wallet.pendingBalanceIcon.explainerCashu'
+            ),
+            buttons: [
+                {
+                    title: localeString('general.learnMore'),
+                    callback: () =>
+                        UrlUtils.goToUrl(
+                            'https://docs.zeusln.app/for-users/using-zeus/pending-balances'
+                        )
+                }
+            ]
+        });
+    };
+
+    render() {
+        const { navigation, route, CashuStore, ChannelsStore } = this.props;
+        const {
+            success,
+            errorMessage,
+            warningMessage,
+            updatedToken,
+            infoIndex,
+            isTokenTooLarge
+        } = this.state;
+        const {
+            mintUrls,
+            addMint,
+            claimToken,
+            loading,
+            errorAddingMint,
+            error_msg: storeErrorMsg
+        } = CashuStore!!;
+        const decoded = updatedToken || route.params?.decoded;
+        const {
+            memo,
+            mint,
+            unit,
+            proofs,
+            getAmount,
+            isSupported,
+            received,
+            sent,
+            spent,
+            pendingClaim,
+            encodedToken,
+            getDisplayTime
+        } = decoded;
+        const token: string = route.params?.token || encodedToken || '';
+        const isSpent = spent || route.params?.offlineSpent;
+
+        const haveMint = mintUrls.includes(mint);
+        const hasOpenChannels = ChannelsStore?.channels?.length > 0;
+        const enableCashu = settingsStore.settings.ecash?.enableCashu;
+
+        const groupStyles = getButtonGroupStyles();
+
+        const qrButton = () => (
+            <Text
+                style={{
+                    ...styles.text,
+                    color:
+                        infoIndex === 1
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('views.PSBT.qrs')}
+            </Text>
+        );
+        const infoButton = () => (
+            <Text
+                style={{
+                    ...styles.text,
+                    color:
+                        infoIndex === 0
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('views.Cashu.CashuToken.info')}
+            </Text>
+        );
+
+        const infoButtons: any = [
+            { element: infoButton },
+            { element: qrButton }
+        ];
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: isSpent
+                            ? localeString('cashu.spentToken')
+                            : pendingClaim
+                            ? localeString('cashu.offlinePending.title')
+                            : received
+                            ? localeString('cashu.receivedToken')
+                            : sent
+                            ? localeString('cashu.unspentToken')
+                            : localeString('cashu.token'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        loading ? (
+                            <View>
+                                <LoadingIndicator size={30} />
+                            </View>
+                        ) : (
+                            <></>
+                        )
+                    }
+                    navigation={navigation}
+                />
+                <ScrollView keyboardShouldPersistTaps="handled">
+                    {success && !warningMessage && (
+                        <SuccessMessage
+                            message={localeString(
+                                'views.Cashu.CashuToken.success'
+                            )}
+                        />
+                    )}
+
+                    {warningMessage && (
+                        <WarningMessage message={warningMessage} />
+                    )}
+
+                    {(errorMessage || storeErrorMsg) && (
+                        <ErrorMessage message={errorMessage || storeErrorMsg} />
+                    )}
+
+                    {errorAddingMint && (
+                        <ErrorMessage
+                            message={localeString('cashu.errorAddingMint')}
+                        />
+                    )}
+
+                    {!isSupported && (
+                        <ErrorMessage
+                            message={`${localeString(
+                                'views.Cashu.CashuToken.notSupported'
+                            )}: ${unit}`}
+                        />
+                    )}
+
+                    {isSupported && (
+                        <View style={styles.center}>
+                            <Amount
+                                sats={getAmount}
+                                sensitive
+                                jumboText
+                                toggleable
+                                credit={received && !pendingClaim && !isSpent}
+                                pending={pendingClaim && !isSpent}
+                                debit={sent && isSpent && !pendingClaim}
+                                onPendingPress={this.handlePendingPress}
+                            />
+                        </View>
+                    )}
+
+                    <ButtonGroup
+                        onPress={(infoIndex: number) => {
+                            this.setState({ infoIndex });
+                        }}
+                        selectedIndex={infoIndex}
+                        buttons={infoButtons}
+                        selectedButtonStyle={groupStyles.selectedButtonStyle}
+                        containerStyle={groupStyles.containerStyle}
+                        innerBorderStyle={groupStyles.innerBorderStyle}
+                    />
+
+                    {infoIndex === 0 && (
+                        <View style={styles.content}>
+                            {mint && (
+                                <KeyValue
+                                    keyValue={localeString('cashu.mintUrl')}
+                                    value={mint}
+                                    sensitive
+                                    showCopyIcon
+                                />
+                            )}
+
+                            {memo && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.Invoice.memo'
+                                    )}
+                                    value={memo}
+                                    sensitive
+                                />
+                            )}
+
+                            {proofs && proofs.length > 0 && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.Cashu.CashuToken.proofCount'
+                                    )}
+                                    value={proofs.length}
+                                    sensitive
+                                />
+                            )}
+
+                            {getDisplayTime && getDisplayTime !== '' && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        sent
+                                            ? 'views.Invoice.creationDate'
+                                            : 'views.Invoice.settleDate'
+                                    )}
+                                    value={getDisplayTime}
+                                    sensitive
+                                />
+                            )}
+
+                            {decoded?.getLockPubkey && (
+                                <KeyValue
+                                    keyValue={localeString('cashu.lockTo')}
+                                    value={
+                                        decoded.getContactName ||
+                                        decoded.getLockPubkey
+                                    }
+                                    sensitive
+                                    showCopyIcon
+                                />
+                            )}
+
+                            {decoded?.getLockPubkey && (
+                                <KeyValue
+                                    keyValue={localeString('cashu.locktime')}
+                                    value={
+                                        decoded.getLocktime
+                                            ? DateTimeUtils.listFormattedDate(
+                                                  decoded.getLocktime
+                                              )
+                                            : localeString(
+                                                  'cashu.duration.forever'
+                                              )
+                                    }
+                                    sensitive
+                                />
+                            )}
+                        </View>
+                    )}
+
+                    {infoIndex === 1 && (
+                        <AnimatedQRDisplay
+                            data={token}
+                            encoderType="generic"
+                            fileType="U"
+                            valuePrefix="cashu:"
+                            copyValue={`cashu:${token}`}
+                            hideSingleFrame={isTokenTooLarge}
+                            onShareGiftLink={() => this.shareGiftLink(token)}
+                        />
+                    )}
+                </ScrollView>
+                {infoIndex === 0 &&
+                    (success || warningMessage) &&
+                    !received &&
+                    !pendingClaim && (
+                        <View style={{ bottom: 15 }}>
+                            <Button
+                                title={localeString(
+                                    'views.SendingLightning.goToWallet'
+                                )}
+                                icon={{
+                                    name: 'list',
+                                    size: 25,
+                                    color: themeColor('background')
+                                }}
+                                onPress={() => {
+                                    navigation.popTo('Wallet');
+                                }}
+                                containerStyle={{ marginTop: 15 }}
+                            />
+                        </View>
+                    )}
+                {infoIndex === 0 &&
+                    !success &&
+                    !warningMessage &&
+                    !received &&
+                    !pendingClaim &&
+                    (!sent || (sent && !spent)) && (
+                        <View style={{ bottom: 15 }}>
+                            {BackendUtils.supportsCashuWallet() && (
+                                <>
+                                    {!haveMint && (
+                                        <Button
+                                            title={localeString(
+                                                enableCashu
+                                                    ? 'views.Cashu.AddMint.title'
+                                                    : 'views.Cashu.AddMint.enableAndAdd'
+                                            )}
+                                            onPress={async () => {
+                                                if (
+                                                    !(await this.confirmCleartextMint(
+                                                        mint
+                                                    ))
+                                                ) {
+                                                    return;
+                                                }
+                                                CashuStore.setLoading(true);
+                                                try {
+                                                    if (!enableCashu) {
+                                                        await settingsStore.updateSettings(
+                                                            {
+                                                                ecash: {
+                                                                    ...(settingsStore
+                                                                        .settings
+                                                                        .ecash ||
+                                                                        {}),
+                                                                    enableCashu:
+                                                                        true
+                                                                }
+                                                            }
+                                                        );
+                                                        await CashuStore.initializeWallets();
+                                                    }
+                                                    await addMint(mint);
+                                                } catch (e) {
+                                                    console.error(
+                                                        'Error enabling Cashu / adding mint:',
+                                                        e
+                                                    );
+                                                    this.setState({
+                                                        errorMessage:
+                                                            localeString(
+                                                                'stores.CashuStore.errorAddingMint'
+                                                            )
+                                                    });
+                                                    CashuStore.setLoading(
+                                                        false
+                                                    );
+                                                }
+                                            }}
+                                            containerStyle={{ marginTop: 15 }}
+                                            disabled={!isSupported || loading}
+                                            tertiary
+                                        />
+                                    )}
+                                    <Button
+                                        title={localeString('general.receive')}
+                                        onPress={async () => {
+                                            this.setState({
+                                                errorMessage: '',
+                                                warningMessage: ''
+                                            });
+
+                                            // Use encodedToken from decoded (clean, no cashu: prefix)
+                                            const {
+                                                success,
+                                                errorMessage,
+                                                warningMessage
+                                            } = await claimToken(
+                                                encodedToken!,
+                                                decoded
+                                            );
+                                            if (errorMessage) {
+                                                this.setState({
+                                                    errorMessage
+                                                });
+                                            } else if (warningMessage) {
+                                                this.setState({
+                                                    success,
+                                                    warningMessage
+                                                });
+                                            } else if (success) {
+                                                this.setState({
+                                                    success
+                                                });
+                                            }
+                                        }}
+                                        containerStyle={{ marginTop: 15 }}
+                                        disabled={
+                                            !haveMint ||
+                                            errorAddingMint ||
+                                            !isSupported ||
+                                            loading
+                                        }
+                                    />
+                                </>
+                            )}
+                            <Button
+                                title={localeString(
+                                    BackendUtils.supportsChannelManagement()
+                                        ? 'views.Cashu.CashuToken.meltTokenSelfCustody'
+                                        : 'general.receive'
+                                )}
+                                onPress={async () => {
+                                    // a mint already in the wallet was chosen by the user
+                                    if (
+                                        !haveMint &&
+                                        !(await this.confirmCleartextMint(mint))
+                                    ) {
+                                        return;
+                                    }
+                                    this.setState({
+                                        errorMessage: '',
+                                        warningMessage: ''
+                                    });
+
+                                    const {
+                                        success,
+                                        errorMessage,
+                                        warningMessage
+                                    } = await claimToken(
+                                        encodedToken!,
+                                        decoded,
+                                        true
+                                    );
+
+                                    if (success) {
+                                        // the token can be claimed without
+                                        // the sweep to the node completing
+                                        this.setState({
+                                            success,
+                                            warningMessage: warningMessage || ''
+                                        });
+                                    } else {
+                                        this.setState({
+                                            errorMessage:
+                                                errorMessage ||
+                                                localeString(
+                                                    'stores.CashuStore.claimError'
+                                                )
+                                        });
+                                    }
+                                }}
+                                containerStyle={{ marginTop: 15 }}
+                                disabled={
+                                    (BackendUtils.supportsChannelManagement() &&
+                                        !hasOpenChannels) ||
+                                    !isSupported ||
+                                    loading
+                                }
+                                secondary
+                            />
+                        </View>
+                    )}
+                {infoIndex === 0 &&
+                    (pendingClaim || route.params?.offlineSpent) && (
+                        <View style={{ bottom: 15 }}>
+                            <Button
+                                title={localeString('general.delete')}
+                                onPress={() => {
+                                    Alert.alert(
+                                        localeString('cashu.deleteToken.title'),
+                                        localeString(
+                                            'cashu.deleteToken.message'
+                                        ),
+                                        [
+                                            {
+                                                text: localeString(
+                                                    'general.cancel'
+                                                ),
+                                                style: 'cancel'
+                                            },
+                                            {
+                                                text: localeString(
+                                                    'general.delete'
+                                                ),
+                                                style: 'destructive',
+                                                onPress: async () => {
+                                                    const isSpentToken =
+                                                        CashuStore.offlineSpentTokens.some(
+                                                            (t) =>
+                                                                t.encodedToken ===
+                                                                encodedToken
+                                                        );
+                                                    if (isSpentToken) {
+                                                        await CashuStore.removeOfflineSpentToken(
+                                                            encodedToken!
+                                                        );
+                                                    } else {
+                                                        await CashuStore.removeOfflinePendingToken(
+                                                            encodedToken!
+                                                        );
+                                                    }
+                                                    navigation.goBack();
+                                                }
+                                            }
+                                        ]
+                                    );
+                                }}
+                                containerStyle={{ marginTop: 15 }}
+                                warning
+                            />
+                        </View>
+                    )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    content: {
+        paddingLeft: 20,
+        paddingRight: 20
+    },
+    center: {
+        alignItems: 'center',
+        paddingTop: 15,
+        paddingBottom: 15
+    }
+});

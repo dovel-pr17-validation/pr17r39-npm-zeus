@@ -1,0 +1,2046 @@
+import * as React from 'react';
+import {
+    Animated,
+    AppState,
+    AppStateStatus,
+    BackHandler,
+    EmitterSubscription,
+    Linking,
+    NativeEventSubscription,
+    PanResponder,
+    PanResponderInstance,
+    Platform,
+    Text,
+    TouchableOpacity,
+    View,
+    Alert,
+    AlertButton
+} from 'react-native';
+import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import {
+    DefaultTheme,
+    NavigationContainer,
+    NavigationContainerRef,
+    NavigationIndependentTree
+} from '@react-navigation/native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import ChannelsPane from '../Channels/ChannelsPane';
+import BalancePane from './BalancePane';
+import KeypadPane from './KeypadPane';
+import SquarePosPane from './SquarePosPane';
+import StandalonePosPane from './StandalonePosPane';
+import StandalonePosKeypadPane from './StandalonePosKeypadPane';
+
+import Button from '../../components/Button';
+import LayerBalances from '../../components/LayerBalances';
+import LoadingColumns from '../../components/LoadingColumns';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import Screen from '../../components/Screen';
+import WalletHeader from '../../components/WalletHeader';
+
+import BackendUtils from '../../utils/BackendUtils';
+import { shouldSkipBackgroundLock } from '../../utils/BackgroundLockUtils';
+import { getSupportedBiometryType } from '../../utils/BiometricUtils';
+import LinkingUtils from '../../utils/LinkingUtils';
+import {
+    initializeLnd,
+    startLnd,
+    stopLnd,
+    expressGraphSync,
+    isLndError,
+    isTransientRpcError,
+    LndErrorCode,
+    matchesLndErrorCode,
+    retryOnTransientError,
+    waitForRpcReady
+} from '../../utils/LndMobileUtils';
+import {
+    startLdkNodeWallet,
+    stopLdkNode,
+    waitForLdkNodeReady,
+    DEFAULT_VSS_SERVER,
+    DEFAULT_SCORER_URL
+} from '../../utils/LdkNodeUtils';
+import { localeString, bridgeJavaStrings } from '../../utils/LocaleUtils';
+import { isBatterySaverEnabled } from '../../utils/BatteryUtils';
+import { fetchLncData } from '../../utils/LncFetchUtils';
+import { IS_BACKED_UP_KEY } from '../../utils/MigrationUtils';
+import { protectedNavigation } from '../../utils/NavigationUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { applySystemNavigationBarTheme } from '../../utils/SystemNavigationBarUtils';
+import { restartNeeded } from '../../utils/RestartUtils';
+import WalletRefreshRunner from '../../utils/WalletRefreshRunner';
+
+import {
+    loadPendingPaymentData,
+    clearPendingPaymentData
+} from '../../utils/GraphSyncUtils';
+import { CHANNEL_MIGRATION_ACTIVE } from '../../utils/ChannelMigrationUtils';
+import { repairMissingChannelEdges } from '../../utils/ChannelEdgeRepairUtils';
+
+import {
+    processSharedQRImageFast,
+    ShareIntentPayload
+} from '../../utils/ShareIntentProcessor';
+
+import Storage from '../../storage';
+import { autoPurgeLegacyKeychain } from '../../utils/KeychainPurgeUtils';
+import { isWipePending } from '../../utils/DataClearUtils';
+
+import AlertStore from '../../stores/AlertStore';
+import BalanceStore from '../../stores/BalanceStore';
+import CashuStore from '../../stores/CashuStore';
+import ChannelBackupStore from '../../stores/ChannelBackupStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+import TransactionsStore from '../../stores/TransactionsStore';
+import FiatStore from '../../stores/FiatStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+import LightningAddressStore from '../../stores/LightningAddressStore';
+import LnurlPayStore from '../../stores/LnurlPayStore';
+import LSPStore from '../../stores/LSPStore';
+import ModalStore from '../../stores/ModalStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import PosStore from '../../stores/PosStore';
+import SettingsStore, {
+    PosEnabled,
+    INTERFACE_KEYS,
+    getLspConfigForNetwork
+} from '../../stores/SettingsStore';
+import SyncStore from '../../stores/SyncStore';
+import UnitsStore from '../../stores/UnitsStore';
+import UTXOsStore from '../../stores/UTXOsStore';
+import ContactStore from '../../stores/ContactStore';
+import NotesStore from '../../stores/NotesStore';
+import SwapStore from '../../stores/SwapStore';
+import NostrWalletConnectStore from '../../stores/NostrWalletConnectStore';
+
+import Bitcoin from '../../assets/images/SVG/Bitcoin.svg';
+import CaretUp from '../../assets/images/SVG/Caret Up.svg';
+import ChannelsIcon from '../../assets/images/SVG/Channels.svg';
+import POS from '../../assets/images/SVG/POS.svg';
+import Temple from '../../assets/images/SVG/Temple.svg';
+import Scan from '../../assets/images/SVG/Scan.svg';
+
+import { version } from '../../package.json';
+
+const Tab = createBottomTabNavigator();
+
+interface WalletProps {
+    enterSetup: any;
+    exitTransaction: any;
+    navigation: NativeStackNavigationProp<any, any>;
+    route?: any;
+    AlertStore: AlertStore;
+    BalanceStore: BalanceStore;
+    CashuStore: CashuStore;
+    ChannelsStore: ChannelsStore;
+    TransactionsStore: TransactionsStore;
+    InvoicesStore: InvoicesStore;
+    NodeInfoStore: NodeInfoStore;
+    SettingsStore: SettingsStore;
+    UnitsStore: UnitsStore;
+    FiatStore: FiatStore;
+    PosStore: PosStore;
+    UTXOsStore: UTXOsStore;
+    ContactStore: ContactStore;
+    ModalStore: ModalStore;
+    SyncStore: SyncStore;
+    LSPStore: LSPStore;
+    NotesStore: NotesStore;
+    SwapStore: SwapStore;
+    ChannelBackupStore: ChannelBackupStore;
+    LightningAddressStore: LightningAddressStore;
+    LnurlPayStore: LnurlPayStore;
+    NostrWalletConnectStore: NostrWalletConnectStore;
+}
+
+interface WalletState {
+    unlocked: boolean;
+    initialLoad: boolean;
+    loading: boolean;
+    pendingShareIntent?: ShareIntentPayload;
+    isChannelMigrating: boolean;
+}
+
+@inject(
+    'AlertStore',
+    'BalanceStore',
+    'CashuStore',
+    'ChannelsStore',
+    'TransactionsStore',
+    'InvoicesStore',
+    'NodeInfoStore',
+    'SettingsStore',
+    'UnitsStore',
+    'FiatStore',
+    'PosStore',
+    'UTXOsStore',
+    'ContactStore',
+    'ModalStore',
+    'SyncStore',
+    'LSPStore',
+    'LnurlPayStore',
+    'ChannelBackupStore',
+    'LightningAddressStore',
+    'NotesStore',
+    'SwapStore',
+    'NostrWalletConnectStore'
+)
+@observer
+export default class Wallet extends React.Component<WalletProps, WalletState> {
+    private tabNavigationRef = React.createRef<NavigationContainerRef<any>>();
+    private pan: Animated.ValueXY;
+    private panResponder: PanResponderInstance;
+    private handleAppStateChangeSubscription: NativeEventSubscription;
+    private backPressSubscription: NativeEventSubscription;
+    private linkingSubscription: EmitterSubscription | undefined;
+    private startupTimeoutId?: ReturnType<typeof setTimeout>;
+    private refreshRunner: WalletRefreshRunner;
+    // Set once this instance replaces itself with the startup wallet
+    // selection screen; late focus/AppState triggers must not connect to
+    // the previously selected wallet or consume the initial deep link
+    private _replacedForWalletSelection = false;
+    // Set once a refresh finds a wipe that did not finish. Launch runs two
+    // refreshes, and by the second the Lockscreen may be running the wipe,
+    // when isWipePending() no longer reports it
+    private wipePending = false;
+
+    constructor(props: WalletProps) {
+        super(props);
+        this.state = {
+            unlocked: false,
+            initialLoad: true,
+            loading: false,
+            pendingShareIntent: undefined,
+            isChannelMigrating: false
+        };
+        this.refreshRunner = new WalletRefreshRunner(
+            props.SettingsStore,
+            () => this.props.navigation.isFocused(),
+            () => this.getSettingsAndNavigate()
+        );
+        this.pan = new Animated.ValueXY();
+        this.panResponder = PanResponder.create({
+            onMoveShouldSetPanResponder: () => true,
+            onPanResponderMove: Animated.event(
+                [null, { dx: this.pan.x, dy: this.pan.y }],
+                { useNativeDriver: false }
+            ),
+            onPanResponderRelease: () => {
+                Animated.spring(this.pan, {
+                    toValue: { x: 0, y: 0 },
+                    useNativeDriver: false
+                }).start();
+                props.navigation.navigate('Activity', {
+                    animation: 'slide_from_bottom'
+                });
+            }
+        });
+    }
+
+    private handleBackButton() {
+        const tabNavigator = this.tabNavigationRef.current;
+        if (!tabNavigator) {
+            return false;
+        }
+        const tabNavigatorState = tabNavigator.getState();
+        if (!tabNavigatorState) {
+            return false;
+        }
+        const currentTabName =
+            tabNavigatorState.routeNames[tabNavigatorState.index];
+        const defaultView =
+            this.props.SettingsStore.settings.display.defaultView;
+
+        if (defaultView === currentTabName || currentTabName === 'POS') {
+            return false;
+        } else if (defaultView) {
+            tabNavigator.navigate(defaultView);
+            return true;
+        }
+        return false;
+    }
+
+    private handleFocus = () => {
+        this.backPressSubscription?.remove();
+        this.backPressSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            this.handleBackButton.bind(this)
+        );
+
+        const { SettingsStore, CashuStore, route } = this.props;
+
+        const shareIntentData = route?.params?.shareIntentData;
+        if (shareIntentData) {
+            this.setState({ pendingShareIntent: shareIntentData });
+            if (route.params) {
+                delete route.params.shareIntentData;
+            }
+        }
+
+        if (route?.params?.switchToChannels) {
+            this.props.navigation.setParams({ switchToChannels: undefined });
+            this.tabNavigationRef.current?.navigate(
+                localeString('views.Wallet.Wallet.channels')
+            );
+        }
+
+        if (this.state.initialLoad || SettingsStore.triggerSettingsRefresh) {
+            // Guard against concurrent getSettingsAndNavigate calls — the
+            // focus event can fire multiple times before the first async
+            // call completes, causing duplicate node builds.
+            if (this.refreshRunner.running) {
+                // Leave the flag armed: a settings change that arrived
+                // while this refresh was already in flight is not covered
+                // by it, and clearing here would drop it silently. The
+                // runner picks it up once the refresh settles.
+                console.log(
+                    '[Wallet] handleFocus: skipping — getSettingsAndNavigate already in flight'
+                );
+            } else {
+                // Trigger getSettingsAndNavigate() in two scenarios:
+                // 1. On initial wallet load to ensure proper initialization
+                // 2. When any settings are updated to refresh the UI state
+                //    (including enabling POS, which navigates into POS mode)
+                console.log(
+                    `[Wallet] handleFocus: triggering getSettingsAndNavigate (initialLoad=${this.state.initialLoad}, triggerSettingsRefresh=${SettingsStore.triggerSettingsRefresh}, connecting=${SettingsStore.connecting})`
+                );
+                this.refreshRunner.run(() =>
+                    this.getSettingsAndNavigate(shareIntentData)
+                );
+            }
+        }
+
+        if (
+            BackendUtils.supportsCashuWallet() &&
+            SettingsStore.settings?.ecash?.enableCashu &&
+            CashuStore?.cdkInitialized
+        ) {
+            CashuStore.checkPendingItems();
+            CashuStore.syncCDKBalances().catch((e) =>
+                console.error('Wallet: Failed to sync CDK balances:', e)
+            );
+        }
+    };
+
+    private handleBlur = () => this.backPressSubscription?.remove();
+
+    async componentDidMount() {
+        // triggers when loaded from navigation or back action
+        this.props.navigation.addListener('focus', this.handleFocus);
+        this.props.navigation.addListener('blur', this.handleBlur);
+
+        this.handleAppStateChangeSubscription = AppState.addEventListener(
+            'change',
+            this.handleAppStateChange
+        );
+
+        const {
+            SettingsStore: { updateSettings }
+        } = this.props;
+
+        const supportedBiometryType = await getSupportedBiometryType();
+
+        await updateSettings({ supportedBiometryType });
+
+        this.handleFocus();
+    }
+
+    componentWillUnmount() {
+        this.props.navigation.removeListener &&
+            this.props.navigation.removeListener('focus', this.handleFocus);
+        this.handleAppStateChangeSubscription?.remove();
+        this.backPressSubscription?.remove();
+        this.linkingSubscription?.remove();
+        if (this.startupTimeoutId) {
+            clearTimeout(this.startupTimeoutId);
+            this.startupTimeoutId = undefined;
+        }
+    }
+
+    handleAppStateChange = (nextAppState: AppStateStatus) => {
+        const { SettingsStore, NostrWalletConnectStore } = this.props;
+        const { settings } = SettingsStore;
+        const { loginBackground } = settings;
+        if (
+            nextAppState === 'background' &&
+            SettingsStore.loginMethodConfigured() &&
+            loginBackground
+        ) {
+            // System dialogs (share sheet, SAF save/open pickers) background
+            // the Android activity without the user leaving the app; skip the
+            // lock while one is up (BackgroundLockUtils re-arms it if the
+            // user actually left).
+            if (!shouldSkipBackgroundLock()) {
+                SettingsStore.setLoginStatus(false);
+            }
+        } else if (nextAppState === 'inactive') {
+            NostrWalletConnectStore.reset();
+        } else if (nextAppState === 'active') {
+            if (SettingsStore.loginRequired()) {
+                this.props.navigation.navigate('Lockscreen');
+            } else if (this.props.navigation.isFocused()) {
+                if (BackendUtils.supportsNostrWalletConnectService()) {
+                    NostrWalletConnectStore.initializeService();
+                }
+                if (this.refreshRunner.running) {
+                    console.log(
+                        '[Wallet] handleAppStateChange(active): skipping — getSettingsAndNavigate already in flight'
+                    );
+                } else {
+                    console.log(
+                        `[Wallet] handleAppStateChange(active): triggering getSettingsAndNavigate (connecting=${SettingsStore.connecting})`
+                    );
+                    this.refreshRunner.run(() => this.getSettingsAndNavigate());
+                }
+            }
+        }
+    };
+
+    startListeners() {
+        this.linkingSubscription?.remove();
+        this.linkingSubscription = Linking.addEventListener(
+            'url',
+            this.handleOpenURL
+        );
+    }
+
+    async getSettingsAndNavigate(
+        explicitShareIntentData?: ShareIntentPayload,
+        transientRetryCount = 0
+    ) {
+        if (this._replacedForWalletSelection) return;
+
+        try {
+            this.setState({ loading: true });
+            const { SettingsStore, navigation } = this.props;
+            const { posStatus, setPosStatus, initialStart } = SettingsStore;
+
+            // A wipe cut short by the end of the process is finished by the
+            // Lockscreen, before this screen connects to a node it is deleting
+            if (this.wipePending || (await isWipePending())) {
+                this.wipePending = true;
+                navigation.navigate('Lockscreen');
+                return;
+            }
+
+            // This awaits on settings, so should await on Tor being bootstrapped before making requests
+            const settings = await SettingsStore.getSettings();
+
+            const { lndDir, implementation } = SettingsStore;
+
+            const migrationDataString = await Storage.getItem(
+                CHANNEL_MIGRATION_ACTIVE
+            );
+
+            if (migrationDataString) {
+                try {
+                    const migrationData = JSON.parse(migrationDataString);
+
+                    if (
+                        implementation === 'embedded-lnd' &&
+                        migrationData.migrationStatus &&
+                        migrationData.lndDir === lndDir
+                    ) {
+                        this.setState({ isChannelMigrating: true });
+                        SettingsStore.setChannelMigrating(true);
+                    } else {
+                        this.setState({ isChannelMigrating: false });
+                        SettingsStore.setChannelMigrating(false);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse migration data:', e);
+                    this.setState({ isChannelMigrating: false });
+                    SettingsStore.setChannelMigrating(false);
+                }
+            } else {
+                this.setState({ isChannelMigrating: false });
+                SettingsStore.setChannelMigrating(false);
+            }
+
+            // reading the intent consumes it, so leave a newer one alone
+            // while a payload is already being carried
+            const shareIntentData: ShareIntentPayload | undefined =
+                explicitShareIntentData ||
+                (await processSharedQRImageFast())?.params;
+            if (Platform.OS === 'android') {
+                const locale = settings.locale || 'en';
+                bridgeJavaStrings(locale);
+            }
+
+            applySystemNavigationBarTheme();
+            const loginRequired = SettingsStore.loginRequired();
+            const posEnabled =
+                settings?.pos?.posEnabled &&
+                settings.pos.posEnabled !== PosEnabled.Disabled;
+
+            if (!loginRequired) SettingsStore.setLoginStatus(true);
+
+            if (posEnabled && posStatus === 'inactive' && loginRequired) {
+                navigation.navigate('Lockscreen', { shareIntentData });
+            } else if (posEnabled && posStatus === 'unselected') {
+                setPosStatus('active');
+                // POS takes over from startup here, so end startup now. If
+                // the first connection below fails, it never reaches the end
+                // of fetchData, where startup otherwise ends, and the next
+                // refresh would replace the POS view with the startup
+                // wallet list
+                SettingsStore.setInitialStart(false);
+                if (!this.state.unlocked) {
+                    this.startListeners();
+                    this.setState({ unlocked: true });
+                }
+                if (shareIntentData) {
+                    this.setState({ pendingShareIntent: shareIntentData });
+                }
+                await this.fetchData(transientRetryCount);
+            } else if (loginRequired) {
+                navigation.navigate('Lockscreen', { shareIntentData });
+            } else if (
+                settings &&
+                settings.nodes &&
+                settings.nodes.length > 0
+            ) {
+                // If select wallet on startup is enabled and this is initial start,
+                // navigate to wallet selection screen without activating any wallet
+                if (settings.selectNodeOnStartup && initialStart) {
+                    SettingsStore.setInitialStart(false);
+                    // Update UI state but don't connect to any wallet yet
+                    if (!this.state.unlocked) {
+                        this.setState({ unlocked: true });
+                    }
+                    // Skip wallet activation by navigating directly to Wallets screen
+                    this._replacedForWalletSelection = true;
+                    navigation.replace('Wallets', {
+                        fromStartup: true,
+                        shareIntentData
+                    });
+                    return;
+                }
+
+                if (!this.state.unlocked) {
+                    this.startListeners();
+                    this.setState({ unlocked: true });
+                }
+
+                if (shareIntentData) {
+                    this.setState({ pendingShareIntent: shareIntentData });
+                }
+                // Fire-and-forget: one-shot removal of legacy and
+                // iCloud-synced keychain copies of wallet data
+                autoPurgeLegacyKeychain();
+                await this.fetchData(transientRetryCount);
+            } else {
+                // Only navigate to IntroSplash if Wallet screen is focused
+                // to prevent interference when user is on other screens
+                // (e.g., setting up a wallet image via WalletConfiguration)
+                if (navigation.isFocused()) {
+                    // reset, not navigate: this loading screen has no
+                    // wallet to return to, so leaving anything in the
+                    // stack lets iOS's swipe-back gesture (and Android's
+                    // hardware back) reveal it again behind IntroSplash.
+                    // replace only swaps the top entry and would still
+                    // leave earlier routes reachable underneath.
+                    navigation.reset({
+                        index: 0,
+                        routes: [{ name: 'IntroSplash' }]
+                    });
+                }
+            }
+        } catch (error) {
+            if (this.props.SettingsStore?.connecting) {
+                this.props.SettingsStore.setConnectingStatus(false);
+            }
+        } finally {
+            this.setState({ loading: false });
+        }
+
+        setTimeout(() => {
+            this.processPendingShareIntent();
+        }, 100);
+    }
+
+    async fetchData(transientRetryCount = 0) {
+        const { SettingsStore } = this.props;
+
+        // ensure we don't run this twice in parallel
+        const seq = SettingsStore.acquireFetchLock();
+        if (seq === null) return;
+
+        // A wallet switch or reconnect while this run is in flight hands the
+        // connection to a newer run (WalletRefreshRunner's follow-up). From
+        // then on this run must stop without writing state, including
+        // setConnectingStatus(false), which would end the newer connect.
+        const isCurrent = SettingsStore.getConnectionGuard();
+        try {
+            await this.fetchDataCore(transientRetryCount, isCurrent);
+        } catch (error) {
+            if (isCurrent()) throw error;
+            console.log('[Wallet] superseded refresh failed:', error);
+        } finally {
+            // Single release point: every exit from fetchDataCore (success,
+            // early return, or throw) must free the lock, otherwise
+            // pull-to-refresh and app-resume refreshes silently no-op until
+            // the next full reconnect. The store ignores the release if this
+            // invocation no longer owns the lock.
+            SettingsStore.releaseFetchLock(seq);
+        }
+    }
+
+    private async fetchDataCore(
+        transientRetryCount: number,
+        isCurrent: () => boolean
+    ) {
+        const {
+            AlertStore,
+            NodeInfoStore,
+            BalanceStore,
+            CashuStore,
+            ChannelsStore,
+            TransactionsStore,
+            UTXOsStore,
+            ContactStore,
+            SettingsStore,
+            PosStore,
+            FiatStore,
+            LSPStore,
+            ChannelBackupStore,
+            SyncStore,
+            LightningAddressStore,
+            LnurlPayStore,
+            NotesStore,
+            SwapStore,
+            NostrWalletConnectStore,
+            UnitsStore
+        } = this.props;
+        const {
+            settings,
+            implementation,
+            username,
+            password,
+            login,
+            connecting,
+            setConnectingStatus,
+            connectNWC,
+            posStatus,
+            walletPassword,
+            lndDir,
+            embeddedLndNetwork,
+            isSqlite,
+            // LDK Node settings
+            ldkNodeDir,
+            ldkMnemonic,
+            ldkPassphrase,
+            ldkNetwork,
+            ldkEsploraServer,
+            ldkRgsServer,
+            ldkScorerUrl,
+            ldkVssServer,
+            updateSettings
+        } = SettingsStore;
+        const { isSyncing } = SyncStore;
+        const {
+            fiatEnabled,
+            pos,
+            rescan,
+            compactDb,
+            recovery,
+            lightningAddress,
+            embeddedTor,
+            initialLoad
+        } = settings;
+        const expressGraphSyncEnabled =
+            settings.expressGraphSync && embeddedLndNetwork === 'Mainnet';
+
+        let start;
+        if (connecting) {
+            start = new Date().getTime();
+            AlertStore.reset();
+            NodeInfoStore.reset();
+            BalanceStore.reset();
+            ChannelsStore.reset();
+            TransactionsStore.reset();
+            SyncStore.reset();
+            LightningAddressStore.reset();
+            LSPStore.reset();
+            ChannelBackupStore.reset();
+            UTXOsStore.reset();
+            ContactStore.loadContacts();
+            NotesStore.loadNoteKeys();
+            // Units are first read at store construction, which on iOS can
+            // precede keychainDesyncMigration populating the device-local
+            // partition; re-read now that getSettings has completed
+            UnitsStore.getUnits();
+            CashuStore.reset();
+        }
+
+        LnurlPayStore.reset();
+
+        if (
+            pos?.posEnabled &&
+            pos.posEnabled !== PosEnabled.Disabled &&
+            posStatus === 'active'
+        ) {
+            PosStore.getOrders();
+        }
+
+        if (fiatEnabled) {
+            FiatStore.getFiatRates();
+        }
+
+        // Initialize and start LDK Node
+        if (implementation === 'ldk-node' && connecting) {
+            const justCreated = SettingsStore.walletJustCreated;
+
+            if (!justCreated) {
+                console.log('[LDK startup] stopping previous instance');
+                await stopLdkNode();
+                console.log('[LDK startup] stopped');
+                if (!isCurrent()) return;
+            } else {
+                console.log(
+                    '[LDK startup] node already built, skipping stop + init'
+                );
+                SettingsStore.walletJustCreated = false;
+            }
+
+            if (ldkMnemonic && ldkNodeDir) {
+                // Get LSPS1 config from settings based on network
+                const lspConfig = getLspConfigForNetwork(
+                    settings,
+                    ldkNetwork || 'mainnet'
+                );
+                const lsps1Token = settings.lsps1Token;
+
+                const lsps1Config =
+                    lspConfig.lsps1Pubkey && lspConfig.lsps1Host
+                        ? {
+                              nodeId: lspConfig.lsps1Pubkey,
+                              address: lspConfig.lsps1Host,
+                              token: lsps1Token || null
+                          }
+                        : undefined;
+
+                // Always include Flow LSP pubkey as trusted 0-conf peer
+                const flowLspPubkey = lspConfig.defaultPubkey;
+
+                // Include both the default Flow LSP and user-configured
+                // LSP as trusted 0-conf peers (dedup if they're the same)
+                const trustedPeers = [flowLspPubkey];
+                if (
+                    lsps1Config?.nodeId &&
+                    lsps1Config.nodeId !== flowLspPubkey
+                ) {
+                    trustedPeers.push(lsps1Config.nodeId);
+                }
+
+                console.log('[LDK startup] calling startLdkNodeWallet');
+                let ldkResult;
+                try {
+                    ldkResult = await startLdkNodeWallet({
+                        nodeDir: ldkNodeDir,
+                        seedMnemonic: ldkMnemonic,
+                        passphrase: ldkPassphrase,
+                        network: (ldkNetwork || 'mainnet') as
+                            | 'mainnet'
+                            | 'testnet'
+                            | 'signet'
+                            | 'regtest',
+                        esploraServerUrl: ldkEsploraServer,
+                        rgsServerUrl: ldkRgsServer,
+                        scorerUrl:
+                            ldkScorerUrl === undefined
+                                ? DEFAULT_SCORER_URL
+                                : ldkScorerUrl,
+                        lsps1Config,
+                        trustedPeers0conf: trustedPeers,
+                        vssServerUrl: ldkVssServer || DEFAULT_VSS_SERVER,
+                        skipInit: justCreated,
+                        onSyncStart: () => {
+                            SettingsStore.ldkNodeSyncing = true;
+                        }
+                    });
+                } catch (e: any) {
+                    // Startup with no local DB hard-fails on VSS errors
+                    // instead of silently building a fresh (empty) node —
+                    // surface the error and let the user retry
+                    const errMsg = e?.message || e.toString();
+                    console.warn('[LDK startup] failed:', errMsg);
+                    SettingsStore.ldkNodeSyncing = false;
+                    if (!isCurrent()) return;
+                    const isVssError =
+                        e?.code === 'vss_error' || errMsg.includes('VSS');
+                    SettingsStore.error = true;
+                    SettingsStore.errorMsg = isVssError
+                        ? `${localeString(
+                              'views.Settings.SeedRecovery.vssRestoreFailed'
+                          )}\n\n${errMsg}`
+                        : errMsg;
+                    SettingsStore.setConnectingStatus(false);
+                    return;
+                }
+
+                console.log('[LDK startup] startLdkNodeWallet returned');
+                SettingsStore.ldkNodeSyncing = false;
+                if (!isCurrent()) return;
+                if (ldkResult?.vssError) {
+                    AlertStore.setVssError(ldkResult.vssError);
+                }
+                if (ldkResult?.esploraError) {
+                    AlertStore.setEsploraError(ldkResult.esploraError);
+                }
+                if (ldkResult?.rgsError) {
+                    AlertStore.setRgsError(ldkResult.rgsError);
+                }
+
+                if (settings?.ecash?.enableCashu)
+                    await CashuStore.initializeWallets();
+                if (!isCurrent()) return;
+            } else {
+                console.error(
+                    'LDK Node configuration missing mnemonic or nodeDir'
+                );
+            }
+        }
+
+        if (implementation === 'embedded-lnd') {
+            if (connecting) {
+                // Helper to show folder missing alert
+                const showFolderMissingAlert = () => {
+                    console.log('showFolderMissingAlert called');
+                    SettingsStore.setConnectingStatus(false);
+                    SettingsStore.setLndFolderMissing(true);
+                    Alert.alert(
+                        localeString('views.Wallet.lndFolderMissing.title'),
+                        localeString('views.Wallet.lndFolderMissing.message'),
+                        [
+                            {
+                                text: localeString(
+                                    'views.Wallet.lndFolderMissing.deleteWallet'
+                                ),
+                                onPress: () =>
+                                    this.props.navigation.navigate('Wallets'),
+                                style: 'destructive' as const
+                            },
+                            {
+                                text: localeString(
+                                    'views.Tools.clearStorage.title'
+                                ),
+                                onPress: () =>
+                                    this.props.navigation.navigate('Tools', {
+                                        showClearDataModal: true
+                                    })
+                            },
+                            {
+                                text: localeString('general.cancel'),
+                                style: 'cancel' as const
+                            }
+                        ]
+                    );
+                };
+
+                // If LND is already running (e.g. just created via Quick Start),
+                // skip the stop→init→start cycle entirely
+                if (!SettingsStore.walletJustCreated) {
+                    try {
+                        AlertStore.checkNeutrinoPeers();
+
+                        const isChannelMigrating =
+                            this.state.isChannelMigrating ||
+                            SettingsStore.isChannelMigrating;
+
+                        if (isChannelMigrating) {
+                            try {
+                                await stopLnd();
+                            } catch (e) {
+                                console.log('stopLnd in migration mode:', e);
+                            }
+                            if (!isCurrent()) return;
+                            console.log(
+                                'Wallet is in migration lock mode - skipping LND startup'
+                            );
+                            this.setState({ loading: false });
+                            setConnectingStatus(false);
+                            return;
+                        }
+
+                        // Skip stopLnd when wallet is already closed (e.g. after delete)
+                        if (!recovery && SettingsStore.embeddedLndStarted) {
+                            await stopLnd();
+                            if (!isCurrent()) return;
+                        }
+
+                        if (settings?.ecash?.enableCashu)
+                            await CashuStore.initializeWallets();
+                        if (!isCurrent()) return;
+
+                        console.log('lndDir', lndDir);
+
+                        try {
+                            await initializeLnd({
+                                lndDir: lndDir || 'lnd',
+                                isTestnet: embeddedLndNetwork === 'Testnet',
+                                rescan,
+                                compactDb,
+                                isSqlite
+                            });
+                        } catch (initError: any) {
+                            // During recovery, initializeLnd may fail because createLndWallet
+                            // already set up the directories and config - that's OK, continue
+                            if (recovery) {
+                                console.log(
+                                    'initializeLnd failed during recovery (expected):',
+                                    initError?.message
+                                );
+                            } else {
+                                throw initError;
+                            }
+                        }
+                    } catch (error: any) {
+                        console.log(
+                            'embedded-lnd startup error:',
+                            error?.message,
+                            error
+                        );
+                        if (!isCurrent()) return;
+                        if (
+                            !recovery &&
+                            matchesLndErrorCode(
+                                error?.message || String(error),
+                                LndErrorCode.LND_FOLDER_MISSING
+                            )
+                        ) {
+                            showFolderMissingAlert();
+                            return;
+                        }
+                        throw error;
+                    }
+                    if (!isCurrent()) return;
+
+                    // on initial load, do not run EGS
+                    if (initialLoad) {
+                        await updateSettings({
+                            initialLoad: false
+                        });
+                    } else {
+                        if (expressGraphSyncEnabled) {
+                            const expressGraphSyncStart = new Date().getTime();
+                            console.log(
+                                '[Performance] Express Graph Sync starting...'
+                            );
+
+                            const { resetFailed } = await expressGraphSync();
+
+                            const expressGraphSyncDuration =
+                                new Date().getTime() - expressGraphSyncStart;
+                            console.log(
+                                `[Performance] Express Graph Sync completed in ${expressGraphSyncDuration}ms`
+                            );
+
+                            // Keep the reset flag if the graph reset failed
+                            // so it is retried on the next startup
+                            if (
+                                settings.resetExpressGraphSyncOnStartup &&
+                                !resetFailed
+                            ) {
+                                await updateSettings({
+                                    resetExpressGraphSyncOnStartup: false
+                                });
+                            }
+                        } else {
+                            console.log(
+                                '[Performance] Express Graph Sync skipped (disabled) - faster startup'
+                            );
+                        }
+                    }
+                    if (!isCurrent()) return;
+
+                    try {
+                        await startLnd({
+                            lndDir: lndDir || 'lnd',
+                            walletPassword: walletPassword || '',
+                            isTorEnabled: embeddedTor,
+                            isTestnet: embeddedLndNetwork === 'Testnet',
+                            isRecovery: recovery
+                        });
+                    } catch (error: any) {
+                        const errorMessage = error?.message ?? '';
+                        console.log('startLnd error:', errorMessage);
+                        if (!isCurrent()) return;
+
+                        // Handle folder missing error
+                        if (
+                            matchesLndErrorCode(
+                                errorMessage,
+                                LndErrorCode.LND_FOLDER_MISSING
+                            )
+                        ) {
+                            showFolderMissingAlert();
+                            return;
+                        }
+
+                        // Handle LND start failed after max retries - restart app
+                        if (
+                            isLndError(error, LndErrorCode.LND_START_FAILED) ||
+                            isLndError(error, LndErrorCode.LND_READY_TIMEOUT)
+                        ) {
+                            // Leave connecting mode before showing the restart
+                            // alert: with the fetch lock now released on exit,
+                            // a background/foreground would otherwise re-run
+                            // the full stop/init/start cycle and stack a
+                            // second restart alert on top of this one
+                            setConnectingStatus(false);
+                            restartNeeded(true);
+                            return;
+                        }
+
+                        // Handle transient errors - attempt restart with exponential backoff
+                        if (isTransientRpcError(errorMessage)) {
+                            await retryOnTransientError(
+                                error,
+                                errorMessage,
+                                'startLnd error',
+                                transientRetryCount,
+                                setConnectingStatus,
+                                () =>
+                                    this.getSettingsAndNavigate(
+                                        undefined,
+                                        transientRetryCount + 1
+                                    ),
+                                isCurrent
+                            );
+                            return;
+                        }
+
+                        // Fatal error - throw to outer handler
+                        console.error('Fatal startLnd error:', error);
+                        setConnectingStatus(false);
+                        throw error;
+                    }
+                    if (!isCurrent()) return;
+                } else {
+                    try {
+                        // LND was just created and is already running — skip stop→init→start
+                        AlertStore.checkNeutrinoPeers();
+                        SettingsStore.walletJustCreated = false;
+
+                        if (settings?.ecash?.enableCashu)
+                            await CashuStore.initializeWallets();
+                        if (!isCurrent()) return;
+
+                        await waitForRpcReady();
+                        if (!isCurrent()) return;
+                        if (!SyncStore.isSyncing) {
+                            SyncStore.startSyncing();
+                        }
+                    } catch (error: any) {
+                        console.error(
+                            'Fatal error during post-wallet creation setup:',
+                            error
+                        );
+                        if (!isCurrent()) return;
+                        setConnectingStatus(false);
+                        throw error;
+                    }
+                }
+
+                try {
+                    const batterySaverEnabled = await isBatterySaverEnabled();
+                    if (!isCurrent()) return;
+                    if (batterySaverEnabled) {
+                        if (Platform.OS === 'ios') {
+                            // The delay is what actually lets the navigation
+                            // transition settle before the modal appears. The
+                            // InteractionManager wrapper this replaces added
+                            // nothing beyond a microtask in RN 0.86, where
+                            // runAfterInteractions no longer waits for
+                            // interactions at all.
+                            setTimeout(() => {
+                                this.showBatterySaverModal();
+                            }, 500);
+                        } else {
+                            this.showBatterySaverModal();
+                        }
+                    }
+                } catch (error) {
+                    console.warn('Failed to check battery saver mode:', error);
+                }
+
+                if (!this.startupTimeoutId) {
+                    this.startupTimeoutId = setTimeout(() => {
+                        if (
+                            this.props.SettingsStore.connecting &&
+                            this.props.SettingsStore.implementation ===
+                                'embedded-lnd'
+                        ) {
+                            try {
+                                const message =
+                                    Platform.OS === 'ios'
+                                        ? localeString(
+                                              'views.Wallet.startupSlowMsg.ios'
+                                          )
+                                        : localeString(
+                                              'views.Wallet.startupSlowMsg.android'
+                                          );
+
+                                const buttons: AlertButton[] =
+                                    Platform.OS === 'ios'
+                                        ? [
+                                              {
+                                                  text: localeString(
+                                                      'views.Settings.EmbeddedNode.LNDLogs.title'
+                                                  ),
+                                                  onPress: () =>
+                                                      this.props.navigation.navigate(
+                                                          'LNDLogs'
+                                                      )
+                                              },
+                                              {
+                                                  text: localeString(
+                                                      'general.cancel'
+                                                  ),
+                                                  style: 'cancel' as const
+                                              }
+                                          ]
+                                        : [
+                                              {
+                                                  text: localeString(
+                                                      'views.Settings.EmbeddedNode.LNDLogs.title'
+                                                  ),
+                                                  onPress: () =>
+                                                      this.props.navigation.navigate(
+                                                          'LNDLogs'
+                                                      )
+                                              },
+                                              {
+                                                  text: localeString(
+                                                      'views.Wallet.restart'
+                                                  ),
+                                                  style: 'destructive' as const,
+                                                  onPress: () =>
+                                                      restartNeeded(true)
+                                              },
+                                              {
+                                                  text: localeString(
+                                                      'general.cancel'
+                                                  ),
+                                                  style: 'cancel' as const
+                                              }
+                                          ];
+
+                                Alert.alert(
+                                    localeString(
+                                        'views.Wallet.startupSlowTitle'
+                                    ),
+                                    message,
+                                    buttons
+                                );
+                            } catch (e) {}
+                        }
+                    }, 60000); // 60 seconds
+                }
+            }
+            try {
+                await waitForRpcReady();
+                if (!isCurrent()) return;
+                SyncStore.checkRecoveryStatus();
+                await NodeInfoStore.getNodeInfo();
+                if (!isCurrent()) return;
+                NodeInfoStore.getNetworkInfo();
+                await UTXOsStore.listAccounts();
+                if (!isCurrent()) return;
+                await BalanceStore.getCombinedBalance(false);
+                if (!isCurrent()) return;
+                ChannelsStore.getChannelsWithPolling().then(() => {
+                    if (!isCurrent()) return;
+                    // Resetting or rebuilding the SQLite graph database
+                    // drops our own channel edges, so recreate any that
+                    // are missing. This is a no-op after the first clean
+                    // pass this session; later refreshes only retry a
+                    // pass that skipped or failed a channel
+                    if (isSqlite) {
+                        repairMissingChannelEdges(lndDir || 'lnd').catch(
+                            (error) =>
+                                console.error(
+                                    'Channel edge repair failed',
+                                    error
+                                )
+                        );
+                    }
+                    // Check for sweep to self-custody threshold after channels are online
+                    if (settings?.ecash?.enableCashu) {
+                        CashuStore.checkAndSweepMints();
+                        // Check Cashu balance for upgrade prompts after channels are loaded
+                        CashuStore.checkAndShowUpgradeModal(
+                            0,
+                            CashuStore.totalBalanceSats || 0
+                        );
+                    }
+                });
+
+                if (rescan) {
+                    await updateSettings({
+                        rescan: false
+                    });
+                    if (!isCurrent()) return;
+                }
+                if (recovery) {
+                    const isBackedUp = await Storage.getItem(IS_BACKED_UP_KEY);
+                    if (!isBackedUp) {
+                        await Storage.setItem(IS_BACKED_UP_KEY, true);
+                    }
+                    if (isSyncing || !isCurrent()) return;
+                    try {
+                        await ChannelBackupStore.recoverStaticChannelBackup();
+                        if (!isCurrent()) return;
+                        await updateSettings({
+                            recovery: false
+                        });
+                        if (!isCurrent()) return;
+                        if (
+                            SettingsStore.settings
+                                .automaticDisasterRecoveryBackup
+                        )
+                            ChannelBackupStore.initSubscribeChannelEvents();
+                    } catch (recoverError) {
+                        console.error('recover error', recoverError);
+                    }
+                } else {
+                    if (SettingsStore.settings.automaticDisasterRecoveryBackup)
+                        ChannelBackupStore.initSubscribeChannelEvents();
+                }
+            } catch (rpcError: any) {
+                const errorMessage = rpcError?.message ?? '';
+                console.error('RPC/Data fetching error:', errorMessage);
+                if (!isCurrent()) return;
+
+                // Handle wallet directory not found (deleted wallet)
+                if (
+                    matchesLndErrorCode(
+                        errorMessage,
+                        LndErrorCode.LND_FOLDER_MISSING
+                    )
+                ) {
+                    setConnectingStatus(false);
+                    Alert.alert(
+                        localeString('views.Wallet.lndFolderMissing.title'),
+                        localeString('views.Wallet.lndFolderMissing.message'),
+                        [
+                            {
+                                text: localeString(
+                                    'views.Wallet.lndFolderMissing.deleteWallet'
+                                ),
+                                onPress: () =>
+                                    this.props.navigation.navigate('Wallets'),
+                                style: 'destructive' as const
+                            }
+                        ]
+                    );
+                    return;
+                }
+
+                // Handle transient RPC errors - attempt restart with exponential backoff
+                if (isTransientRpcError(errorMessage)) {
+                    await retryOnTransientError(
+                        rpcError,
+                        errorMessage,
+                        'RPC error',
+                        transientRetryCount,
+                        setConnectingStatus,
+                        () =>
+                            this.getSettingsAndNavigate(
+                                undefined,
+                                transientRetryCount + 1
+                            ),
+                        isCurrent
+                    );
+                    return;
+                }
+
+                // Fatal error - clear connecting status and re-throw
+                console.error('Fatal RPC error:', rpcError);
+                setConnectingStatus(false);
+                throw rpcError;
+            }
+        } else if (implementation === 'lndhub') {
+            if (connecting) {
+                try {
+                    await login({ login: username, password });
+                    if (!isCurrent()) return;
+                    await BalanceStore.getLightningBalance(true);
+                } catch (connectionError) {
+                    console.log('LNDHub connection failed:', connectionError);
+                    return;
+                }
+                if (!isCurrent()) return;
+            } else {
+                BalanceStore.getLightningBalance(true);
+            }
+        } else if (implementation === 'lightning-node-connect') {
+            const fetched = await fetchLncData(
+                connecting,
+                {
+                    SettingsStore,
+                    NodeInfoStore,
+                    UTXOsStore,
+                    BalanceStore,
+                    ChannelsStore
+                },
+                isCurrent
+            );
+            if (!isCurrent()) return;
+            if (!fetched) {
+                if (connecting) setConnectingStatus(false);
+                return;
+            }
+        } else if (implementation === 'nostr-wallet-connect') {
+            let error;
+            if (connecting) {
+                error = await connectNWC();
+                if (!isCurrent()) return;
+            }
+            if (!error) {
+                try {
+                    await BalanceStore.getLightningBalance(true);
+                } catch (connectionError) {
+                    console.log('NWC connection failed:', connectionError);
+                    return;
+                }
+                if (!isCurrent()) return;
+            }
+        } else if (implementation === 'ldk-node') {
+            try {
+                console.log('[LDK startup] waiting for node to be ready');
+                await waitForLdkNodeReady();
+                if (!isCurrent()) return;
+                console.log('[LDK startup] fetching node info');
+                await NodeInfoStore.getNodeInfo();
+                if (!isCurrent()) return;
+                console.log('[LDK startup] fetching balance');
+                await BalanceStore.getCombinedBalance();
+                if (!isCurrent()) return;
+                console.log('[LDK startup] polling channels');
+                ChannelsStore.getChannelsWithPolling().then(() => {
+                    if (!isCurrent()) return;
+                    // Check for sweep to self-custody threshold after channels are online
+                    if (settings?.ecash?.enableCashu) {
+                        CashuStore.checkAndSweepMints();
+                        CashuStore.checkAndShowUpgradeModal(
+                            0,
+                            CashuStore.totalBalanceSats || 0
+                        );
+                    }
+                });
+
+                if (recovery) {
+                    await updateSettings({
+                        recovery: false
+                    });
+                    if (!isCurrent()) return;
+                }
+            } catch (connectionError) {
+                console.log('LDK Node connection failed:', connectionError);
+                if (!isCurrent()) return;
+                NodeInfoStore.handleGetNodeInfoError();
+                setConnectingStatus(false);
+                return;
+            }
+        } else {
+            try {
+                await NodeInfoStore.getNodeInfo();
+                if (!isCurrent()) return;
+                if (BackendUtils.supportsAccounts()) {
+                    await UTXOsStore.listAccounts();
+                    if (!isCurrent()) return;
+                }
+                await BalanceStore.getCombinedBalance();
+                if (!isCurrent()) return;
+                await ChannelsStore.getChannels();
+                if (!isCurrent()) return;
+            } catch (connectionError) {
+                console.log('Node connection failed:', connectionError);
+                if (!isCurrent()) return;
+                NodeInfoStore.handleGetNodeInfoError();
+                setConnectingStatus(false);
+                return;
+            }
+        }
+
+        if (
+            lightningAddress.enabled &&
+            !NodeInfoStore.testnet &&
+            // all ZEUS Pay calls authenticate with the node pubkey; without
+            // it (connection failure) they can only fail server-side
+            NodeInfoStore.nodeInfo?.identity_pubkey &&
+            BackendUtils.supportsLightningAddress()
+        ) {
+            if (connecting) {
+                try {
+                    await LightningAddressStore.status();
+                    if (!isCurrent()) return;
+
+                    if (
+                        settings?.lightningAddress?.automaticallyAccept &&
+                        LightningAddressStore.lightningAddressType === 'cashu'
+                    ) {
+                        LightningAddressStore.prepareToAutomaticallyAcceptCashu();
+                    }
+
+                    if (
+                        // TODO add enum
+                        SettingsStore.settings.lightningAddress
+                            ?.notifications === 1
+                    ) {
+                        LightningAddressStore.updatePushCredentials().catch(
+                            (e) =>
+                                console.log(
+                                    'Failed to update push credentials',
+                                    e
+                                )
+                        );
+                    }
+                } catch (e) {
+                    console.error('Lightning address error', e);
+                }
+            }
+        }
+
+        // Auto-create Cashu Lightning address on first connection
+        // if Cashu was enabled during onboarding but no address exists yet
+        if (
+            connecting &&
+            settings?.ecash?.enableCashu &&
+            !lightningAddress.enabled &&
+            (settings?.ecash?.initialMintUrls?.length ?? 0) > 0 &&
+            !NodeInfoStore.testnet &&
+            BackendUtils.supportsCashuWallet()
+        ) {
+            try {
+                const mintUrl = settings.ecash.initialMintUrls![0];
+                await LightningAddressStore.createCashu(mintUrl);
+                if (!isCurrent()) return;
+                LightningAddressStore.prepareToAutomaticallyAcceptCashu();
+            } catch (e) {
+                console.error('Auto Lightning address creation failed', e);
+            }
+        }
+
+        // check for swaps after node info is fetched
+        // NOTE: swap rates are only fetched from the Swaps view
+        if (!isCurrent()) return;
+        if (connecting) {
+            SwapStore.fetchAndUpdateSwaps();
+        }
+
+        if (connecting && start != null) {
+            console.log(
+                '[Wallet] connect time: ' +
+                    (new Date().getTime() - start) / 1000 +
+                    's'
+            );
+            setConnectingStatus(false);
+            SettingsStore.setInitialStart(false);
+
+            if (this.startupTimeoutId) {
+                clearTimeout(this.startupTimeoutId);
+                this.startupTimeoutId = undefined;
+            }
+        }
+
+        LSPStore.initFlowLSP();
+
+        if (connecting && BackendUtils.supportsNostrWalletConnectService()) {
+            try {
+                NostrWalletConnectStore.initializeService();
+            } catch (error) {
+                console.warn(
+                    'Failed to initialize Nostr Wallet Connect service:',
+                    error
+                );
+            }
+        }
+        // only navigate to initial url after connection and main calls are
+        // made. No selectNodeOnStartup check is needed here: an instance
+        // that deferred to the startup wallet selection screen never reaches
+        // fetchData (_replacedForWalletSelection), and LinkingUtils only
+        // handles a given initial URL once
+        if (this.state.initialLoad) {
+            this.setState({
+                initialLoad: false
+            });
+            if (!this.state.pendingShareIntent) {
+                LinkingUtils.handleInitialUrl(this.props.navigation);
+            }
+        }
+
+        // Process any deep link that was deferred while login was required
+        LinkingUtils.processPendingDeepLink(this.props.navigation);
+
+        // Process pending share intent after wallet is fully loaded and synced
+        this.processPendingShareIntent();
+
+        // Process pending graph sync payment after wallet is fully loaded and synced
+        this.processPendingGraphSyncPayment();
+    }
+
+    processPendingShareIntent = () => {
+        if (this.state.pendingShareIntent) {
+            if (this.props.SettingsStore.connecting) {
+                return;
+            }
+            const { navigation } = this.props;
+            const shareIntentData = this.state.pendingShareIntent;
+
+            this.setState({ pendingShareIntent: undefined });
+
+            if (navigation.canGoBack()) {
+                navigation.popToTop();
+            }
+            navigation.push('ShareIntentProcessing', shareIntentData);
+        }
+    };
+
+    private showBatterySaverModal = () => {
+        this.props.ModalStore.toggleInfoModal({
+            title: localeString('views.Wallet.batterySaverWarningTitle'),
+            text: localeString('views.Wallet.batterySaverWarningText')
+        });
+    };
+
+    processPendingGraphSyncPayment = async () => {
+        try {
+            const pendingPaymentData = await loadPendingPaymentData();
+            if (pendingPaymentData) {
+                const { InvoicesStore, navigation } = this.props;
+
+                if (pendingPaymentData.payment_request) {
+                    await InvoicesStore.getPayReq(
+                        pendingPaymentData.payment_request
+                    );
+                    navigation.navigate('PaymentRequest', {
+                        fromGraphSync: true
+                    });
+                } else if (pendingPaymentData.pubkey) {
+                    navigation.navigate('Send', {
+                        destination: pendingPaymentData.pubkey,
+                        satAmount: pendingPaymentData.amount,
+                        transactionType: 'Keysend',
+                        fromGraphSync: true
+                    });
+                } else {
+                    clearPendingPaymentData().catch((error) => {
+                        console.error(
+                            'Failed to clear invalid pending payment data:',
+                            error
+                        );
+                    });
+                }
+            }
+        } catch (error) {
+            console.error(
+                'Error processing pending graph sync payment:',
+                error
+            );
+        }
+    };
+
+    handleOpenURL = (event: any) => {
+        const { navigation } = this.props;
+        if (event.url) {
+            if (
+                Platform.OS === 'ios' &&
+                event.url.startsWith('zeusln://share')
+            ) {
+                this.getSettingsAndNavigate();
+                return;
+            }
+            LinkingUtils.handleDeepLink(event.url, navigation);
+        }
+    };
+
+    // The error screen's Retry. It bypasses refreshRunner so that a refresh
+    // whose promise never settles cannot block the only in-app way out.
+    retryConnection = () => {
+        this.props.SettingsStore.setConnectingStatus(true);
+        return this.getSettingsAndNavigate();
+    };
+
+    render() {
+        const { loading, isChannelMigrating } = this.state;
+        const {
+            NodeInfoStore,
+            BalanceStore,
+            CashuStore,
+            SettingsStore,
+            SyncStore,
+            navigation,
+            ModalStore
+        } = this.props;
+        const { isSyncing, isInExpressGraphSync } = SyncStore;
+        const { nodeInfo } = NodeInfoStore;
+        const error =
+            NodeInfoStore.error || SettingsStore.error || BalanceStore.error;
+        const { implementation, settings, loggedIn, connecting, isMigrating } =
+            SettingsStore;
+        const loginRequired = !settings || SettingsStore.loginRequired();
+
+        const posEnabled: PosEnabled =
+            settings?.pos?.posEnabled || PosEnabled.Disabled;
+
+        const showKeypad: boolean = settings?.pos?.showKeypad || false;
+        const posView = SettingsStore.posViewActive();
+
+        const dataAvailable =
+            implementation === 'lndhub' ||
+            implementation === 'nostr-wallet-connect' ||
+            nodeInfo.version;
+
+        // Define the type for implementationDisplayValue
+        interface ImplementationDisplayValue {
+            [key: string]: string;
+        }
+
+        const implementationDisplayValue: ImplementationDisplayValue = {};
+        INTERFACE_KEYS.filter((item) => !item.isHeader).forEach((item) => {
+            implementationDisplayValue[item.value] = item.key;
+        });
+
+        const BalanceScreen = () => {
+            return (
+                <Screen>
+                    <BalancePane
+                        navigation={navigation}
+                        NodeInfoStore={NodeInfoStore}
+                        BalanceStore={BalanceStore}
+                        CashuStore={CashuStore}
+                        SettingsStore={SettingsStore}
+                        SyncStore={SyncStore}
+                        ModalStore={ModalStore}
+                        loading={loading}
+                        isChannelMigrating={isChannelMigrating}
+                        onUnlock={() => {
+                            this.setState({ isChannelMigrating: false });
+                            SettingsStore.setChannelMigrating(false);
+                        }}
+                    />
+
+                    {error && (
+                        <View style={{ backgroundColor: themeColor('error') }}>
+                            <Text
+                                style={{
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    color: '#fff',
+                                    fontSize: 12,
+                                    marginBottom: 15,
+                                    textAlign: 'center'
+                                }}
+                            >
+                                {`v${version} | ${implementationDisplayValue[implementation]}`}
+                            </Text>
+                            <Button
+                                icon={{
+                                    name: 'settings',
+                                    size: 25,
+                                    color: '#fff'
+                                }}
+                                title={localeString(
+                                    'views.Wallet.BalancePane.goToWalletConfig'
+                                )}
+                                buttonStyle={{
+                                    backgroundColor: 'gray',
+                                    marginBottom: 20
+                                }}
+                                onPress={() => {
+                                    const { settings } = SettingsStore;
+                                    const selectedNode =
+                                        settings.selectedNode || 0;
+                                    const node = settings.nodes?.[selectedNode];
+                                    protectedNavigation(
+                                        navigation,
+                                        'WalletConfiguration',
+                                        false,
+                                        {
+                                            node,
+                                            index: selectedNode,
+                                            active: true,
+                                            newEntry: false
+                                        }
+                                    );
+                                }}
+                            />
+                            <Button
+                                title={localeString('general.retry')}
+                                icon={{
+                                    name: 'sync',
+                                    size: 25
+                                }}
+                                onPress={this.retryConnection}
+                            />
+                        </View>
+                    )}
+
+                    {dataAvailable && !error && !isChannelMigrating && (
+                        <>
+                            <LayerBalances
+                                navigation={navigation}
+                                onRefresh={() => this.getSettingsAndNavigate()}
+                                consolidated
+                            />
+
+                            <Animated.View
+                                style={{
+                                    position: 'absolute',
+                                    bottom: 10,
+                                    width: '100%',
+                                    height: 80,
+                                    transform: [{ translateY: this.pan.y }],
+                                    justifyContent: 'center',
+                                    alignItems: 'center'
+                                }}
+                                {...this.panResponder.panHandlers}
+                            >
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        this.props.navigation.navigate(
+                                            'Activity',
+                                            { animation: 'slide_from_bottom' }
+                                        )
+                                    }
+                                    accessibilityLabel={localeString(
+                                        'general.activity'
+                                    )}
+                                    style={{
+                                        alignItems: 'center',
+                                        padding: 10
+                                    }}
+                                >
+                                    <CaretUp fill={themeColor('text')} />
+                                    <Text
+                                        style={{
+                                            marginTop: 7,
+                                            textAlign: 'center',
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            color: themeColor('text')
+                                        }}
+                                    >
+                                        {localeString('general.activity')}
+                                    </Text>
+                                </TouchableOpacity>
+                            </Animated.View>
+                        </>
+                    )}
+                </Screen>
+            );
+        };
+
+        const PosScreen = () => {
+            return (
+                <Screen>
+                    {posEnabled === PosEnabled.Square && (
+                        <SquarePosPane navigation={navigation} />
+                    )}
+                    {posEnabled === PosEnabled.Standalone && (
+                        <StandalonePosPane navigation={navigation} />
+                    )}
+                </Screen>
+            );
+        };
+
+        const PosKeypadScreen = () => {
+            return (
+                <Screen>
+                    <StandalonePosKeypadPane navigation={navigation} />
+                </Screen>
+            );
+        };
+
+        const KeypadScreen = () => {
+            return (
+                <Screen>
+                    <KeypadPane navigation={navigation} loading={loading} />
+                </Screen>
+            );
+        };
+
+        const CameraScreen: any = () => {};
+
+        const ChannelsScreen = () => {
+            return (
+                <Screen>
+                    <ChannelsPane navigation={navigation} />
+                </Screen>
+            );
+        };
+
+        const Theme = {
+            ...DefaultTheme,
+            colors: {
+                ...DefaultTheme.colors,
+                background: themeColor('background'),
+                card: error ? themeColor('error') : themeColor('background'),
+                border: error ? themeColor('error') : themeColor('background')
+            }
+        };
+
+        return (
+            <View style={{ flex: 1 }}>
+                {!connecting &&
+                    (!loginRequired || posEnabled !== PosEnabled.Disabled) && (
+                        <NavigationIndependentTree>
+                            <NavigationContainer
+                                theme={Theme}
+                                ref={this.tabNavigationRef}
+                            >
+                                <Tab.Navigator
+                                    initialRouteName={
+                                        isChannelMigrating
+                                            ? 'Balance'
+                                            : error &&
+                                              posEnabled === PosEnabled.Disabled
+                                            ? 'Balance'
+                                            : posView
+                                            ? (settings.pos &&
+                                                  settings.pos.defaultView) ||
+                                              'Products'
+                                            : isSyncing
+                                            ? 'Balance'
+                                            : (settings.display &&
+                                                  settings.display
+                                                      .defaultView) ||
+                                              'Keypad'
+                                    }
+                                    backBehavior="none"
+                                    screenOptions={({ route }) => ({
+                                        tabBarIcon: ({ color }) => {
+                                            if (
+                                                isSyncing &&
+                                                !settings?.ecash?.enableCashu &&
+                                                route.name === 'Keypad'
+                                            ) {
+                                                return;
+                                            }
+                                            if (route.name === 'Keypad') {
+                                                return <Bitcoin fill={color} />;
+                                            }
+                                            if (route.name === 'Balance') {
+                                                return <Temple fill={color} />;
+                                            }
+                                            if (route.name === 'Products') {
+                                                return <POS stroke={color} />;
+                                            }
+                                            if (route.name === 'POS Keypad') {
+                                                return <Bitcoin fill={color} />;
+                                            }
+                                            if (route.name === 'Camera') {
+                                                return (
+                                                    <Scan
+                                                        fill={color}
+                                                        width={20}
+                                                    />
+                                                );
+                                            }
+                                            if (
+                                                BackendUtils.supportsChannelManagement()
+                                            ) {
+                                                return (
+                                                    <ChannelsIcon
+                                                        height={26}
+                                                        width={26}
+                                                        fill={color}
+                                                    />
+                                                );
+                                            }
+                                        },
+                                        headerShown: false,
+                                        tabBarActiveTintColor: error
+                                            ? themeColor('error')
+                                            : themeColor('text'),
+                                        tabBarInactiveTintColor: error
+                                            ? themeColor('error')
+                                            : 'gray',
+                                        tabBarShowLabel: false,
+                                        tabBarStyle: {
+                                            paddingBottom: 12,
+                                            height: 55
+                                        },
+                                        // Disable top safe area - WalletHeader handles it
+                                        safeAreaInsets: { top: 0 },
+                                        // TODO re-enable for iOS once ZEUS-3514 is resolved
+                                        animation:
+                                            Platform.OS === 'android'
+                                                ? 'shift'
+                                                : undefined
+                                    })}
+                                >
+                                    {!isChannelMigrating && posView ? (
+                                        <Tab.Screen name="Products">
+                                            {PosScreen}
+                                        </Tab.Screen>
+                                    ) : (
+                                        <Tab.Screen name="Balance">
+                                            {BalanceScreen}
+                                        </Tab.Screen>
+                                    )}
+                                    {!isChannelMigrating &&
+                                        posEnabled === PosEnabled.Standalone &&
+                                        posView &&
+                                        showKeypad && (
+                                            <Tab.Screen name="POS Keypad">
+                                                {PosKeypadScreen}
+                                            </Tab.Screen>
+                                        )}
+                                    {!isChannelMigrating && !posView && (
+                                        <>
+                                            {!error &&
+                                                !(
+                                                    isSyncing &&
+                                                    !settings?.ecash
+                                                        ?.enableCashu
+                                                ) && (
+                                                    <Tab.Screen name="Keypad">
+                                                        {KeypadScreen}
+                                                    </Tab.Screen>
+                                                )}
+                                            {BackendUtils.supportsChannelManagement() &&
+                                                !error &&
+                                                !isSyncing && (
+                                                    <Tab.Screen
+                                                        name={localeString(
+                                                            'views.Wallet.Wallet.channels'
+                                                        )}
+                                                    >
+                                                        {ChannelsScreen}
+                                                    </Tab.Screen>
+                                                )}
+                                        </>
+                                    )}
+                                    {!isChannelMigrating && !posView && !error && (
+                                        <Tab.Screen
+                                            name="Camera"
+                                            listeners={{
+                                                tabPress: (e) => {
+                                                    // Prevent default action
+                                                    e.preventDefault();
+                                                    navigation.navigate(
+                                                        'HandleAnythingQRScanner'
+                                                    );
+                                                }
+                                            }}
+                                        >
+                                            {CameraScreen}
+                                        </Tab.Screen>
+                                    )}
+                                </Tab.Navigator>
+                            </NavigationContainer>
+                        </NavigationIndependentTree>
+                    )}
+                {connecting &&
+                    (!loginRequired || posEnabled !== PosEnabled.Disabled) && (
+                        <Screen>
+                            <View
+                                style={{
+                                    position: 'absolute',
+                                    zIndex: 1
+                                }}
+                            >
+                                <WalletHeader
+                                    navigation={navigation}
+                                    connecting
+                                />
+                            </View>
+                            <View
+                                style={{
+                                    flex: 1,
+                                    justifyContent: 'center',
+                                    alignItems: 'center'
+                                }}
+                            >
+                                <LoadingColumns />
+                                <View
+                                    style={{
+                                        position: 'absolute',
+                                        bottom: 130
+                                    }}
+                                >
+                                    <Text
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            alignSelf: 'center',
+                                            fontSize: 15,
+                                            padding: 8
+                                        }}
+                                    >
+                                        {isMigrating
+                                            ? localeString(
+                                                  'views.Wallet.Wallet.migrating'
+                                              ).replace('Zeus', 'ZEUS')
+                                            : CashuStore.initializing
+                                            ? CashuStore.loadingMsg
+                                            : settings.nodes &&
+                                              loggedIn &&
+                                              implementation
+                                            ? BackendUtils.isLocalWallet()
+                                                ? isInExpressGraphSync
+                                                    ? localeString(
+                                                          'views.Wallet.Wallet.expressGraphSync'
+                                                      ).replace('Zeus', 'ZEUS')
+                                                    : SettingsStore.ldkNodeSyncing
+                                                    ? localeString(
+                                                          'views.Sync.title'
+                                                      ).replace('Zeus', 'ZEUS')
+                                                    : localeString(
+                                                          'views.Wallet.Wallet.startingNode'
+                                                      ).replace('Zeus', 'ZEUS')
+                                                : implementation === 'lndhub' ||
+                                                  implementation ===
+                                                      'nostr-wallet-connect'
+                                                ? localeString(
+                                                      'views.Wallet.Wallet.loadingAccount'
+                                                  ).replace('Zeus', 'ZEUS')
+                                                : localeString(
+                                                      'views.Wallet.Wallet.connecting'
+                                                  ).replace('Zeus', 'ZEUS')
+                                            : localeString(
+                                                  'views.Wallet.Wallet.startingUp'
+                                              ).replace('Zeus', 'ZEUS')}
+                                    </Text>
+                                    <View style={{ marginTop: 40 }}>
+                                        <LoadingIndicator />
+                                    </View>
+                                </View>
+                            </View>
+                            {isInExpressGraphSync && (
+                                <View
+                                    style={{
+                                        bottom: 70,
+                                        position: 'absolute',
+                                        alignSelf: 'center'
+                                    }}
+                                >
+                                    <Button
+                                        title={localeString('general.skip')}
+                                        containerStyle={{
+                                            width: 320
+                                        }}
+                                        titleStyle={{
+                                            color: themeColor('text')
+                                        }}
+                                        onPress={() => {
+                                            SyncStore.setExpressGraphSyncStatus(
+                                                false
+                                            );
+                                        }}
+                                        adaptiveWidth
+                                        iconOnly
+                                    />
+                                </View>
+                            )}
+                        </Screen>
+                    )}
+            </View>
+        );
+    }
+}

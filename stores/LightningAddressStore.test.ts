@@ -1,0 +1,669 @@
+jest.mock('react-native-blob-util', () => ({ fetch: jest.fn() }));
+jest.mock('react-native-notifications', () => ({
+    Notifications: { postLocalNotification: jest.fn() }
+}));
+jest.mock('socket.io-client', () => ({ io: jest.fn() }));
+jest.mock('nostr-tools', () => ({
+    getPublicKey: jest.fn(),
+    SimplePool: jest.fn()
+}));
+jest.mock('./CashuStore', () => ({}));
+jest.mock('./NodeInfoStore', () => ({}));
+jest.mock('./SettingsStore', () => ({}));
+jest.mock('../utils/BackendUtils', () => ({}));
+jest.mock('../utils/LocaleUtils');
+jest.mock('../storage', () => ({
+    getItem: jest.fn().mockResolvedValue(null),
+    setItem: jest.fn().mockResolvedValue(true),
+    removeItem: jest.fn().mockResolvedValue(true)
+}));
+
+import ReactNativeBlobUtil from 'react-native-blob-util';
+import Storage from '../storage';
+import LightningAddressStore, {
+    HASHES_STORAGE_STRING
+} from './LightningAddressStore';
+
+const newStore = (settings: any = {}) =>
+    new LightningAddressStore(
+        {
+            cashuWallets: { 'https://mint.test': { pubkey: '02ab' } }
+        } as any,
+        { nodeInfo: { identity_pubkey: '03cd' } } as any,
+        {
+            settings,
+            updateSettings: jest.fn().mockResolvedValue(undefined),
+            updateSettingsGroup: jest.fn().mockResolvedValue(undefined)
+        } as any
+    );
+
+const flushPromises = () => new Promise((resolve) => setImmediate(resolve));
+
+describe('LightningAddressStore', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+        jest.spyOn(console, 'log').mockImplementation(() => {});
+    });
+
+    afterEach(() => jest.restoreAllMocks());
+
+    describe('status', () => {
+        const mockStatusResponse = (data: any) =>
+            (ReactNativeBlobUtil.fetch as jest.Mock).mockResolvedValue({
+                info: () => ({ status: 200 }),
+                json: () => ({
+                    success: true,
+                    handle: 'satoshi',
+                    domain: 'zeuspay.com',
+                    minimumSats: 1,
+                    ...data
+                })
+            });
+
+        const statusStore = () => {
+            const store = newStore();
+            jest.spyOn(store as any, 'getAuthData').mockResolvedValue({
+                verification: 'v',
+                signature: 's'
+            });
+            return store;
+        };
+
+        it('keeps open payments for a Cashu address', async () => {
+            const store = statusStore();
+            const paid = [
+                {
+                    quote_id: 'q1',
+                    mint_url: 'https://mint.test',
+                    amount_msat: 1000
+                }
+            ];
+            mockStatusResponse({ addressType: 'cashu', paid });
+
+            await store.status();
+
+            expect(store.paid).toEqual(paid);
+            expect(store.lightningAddressType).toBe('cashu');
+            expect(store.lightningAddress).toBe('satoshi@zeuspay.com');
+            expect(store.minimumSats).toBe(1);
+            expect(store.loading).toBe(false);
+        });
+
+        it('drops held payments for a retired Zaplocker address and submits no hashes', async () => {
+            const store = statusStore();
+            mockStatusResponse({
+                addressType: 'zaplocker',
+                results: 0,
+                paid: [{ hash: 'h1', amount_msat: 1000, hodl: 'lnbc1' }]
+            });
+
+            await store.status();
+
+            expect(store.paid).toEqual([]);
+            expect(store.lightningAddressType).toBe('zaplocker');
+            expect(ReactNativeBlobUtil.fetch).toHaveBeenCalledTimes(1);
+            expect(
+                (ReactNativeBlobUtil.fetch as jest.Mock).mock.calls[0][1]
+            ).toBe('https://zeuspay.com/api/lnurl/status');
+        });
+
+        it('sets no open payments for an NWC address without a paid list', async () => {
+            const store = statusStore();
+            mockStatusResponse({ addressType: 'nwc' });
+
+            await store.status();
+
+            expect(store.paid).toEqual([]);
+            expect(store.lightningAddressType).toBe('nwc');
+        });
+
+        it('keeps only the object entries of a Cashu paid list', async () => {
+            const store = statusStore();
+            const payment = {
+                quote_id: 'q1',
+                mint_url: 'https://mint.test',
+                amount_msat: 1000
+            };
+            mockStatusResponse({
+                addressType: 'cashu',
+                paid: [null, 1, 'x', ['q0'], payment]
+            });
+
+            await store.status();
+
+            expect(store.paid).toEqual([payment]);
+        });
+
+        it.each([
+            ['an object', {}],
+            ['a string', 'x'],
+            ['a number', 5],
+            ['null', null],
+            ['missing', undefined]
+        ])(
+            'stores no open payments when paid is %s',
+            async (_name: string, paid: any) => {
+                const store = statusStore();
+                mockStatusResponse({ addressType: 'cashu', paid });
+
+                await store.status();
+
+                expect(store.paid).toEqual([]);
+            }
+        );
+
+        it('lets Redeem All finish after a paid value that is not an array', async () => {
+            const store = statusStore();
+            mockStatusResponse({ addressType: 'cashu', paid: {} });
+            await store.status();
+            const redeem = jest
+                .spyOn(store, 'redeemCashu')
+                .mockResolvedValue(true);
+
+            await expect(
+                store.redeemAllOpenPaymentsCashu(true)
+            ).resolves.toBeUndefined();
+            // the status call at the end of Redeem All
+            await flushPromises();
+
+            expect(redeem).not.toHaveBeenCalled();
+            expect(store.redeemingAll).toBe(false);
+        });
+
+        it('records the error and rethrows when the server rejects the call', async () => {
+            const store = statusStore();
+            (ReactNativeBlobUtil.fetch as jest.Mock).mockResolvedValue({
+                info: () => ({ status: 400 }),
+                json: () => ({ success: false, error: 'invalid signature' })
+            });
+
+            await expect(store.status()).rejects.toBe('invalid signature');
+
+            expect(store.error).toBe(true);
+            expect(store.error_msg).toBe('invalid signature');
+            expect(store.loading).toBe(false);
+        });
+    });
+
+    describe('redeemAllOpenPaymentsCashu', () => {
+        it('redeems oldest first and only checks the mint on the last payment', async () => {
+            const store = newStore();
+            store.paid = [
+                {
+                    quote_id: 'q3',
+                    mint_url: 'https://mint.test',
+                    amount_msat: 3000
+                },
+                {
+                    quote_id: 'q2',
+                    mint_url: 'https://mint.test',
+                    amount_msat: 2000
+                },
+                {
+                    quote_id: 'q1',
+                    mint_url: 'https://mint.test',
+                    amount_msat: 1000
+                }
+            ];
+            const redeem = jest
+                .spyOn(store, 'redeemCashu')
+                .mockResolvedValue(true);
+            const status = jest
+                .spyOn(store, 'status')
+                .mockResolvedValue(undefined as any);
+
+            await store.redeemAllOpenPaymentsCashu(true);
+
+            expect(redeem.mock.calls).toEqual([
+                ['q1', 'https://mint.test', 1000, true, true, true],
+                ['q2', 'https://mint.test', 2000, true, true, true],
+                ['q3', 'https://mint.test', 3000, true, true, false]
+            ]);
+            expect(status).toHaveBeenCalledWith(true);
+            expect(store.redeemingAll).toBe(false);
+        });
+    });
+
+    describe('update', () => {
+        const updateStore = () => {
+            const store = newStore();
+            jest.spyOn(store as any, 'getAuthData').mockResolvedValue({
+                verification: 'v',
+                signature: 's'
+            });
+            return store;
+        };
+
+        const mockUpdateResponse = (status: number, data: any) =>
+            (ReactNativeBlobUtil.fetch as jest.Mock).mockResolvedValue({
+                info: () => ({ status }),
+                json: () => data
+            });
+
+        it('clears local hashes after switching address type', async () => {
+            const store = updateStore();
+            mockUpdateResponse(200, { success: true });
+
+            await expect(
+                store.update({ address_type: 'cashu' })
+            ).resolves.toEqual({ success: true });
+
+            expect(Storage.setItem).toHaveBeenCalledWith(
+                HASHES_STORAGE_STRING,
+                ''
+            );
+        });
+
+        it('still resolves if clearing local hashes fails', async () => {
+            const store = updateStore();
+            mockUpdateResponse(200, { success: true });
+            (Storage.setItem as jest.Mock).mockRejectedValueOnce(
+                new Error('keychain error')
+            );
+
+            await expect(
+                store.update({ address_type: 'nwc' })
+            ).resolves.toEqual({ success: true });
+            expect(store.error).toBe(false);
+        });
+
+        it('keeps local hashes when the address type is unchanged', async () => {
+            const store = updateStore();
+            mockUpdateResponse(200, { success: true, handle: 'satoshi' });
+
+            await store.update({ handle: 'satoshi' });
+
+            expect(Storage.setItem).not.toHaveBeenCalledWith(
+                HASHES_STORAGE_STRING,
+                expect.anything()
+            );
+        });
+
+        it('keeps local hashes when the server rejects the switch', async () => {
+            const store = updateStore();
+            mockUpdateResponse(400, { success: false, error: 'rejected' });
+
+            await expect(
+                store.update({ address_type: 'cashu' })
+            ).rejects.toEqual('rejected');
+
+            expect(Storage.setItem).not.toHaveBeenCalledWith(
+                HASHES_STORAGE_STRING,
+                expect.anything()
+            );
+            expect(store.error).toBe(true);
+        });
+    });
+
+    describe('createCashu', () => {
+        const mockCreateResponse = () =>
+            (ReactNativeBlobUtil.fetch as jest.Mock).mockResolvedValue({
+                info: () => ({ status: 200 }),
+                json: () => ({
+                    success: true,
+                    handle: 'satoshi',
+                    domain: 'zeuspay.com'
+                })
+            });
+
+        it('resolves and handles a failed push credential update', async () => {
+            const store = newStore();
+            jest.spyOn(store as any, 'getAuthData').mockResolvedValue({
+                verification: 'v',
+                signature: 's'
+            });
+            mockCreateResponse();
+            jest.spyOn(store, 'updatePushCredentials').mockRejectedValue(
+                new Error('update failed')
+            );
+
+            await expect(
+                store.createCashu('https://mint.test')
+            ).resolves.toEqual({ success: true });
+            await flushPromises();
+
+            expect(store.loading).toBe(false);
+            expect(console.log).toHaveBeenCalledWith(
+                'Failed to update push credentials',
+                expect.any(Error)
+            );
+        });
+    });
+});
+
+const CONFIGURED_MINT = 'https://mint.zeusnuts.com';
+const LOCAL_MINT = 'https://mint.minibits.cash/Bitcoin';
+const ATTACKER_MINT = 'http://attacker-mint.example:3338';
+
+const makeStore = (configuredMintUrl?: string, localMintUrls?: string[]) => {
+    const checkInvoicePaid = jest.fn().mockResolvedValue({ isPaid: false });
+    const cashuStore: any = {
+        checkInvoicePaid,
+        deriveCashuSecretKey: jest.fn(),
+        receiveTokenCDK: jest.fn(),
+        decodeTokenCDK: jest.fn(),
+        mintUrls: localMintUrls
+    };
+    const settingsStore: any = {
+        settings: {
+            lightningAddress: configuredMintUrl
+                ? { mintUrl: configuredMintUrl }
+                : {}
+        }
+    };
+    const nodeInfoStore: any = { nodeInfo: {} };
+    const store = new LightningAddressStore(
+        cashuStore,
+        nodeInfoStore,
+        settingsStore
+    );
+    return { store, checkInvoicePaid, cashuStore };
+};
+
+describe('LightningAddressStore.redeemCashu mint binding', () => {
+    it('refuses to redeem against a mint that is not approved', async () => {
+        const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT, [
+            LOCAL_MINT
+        ]);
+
+        const result = await store.redeemCashu(
+            'attacker-quote-id',
+            ATTACKER_MINT,
+            21000,
+            false,
+            true
+        );
+
+        expect(result).toBe(false);
+        expect(checkInvoicePaid).not.toHaveBeenCalled();
+    });
+
+    it('proceeds when the event mint matches the configured mint', async () => {
+        const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT);
+
+        await store.redeemCashu(
+            'quote-id',
+            CONFIGURED_MINT,
+            21000,
+            false,
+            true
+        );
+
+        expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+        expect(checkInvoicePaid.mock.calls[0][1]).toBe(CONFIGURED_MINT);
+    });
+
+    it('matches on trailing slash or scheme/host case differences and forwards the configured spelling', async () => {
+        const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT);
+
+        await store.redeemCashu(
+            'quote-id',
+            `${CONFIGURED_MINT.toUpperCase()}/`,
+            21000,
+            false,
+            true
+        );
+
+        expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+        expect(checkInvoicePaid.mock.calls[0][1]).toBe(CONFIGURED_MINT);
+    });
+
+    it('treats the URL path as case-sensitive', async () => {
+        const { store, checkInvoicePaid } = makeStore(LOCAL_MINT);
+
+        const result = await store.redeemCashu(
+            'quote-id',
+            'https://mint.minibits.cash/bitcoin',
+            21000,
+            false,
+            true
+        );
+
+        expect(result).toBe(false);
+        expect(checkInvoicePaid).not.toHaveBeenCalled();
+    });
+
+    it('accepts a locally added mint that differs from the configured mint and forwards the local spelling', async () => {
+        const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT, [
+            LOCAL_MINT
+        ]);
+
+        await store.redeemCashu(
+            'quote-id',
+            `${LOCAL_MINT}/`,
+            21000,
+            false,
+            true
+        );
+
+        expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+        expect(checkInvoicePaid.mock.calls[0][1]).toBe(LOCAL_MINT);
+    });
+
+    it('accepts a locally added mint when no mint is configured', async () => {
+        const { store, checkInvoicePaid } = makeStore(undefined, [LOCAL_MINT]);
+
+        await store.redeemCashu('quote-id', LOCAL_MINT, 21000, false, true);
+
+        expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+        expect(checkInvoicePaid.mock.calls[0][1]).toBe(LOCAL_MINT);
+    });
+
+    it('refuses to redeem when no mint is configured or locally added', async () => {
+        const { store, checkInvoicePaid } = makeStore(undefined);
+
+        const result = await store.redeemCashu(
+            'quote-id',
+            CONFIGURED_MINT,
+            21000,
+            false,
+            true
+        );
+
+        expect(result).toBe(false);
+        expect(checkInvoicePaid).not.toHaveBeenCalled();
+    });
+
+    it('surfaces an error message on a manual redeem of an unapproved mint', async () => {
+        const { store } = makeStore(CONFIGURED_MINT);
+
+        const result = await store.redeemCashu(
+            'quote-id',
+            ATTACKER_MINT,
+            21000
+        );
+
+        expect(result).toBe(false);
+        expect(store.error).toBe(true);
+        expect(store.error_msg).toBe(
+            'stores.LightningAddressStore.Cashu.mintMismatch'
+        );
+    });
+
+    it('stays silent on an automatic redeem of an unapproved mint', async () => {
+        const { store } = makeStore(CONFIGURED_MINT);
+
+        const result = await store.redeemCashu(
+            'quote-id',
+            ATTACKER_MINT,
+            21000,
+            false,
+            true // localNotification: automatic socket path
+        );
+
+        expect(result).toBe(false);
+        expect(store.error).toBe(false);
+        expect(store.error_msg).toBe('');
+    });
+
+    it.each([12345, { url: CONFIGURED_MINT }, [CONFIGURED_MINT], true, null])(
+        'refuses a non-string mint_url (%p) without throwing',
+        async (mintUrl) => {
+            const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT);
+
+            const result = await store.redeemCashu(
+                'quote-id',
+                mintUrl as any,
+                21000,
+                false,
+                true
+            );
+
+            expect(result).toBe(false);
+            expect(checkInvoicePaid).not.toHaveBeenCalled();
+        }
+    );
+
+    it('does not clear the redeeming flag of a redeem in progress when refusing', async () => {
+        const { store } = makeStore(CONFIGURED_MINT);
+        store.redeeming = true;
+
+        await store.redeemCashu('quote-id', ATTACKER_MINT, 21000, false, true);
+
+        expect(store.redeeming).toBe(true);
+    });
+
+    it('keeps redeeming the open payments list after a non-string mint_url', async () => {
+        const { store, checkInvoicePaid } = makeStore(CONFIGURED_MINT);
+        jest.spyOn(store, 'status').mockResolvedValue(undefined as any);
+        // Processed in reverse, so the bad item goes first.
+        store.paid = [
+            { quote_id: 'legit', mint_url: CONFIGURED_MINT, amount_msat: 1000 },
+            { quote_id: 'bad', mint_url: 12345 as any, amount_msat: 1000 }
+        ];
+
+        await store.redeemAllOpenPaymentsCashu(true);
+
+        expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+        expect(checkInvoicePaid.mock.calls[0][0]).toBe('legit');
+        expect(store.redeemingAll).toBe(false);
+    });
+
+    describe('Redeem All with an unapproved mint', () => {
+        // Processed in reverse, so the rejected item goes first and the
+        // legit redeem after it clears the error again.
+        const redeemAllStore = () => {
+            const ctx = makeStore(CONFIGURED_MINT);
+            ctx.checkInvoicePaid.mockResolvedValue({ isPaid: true });
+            jest.spyOn(
+                ctx.store as any,
+                'callRedeemEndpoint'
+            ).mockResolvedValue({ success: true });
+            jest.spyOn(ctx.store, 'status').mockResolvedValue(undefined as any);
+            ctx.store.paid = [
+                {
+                    quote_id: 'legit',
+                    mint_url: CONFIGURED_MINT,
+                    amount_msat: 1000
+                },
+                {
+                    quote_id: 'forged',
+                    mint_url: ATTACKER_MINT,
+                    amount_msat: 1000
+                }
+            ];
+            return ctx;
+        };
+
+        it('keeps the mint mismatch error on a manual Redeem All', async () => {
+            const { store, checkInvoicePaid } = redeemAllStore();
+
+            await store.redeemAllOpenPaymentsCashu();
+
+            expect(checkInvoicePaid).toHaveBeenCalledTimes(1);
+            expect(checkInvoicePaid.mock.calls[0][0]).toBe('legit');
+            expect(store.error).toBe(true);
+            expect(store.error_msg).toBe(
+                'stores.LightningAddressStore.Cashu.mintMismatch'
+            );
+            expect(store.redeemingAll).toBe(false);
+        });
+
+        it('stays silent on the automatic startup redeem', async () => {
+            const { store } = redeemAllStore();
+
+            await store.redeemAllOpenPaymentsCashu(true);
+
+            expect(store.error).toBe(false);
+            expect(store.error_msg).toBe('');
+        });
+
+        it('sets no error when every payment is from an approved mint', async () => {
+            const { store } = redeemAllStore();
+            store.paid = [store.paid[0]];
+
+            await store.redeemAllOpenPaymentsCashu();
+
+            expect(store.error).toBe(false);
+            expect(store.error_msg).toBe('');
+        });
+    });
+
+    describe('server redeem token', () => {
+        const paidStore = (tokenMintUrl?: string) => {
+            const ctx = makeStore(CONFIGURED_MINT);
+            ctx.checkInvoicePaid.mockResolvedValue({ isPaid: true });
+            jest.spyOn(
+                ctx.store as any,
+                'callRedeemEndpoint'
+            ).mockResolvedValue({ success: true, token: 'cashuBtoken' });
+            if (tokenMintUrl) {
+                ctx.cashuStore.decodeTokenCDK.mockResolvedValue({
+                    mint_url: tokenMintUrl
+                });
+            }
+            return ctx;
+        };
+
+        it('refuses a token from a mint other than the approved mint', async () => {
+            const { store, cashuStore } = paidStore(ATTACKER_MINT);
+
+            const result = await store.redeemCashu(
+                'quote-id',
+                CONFIGURED_MINT,
+                21000,
+                true
+            );
+
+            expect(result).toBe(false);
+            expect(cashuStore.decodeTokenCDK).toHaveBeenCalledWith(
+                'cashuBtoken'
+            );
+            expect(cashuStore.receiveTokenCDK).not.toHaveBeenCalled();
+            expect(store.redeeming).toBe(false);
+            expect(store.error_msg).toBe(
+                'stores.LightningAddressStore.Cashu.mintMismatch'
+            );
+        });
+
+        it('receives a token from the approved mint', async () => {
+            const { store, cashuStore } = paidStore(`${CONFIGURED_MINT}/`);
+
+            const result = await store.redeemCashu(
+                'quote-id',
+                CONFIGURED_MINT,
+                21000,
+                true
+            );
+
+            expect(result).toBe(true);
+            expect(cashuStore.receiveTokenCDK).toHaveBeenCalledTimes(1);
+            expect(cashuStore.receiveTokenCDK.mock.calls[0][0]).toBe(
+                'cashuBtoken'
+            );
+        });
+
+        it('does not receive a token that fails to decode', async () => {
+            const { store, cashuStore } = paidStore();
+            cashuStore.decodeTokenCDK.mockRejectedValue(
+                new Error('invalid token')
+            );
+
+            await store.redeemCashu('quote-id', CONFIGURED_MINT, 21000, true);
+
+            expect(cashuStore.receiveTokenCDK).not.toHaveBeenCalled();
+            expect(store.redeeming).toBe(false);
+            expect(store.error).toBe(true);
+        });
+    });
+});

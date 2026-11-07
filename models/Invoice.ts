@@ -1,0 +1,526 @@
+import { observable, computed } from 'mobx';
+import humanizeDuration from 'humanize-duration';
+
+import BaseModel from './BaseModel';
+import Base64Utils from '../utils/Base64Utils';
+import DateTimeUtils from '../utils/DateTimeUtils';
+import Bolt11Utils, { DecodedBolt11 } from '../utils/Bolt11Utils';
+import { localeString } from '../utils/LocaleUtils';
+import { decodeMemo } from '../utils/MemoUtils';
+import { notesStore } from '../stores/Stores';
+
+interface HopHint {
+    fee_proportional_millionths: number;
+    chan_id: string;
+    fee_base_msat: number;
+    cltv_expiry_delta: number;
+    node_id: string;
+}
+
+interface RouteHint {
+    hop_hints: Array<HopHint>;
+}
+
+interface HTLC {
+    custom_records?: CustomRecords;
+}
+
+interface CustomRecords {
+    [key: number]: string;
+}
+
+const keySendMessageType = '34349334';
+const keySendPreimageType = '5482373484';
+
+export default class Invoice extends BaseModel {
+    public route_hints: Array<RouteHint>;
+    public fallback_addr: string;
+    public r_hash: any;
+    public settle_date: string;
+    public expiry: string;
+    public memo: string;
+    public receipt: string;
+    public settle_index: string;
+    public add_index: string;
+    public payment_request: string;
+    public value: string;
+    public settled: boolean;
+    public amt_paid_msat: string;
+    public amt_paid: string;
+    public amt_paid_sat: string;
+    public private: boolean;
+    public creation_date: string;
+    public description_hash: string;
+    public r_preimage: any;
+    public cltv_expiry: string;
+    public htlcs: Array<HTLC>;
+    public is_amp?: boolean;
+    public is_blinded?: boolean;
+    // Core Lightning
+    public bolt11: string;
+    public label: string;
+    public description: string;
+    public msatoshi: number;
+    public msatoshi_received: number;
+    @observable public payment_hash: string;
+    public paid_at: number;
+    public expires_at: number;
+    public status: string;
+    public amount_msat: number;
+    public invoice_amount_msat: string | number;
+    public bolt12: string;
+    public payment_preimage: string;
+    // NIP-47 (Nostr Wallet Connect) transaction objects
+    public preimage?: string;
+    // pay req
+    public timestamp?: string | number;
+    public destination?: string;
+    public num_satoshis?: string | number;
+    public num_msat?: string | number;
+    public features?: any;
+    // lndhub
+    public amt?: number;
+    public ispaid?: boolean;
+    public expire_time?: number;
+    public millisatoshis?: string;
+    public pay_req?: string;
+    // LNC
+    public paymentRequest?: string;
+    public amount?: number;
+    public state?: string;
+    public created_at?: number;
+    public settled_at?: number;
+    public invoice?: string;
+    public amount_received_msat?: string | number;
+    public formattedOriginalTimeUntilExpiry: string;
+    public formattedTimeUntilExpiry: string;
+
+    @computed public get isKeysend(): boolean {
+        if (
+            this.htlcs?.length > 0 &&
+            (this.htlcs?.[0]?.custom_records?.[keySendMessageType] ||
+                this.htlcs?.[0]?.custom_records?.[keySendPreimageType])
+        ) {
+            return true;
+        }
+        return false;
+    }
+
+    @computed public get model(): string {
+        return localeString('views.Invoice.title');
+    }
+
+    @computed public get getRPreimage(): string {
+        // LND uses r_preimage, Core Lightning payment_preimage, NIP-47 preimage
+        const source =
+            this.r_preimage || this.payment_preimage || this.preimage;
+        if (!source) return '';
+        const preimage = source.data || source;
+        return typeof preimage === 'object'
+            ? Base64Utils.bytesToHex(preimage)
+            : typeof preimage === 'string'
+            ? preimage.includes('=')
+                ? Base64Utils.base64ToHex(preimage)
+                : preimage
+            : '';
+    }
+
+    @computed public get getRHash(): string {
+        // LND uses r_hash, Core Lightning and NIP-47 payment_hash
+        const source = this.r_hash || this.payment_hash;
+        if (!source) return '';
+        const hash = source.data || source;
+        return typeof hash === 'object'
+            ? Base64Utils.bytesToHex(hash)
+            : typeof hash === 'string'
+            ? hash.includes('=')
+                ? Base64Utils.base64ToHex(hash)
+                : hash
+            : '';
+    }
+
+    @computed public get getDescriptionHash(): string {
+        const hash = this.description_hash;
+        return typeof hash === 'string'
+            ? hash.includes('=')
+                ? Base64Utils.base64ToHex(hash)
+                : hash
+            : '';
+    }
+
+    @computed public get getTimestamp(): string | number {
+        return (
+            this.paid_at ||
+            this.creation_date ||
+            this.timestamp ||
+            this.settled_at ||
+            this.settle_date ||
+            0
+        );
+    }
+
+    @computed public get getKeysendMessage(): string | undefined {
+        if (
+            this.htlcs?.length > 0 &&
+            this.htlcs?.[0]?.custom_records?.[keySendMessageType]
+        )
+            return Base64Utils.base64ToUtf8(
+                this.htlcs[0].custom_records[keySendMessageType]
+            );
+        return undefined;
+    }
+
+    @computed public get getMemo(): string | undefined {
+        const source = this.memo || this.description;
+
+        let memo;
+        if (typeof source === 'string') memo = source;
+        if (Array.isArray(source)) memo = source[0];
+
+        memo = decodeMemo(memo);
+
+        // NameDesc
+        if (memo?.includes(':  ')) {
+            return memo.split(':  ')[1];
+        }
+        if (memo) return memo;
+
+        return undefined;
+    }
+
+    @computed public get getNameDescReceiver(): string | undefined {
+        const source = this.memo || this.description;
+
+        let memo;
+        if (typeof source === 'string') memo = source;
+        if (Array.isArray(source)) memo = source[0];
+
+        memo = decodeMemo(memo);
+
+        // NameDesc
+        if (memo?.includes(':  ')) {
+            return memo.split(':  ')[0];
+        }
+
+        return undefined;
+    }
+
+    @computed public get getKeysendMessageOrMemo(): string | undefined {
+        return this.getKeysendMessage || this.getMemo;
+    }
+
+    @computed public get isPaid(): boolean {
+        return (
+            this.status === 'paid' ||
+            this.state === 'settled' ||
+            this.state === 'PAID' ||
+            !!this.settled_at ||
+            this.settled ||
+            this.ispaid ||
+            false
+        );
+    }
+
+    @computed public get key(): string {
+        return this.bolt11 || this.r_hash;
+    }
+
+    @computed public get getPaymentRequest(): string {
+        return (
+            this.invoice ||
+            this.bolt11 ||
+            this.payment_request ||
+            this.pay_req ||
+            this.paymentRequest ||
+            ''
+        );
+    }
+    // return amount in satoshis
+    @computed public get getAmount(): number {
+        if (this.msatoshi_received) {
+            const msatoshi = this.msatoshi_received.toString();
+            return Number(msatoshi.replace('msat', '')) / 1000;
+        }
+        if (this.msatoshi) {
+            const msatoshi = this.msatoshi.toString();
+            return Number(msatoshi.replace('msat', '')) / 1000;
+        }
+        if (this.amount_received_msat) {
+            const msatoshi = this.amount_received_msat.toString();
+            return Number(msatoshi.replace('msat', '')) / 1000;
+        }
+        if (this.amount) {
+            return Number(this.amount);
+        }
+        return this.settled
+            ? Number(this.amt_paid_sat)
+            : Number(this.value) ||
+                  Number(this.amt) ||
+                  this.getRequestAmount ||
+                  0;
+    }
+
+    // return amount in satoshis
+    @computed public get getRequestAmount(): number {
+        if (this.msatoshi) {
+            const msatoshi = this.msatoshi.toString();
+            return Number(msatoshi.replace('msat', '')) / 1000;
+        }
+        if (this.amount_msat) {
+            const msatoshi = this.amount_msat.toString();
+            return Number(msatoshi.replace('msat', '')) / 1000;
+        }
+        if (this.millisatoshis || this.invoice_amount_msat) {
+            const msatoshi = this.millisatoshis || this.invoice_amount_msat;
+            return Number(msatoshi) / 1000;
+        }
+        // LND rounds num_satoshis down, so num_msat carries the exact
+        // amount (a 500 msat invoice decodes as 0 sats)
+        if (Number(this.num_msat || 0) > 0) {
+            return Number(this.num_msat) / 1000;
+        }
+        return Number(this.num_satoshis || 0);
+    }
+
+    @computed public get getDisplayTime(): string {
+        return this.isPaid
+            ? this.formattedSettleDate
+            : DateTimeUtils.listFormattedDate(
+                  this.expires_at ||
+                      this.created_at ||
+                      this.creation_date ||
+                      this.timestamp ||
+                      0
+              );
+    }
+
+    @computed public get getDisplayTimeOrder(): string {
+        return DateTimeUtils.listFormattedDateOrder(
+            new Date(
+                Number(
+                    this.settled_at ||
+                        this.settle_date ||
+                        this.paid_at ||
+                        this.timestamp ||
+                        0
+                ) * 1000
+            )
+        );
+    }
+
+    @computed public get getDisplayTimeShort(): string {
+        return this.isPaid && !this.is_amp
+            ? DateTimeUtils.listFormattedDateShort(
+                  this.settled_at ||
+                      this.settle_date ||
+                      this.paid_at ||
+                      this.timestamp ||
+                      0
+              )
+            : DateTimeUtils.listFormattedDateShort(
+                  this.expires_at ||
+                      this.created_at ||
+                      this.creation_date ||
+                      this.timestamp ||
+                      0
+              );
+    }
+
+    @computed public get getFormattedRhash(): string {
+        const rHash = this.r_hash || this.payment_hash;
+        return rHash
+            ? typeof rHash === 'string'
+                ? rHash.replace(/\+/g, '-').replace(/\//g, '_')
+                : rHash.data
+                ? Base64Utils.bytesToHex(rHash.data)
+                : Base64Utils.bytesToHex(rHash)
+            : '';
+    }
+
+    @computed public get getDate(): Date {
+        return this.isPaid
+            ? this.settleDate
+            : DateTimeUtils.listDate(
+                  this.expires_at ||
+                      this.created_at ||
+                      this.creation_date ||
+                      this.timestamp ||
+                      0
+              );
+    }
+
+    @computed public get settleDate(): Date {
+        return DateTimeUtils.listDate(
+            this.settled_at ||
+                this.settle_date ||
+                this.paid_at ||
+                this.timestamp ||
+                0
+        );
+    }
+
+    @computed public get formattedSettleDate(): string {
+        return DateTimeUtils.listFormattedDate(
+            this.settled_at ||
+                this.settle_date ||
+                this.paid_at ||
+                this.timestamp ||
+                0
+        );
+    }
+
+    @computed public get getCreationDate(): Date {
+        // CLN listinvoices omits created_at; fall back to the BOLT11 timestamp
+        return DateTimeUtils.listDate(
+            this.created_at ||
+                this.creation_date ||
+                this.decodedPaymentRequest?.timestamp ||
+                0
+        );
+    }
+
+    @computed public get formattedCreationDate(): string {
+        return !!this.created_at || !!this.creation_date
+            ? DateTimeUtils.listFormattedDate(
+                  this.created_at || this.creation_date
+              )
+            : '';
+    }
+
+    @computed public get isExpired(): boolean {
+        return this.isExpiredNow();
+    }
+
+    // plain method, not @computed: Date.now() is not observable, so a
+    // cached computed can report a stale "not expired" when re-checked
+    // later (e.g. at payment dispatch time)
+    public isExpiredNow(): boolean {
+        const getExpiryTimestamp = this.getExpiryUnixTimestamp();
+
+        if (getExpiryTimestamp == null) {
+            return false;
+        }
+
+        return getExpiryTimestamp * 1000 <= Date.now();
+    }
+
+    @computed public get isZeusPay(): boolean {
+        if (this.getMemo?.toLowerCase().startsWith('zeus pay')) return true;
+        return false;
+    }
+
+    @computed private get decodedPaymentRequest(): DecodedBolt11 | undefined {
+        try {
+            return Bolt11Utils.decode(this.getPaymentRequest);
+        } catch (e) {
+            return undefined;
+        }
+    }
+
+    @computed public get originalTimeUntilExpiryInSeconds():
+        | number
+        | undefined {
+        const decoded = this.decodedPaymentRequest;
+        const timestamp = decoded ? decoded.timestamp : Number(this.timestamp);
+        if (this.expires_at != null) {
+            // expiry is missing in payment request in Core Lightning
+            return !isNaN(timestamp) ? this.expires_at - timestamp : undefined;
+        }
+        // BOLT11: an invoice without an expiry (x) field expires after 3600s
+        if (decoded) return decoded.expiry ?? 3600;
+        // no bolt11 string to decode (e.g. pay_req built from a backend
+        // decodepayreq response) — use the reported expiry seconds
+        return this.expiry != null && this.expiry !== ''
+            ? Number(this.expiry)
+            : undefined;
+    }
+
+    public determineFormattedOriginalTimeUntilExpiry(
+        locale: string | undefined
+    ): void {
+        const originalTimeUntilExpiryInSeconds =
+            this.originalTimeUntilExpiryInSeconds;
+
+        if (originalTimeUntilExpiryInSeconds == null) {
+            this.formattedOriginalTimeUntilExpiry = localeString(
+                'models.Invoice.never'
+            );
+            return;
+        }
+
+        const originalTimeUntilExpiryInMs =
+            originalTimeUntilExpiryInSeconds * 1000;
+
+        this.formattedOriginalTimeUntilExpiry =
+            this.formatHumanReadableDuration(
+                originalTimeUntilExpiryInMs,
+                locale
+            );
+    }
+
+    public determineFormattedRemainingTimeUntilExpiry(
+        locale: string | undefined
+    ): void {
+        const millisecondsUntilExpiry =
+            this.getRemainingMillisecondsUntilExpiry();
+
+        if (millisecondsUntilExpiry == null) {
+            this.formattedTimeUntilExpiry = localeString(
+                'models.Invoice.never'
+            );
+            return;
+        }
+
+        this.formattedTimeUntilExpiry =
+            millisecondsUntilExpiry <= 0
+                ? localeString('views.Activity.expired')
+                : this.formatHumanReadableDuration(
+                      millisecondsUntilExpiry,
+                      locale
+                  );
+    }
+
+    private getRemainingMillisecondsUntilExpiry(): number | undefined {
+        const expiryTimestamp = this.getExpiryUnixTimestamp();
+
+        return expiryTimestamp != null
+            ? expiryTimestamp * 1000 - Date.now()
+            : undefined;
+    }
+
+    private getExpiryUnixTimestamp(): number | undefined {
+        const originalTimeUntilExpiryInSeconds =
+            this.originalTimeUntilExpiryInSeconds;
+        if (originalTimeUntilExpiryInSeconds == null) return undefined;
+
+        const decoded = this.decodedPaymentRequest;
+        if (!decoded) return undefined;
+
+        return decoded.timestamp + originalTimeUntilExpiryInSeconds;
+    }
+
+    private formatHumanReadableDuration(
+        durationInMs: number,
+        locale: string | undefined
+    ) {
+        return (
+            humanizeDuration(durationInMs, {
+                language: locale === 'zh' ? 'zh_CN' : locale,
+                fallbacks: ['en'],
+                round: true,
+                largest: 2
+            })
+                // replace spaces between digits and units with non-breaking spaces
+                .replace(/(\d) ([^,])/g, '$1 $2') // LTR
+                .replace(/([^,]) (\d)/g, '$2 $1') // RTL
+        );
+    }
+
+    @computed public get getNoteKey(): string {
+        return `note-${this.payment_hash || this.getRPreimage || ''}`;
+    }
+
+    @computed public get getNote(): string {
+        return notesStore.notes[this.getNoteKey] || '';
+    }
+}

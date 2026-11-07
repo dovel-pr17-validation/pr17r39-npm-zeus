@@ -1,0 +1,495 @@
+import * as React from 'react';
+import { inject, observer } from 'mobx-react';
+import { View } from 'react-native';
+import BigNumber from 'bignumber.js';
+
+import KeyValue from '../../components/KeyValue';
+import Amount from '../../components/Amount';
+import Button from '../../components/Button';
+import { ChannelItem } from '../../components/Channels/ChannelItem';
+import {
+    SuccessMessage,
+    ErrorMessage
+} from '../../components/SuccessErrorMessage';
+
+import {
+    buildPaymentAwaitParams,
+    isOrderFree,
+    LSPOrderState,
+    LSPService
+} from '../../models/LSP';
+
+import DateTimeUtils from '../../utils/DateTimeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { numberWithCommas } from '../../utils/UnitsUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+import NodeInfoStore from '../../stores/NodeInfoStore';
+
+interface LSPS1OrderResponseProps {
+    navigation: any;
+    orderResponse: any;
+    NodeInfoStore?: NodeInfoStore;
+    orderView: boolean;
+}
+
+@inject('NodeInfoStore')
+@observer
+export default class LSPS1OrderResponse extends React.Component<
+    LSPS1OrderResponseProps,
+    {}
+> {
+    render() {
+        const { orderResponse, NodeInfoStore, orderView, navigation } =
+            this.props;
+        const { testnet } = NodeInfoStore!;
+        const payment = orderResponse?.payment;
+        const channel = orderResponse?.channel;
+        // An order is free when the LSP omits every payment option — see
+        // `isOrderFree` for the full definition.
+        const isFreeOrder = isOrderFree(payment);
+        return (
+            <View style={{ paddingHorizontal: 20 }}>
+                <ChannelItem
+                    localBalance={orderResponse?.client_balance_sat}
+                    remoteBalance={orderResponse?.lsp_balance_sat}
+                    title={localeString('views.LSPS1.yourBalance')}
+                    secondTitle={localeString('views.LSPS1.receiveLimit')}
+                    noBorder
+                    highlightLabels
+                />
+                {orderResponse?.order_id && (
+                    <KeyValue
+                        keyValue={localeString('views.LSPS1.orderId')}
+                        value={orderResponse?.order_id}
+                        showCopyIcon
+                    />
+                )}
+                {orderResponse?.lsp_balance_sat &&
+                    orderResponse?.client_balance_sat && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.channelBalance'
+                            )}
+                            value={
+                                <Amount
+                                    sats={new BigNumber(
+                                        orderResponse?.client_balance_sat
+                                    )
+                                        .plus(orderResponse?.lsp_balance_sat)
+                                        .toNumber()}
+                                    sensitive
+                                    toggleable
+                                />
+                            }
+                        />
+                    )}
+                {orderResponse?.announce_channel && (
+                    <KeyValue
+                        keyValue={localeString(
+                            'views.OpenChannel.announceChannel'
+                        )}
+                        value={
+                            orderResponse?.announce_channel
+                                ? localeString('general.true')
+                                : localeString('general.false')
+                        }
+                        color={
+                            orderResponse?.announce_channel
+                                ? 'green'
+                                : '#808000'
+                        }
+                    />
+                )}
+                {orderResponse?.channel_expiry_blocks && (
+                    <KeyValue
+                        keyValue={localeString(
+                            'views.LSPS1.channelExpiryBlocks'
+                        )}
+                        value={numberWithCommas(
+                            orderResponse?.channel_expiry_blocks
+                        )}
+                    />
+                )}
+
+                {orderResponse?.funding_confirms_within_blocks && (
+                    <KeyValue
+                        keyValue={localeString(
+                            'views.LSPS1.confirmWithinBlocks'
+                        )}
+                        value={orderResponse?.funding_confirms_within_blocks}
+                    />
+                )}
+                {orderResponse?.order_state && (
+                    <KeyValue
+                        keyValue={localeString('views.LSPS1.orderState')}
+                        value={orderResponse?.order_state}
+                        color={
+                            orderResponse?.order_state === LSPOrderState.CREATED
+                                ? 'orange'
+                                : orderResponse?.order_state ===
+                                  LSPOrderState.COMPLETED
+                                ? 'green'
+                                : orderResponse?.order_state ===
+                                  LSPOrderState.FAILED
+                                ? 'red'
+                                : ''
+                        }
+                    />
+                )}
+                {orderResponse?.created_at && (
+                    <KeyValue
+                        keyValue={localeString('general.createdAt')}
+                        value={DateTimeUtils.formatDateTime(
+                            orderResponse?.created_at
+                        )}
+                    />
+                )}
+                {orderResponse?.expires_at && (
+                    <KeyValue
+                        keyValue={localeString('general.expiresAt')}
+                        value={DateTimeUtils.formatDateTime(
+                            orderResponse?.expires_at
+                        )}
+                    />
+                )}
+                {/* Legacy format */}
+                {payment && !payment.bolt11 && !payment.onchain && (
+                    <>
+                        {!isFreeOrder && (
+                            <KeyValue
+                                keyValue={localeString('views.Payment.title')}
+                            />
+                        )}
+                        {payment?.state && (
+                            <KeyValue
+                                keyValue={localeString('general.state')}
+                                value={payment?.state}
+                            />
+                        )}
+                        {payment?.order_total_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.orderTotal'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={payment?.order_total_sat}
+                                        toggleable
+                                        sensitive
+                                    />
+                                }
+                            />
+                        )}
+                        {payment?.fee_total_sat && (
+                            <KeyValue
+                                keyValue={localeString('views.LSPS1.feeTotal')}
+                                value={
+                                    <Amount
+                                        sats={payment?.fee_total_sat}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                            />
+                        )}
+                        {(payment?.lightning_invoice ||
+                            payment?.bolt11_invoice) && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'general.lightningInvoice'
+                                )}
+                                value={
+                                    payment?.lightning_invoice ||
+                                    payment?.bolt11_invoice
+                                }
+                                showCopyIcon
+                            />
+                        )}
+                        {payment?.min_fee_for_0conf && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.miniFeeFor0Conf'
+                                )}
+                                value={payment?.min_fee_for_0conf}
+                            />
+                        )}
+                        {payment?.min_onchain_payment_confirmations != null && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.minOnchainPaymentConfirmations'
+                                )}
+                                value={
+                                    payment?.min_onchain_payment_confirmations
+                                }
+                            />
+                        )}
+                        {payment?.onchain_address && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Settings.AddContact.onchainAddress'
+                                )}
+                                value={payment?.onchain_address}
+                                showCopyIcon
+                            />
+                        )}
+                        {payment?.onchain_payment && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.onchainPayment'
+                                )}
+                                value={payment?.onchain_payment}
+                            />
+                        )}
+                    </>
+                )}
+                {/* BOLT11 */}
+                {payment && payment.bolt11 && (
+                    <>
+                        <KeyValue
+                            keyValue={localeString('views.LSPS1.bolt11Payment')}
+                        />
+                        {payment?.bolt11.state && (
+                            <KeyValue
+                                keyValue={localeString('general.state')}
+                                value={payment?.bolt11.state}
+                            />
+                        )}
+                        {payment?.bolt11?.order_total_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.orderTotal'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={payment?.bolt11?.order_total_sat}
+                                        toggleable
+                                        sensitive
+                                    />
+                                }
+                            />
+                        )}
+                        {payment?.bolt11?.fee_total_sat &&
+                            payment?.bolt11?.fee_total_sat !==
+                                payment?.bolt11?.order_total_sat && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.LSPS1.feeTotal'
+                                    )}
+                                    value={
+                                        <Amount
+                                            sats={
+                                                payment?.bolt11?.fee_total_sat
+                                            }
+                                            sensitive
+                                            toggleable
+                                        />
+                                    }
+                                />
+                            )}
+                        {payment?.bolt11.expires_at && (
+                            <KeyValue
+                                keyValue={localeString('general.expiresAt')}
+                                value={DateTimeUtils.formatDateTime(
+                                    payment?.bolt11.expires_at
+                                )}
+                            />
+                        )}
+                        {payment?.bolt11.invoice && (
+                            <KeyValue
+                                keyValue={localeString('views.Invoice.title')}
+                                value={payment?.bolt11.invoice}
+                                showCopyIcon
+                            />
+                        )}
+                    </>
+                )}
+                {/* On-chain */}
+                {payment && payment.onchain && (
+                    <>
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.LSPS1.onchainPayment'
+                            )}
+                        />
+                        {payment?.onchain.fee_total_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Transaction.totalFees'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={payment?.onchain.fee_total_sat}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                            />
+                        )}
+                        {payment?.onchain.order_total_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.orderTotal'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={payment?.onchain.order_total_sat}
+                                        toggleable
+                                        sensitive
+                                    />
+                                }
+                            />
+                        )}
+                        {payment?.onchain.expires_at && (
+                            <KeyValue
+                                keyValue={localeString('general.expiresAt')}
+                                value={DateTimeUtils.formatDateTime(
+                                    payment?.onchain.expires_at
+                                )}
+                            />
+                        )}
+                        {payment?.onchain.address && (
+                            <KeyValue
+                                keyValue={localeString('general.address')}
+                                value={payment?.onchain.address}
+                                showCopyIcon
+                            />
+                        )}
+                        {payment?.onchain.min_fee_for_0conf && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.miniFeeFor0Conf'
+                                )}
+                                value={payment?.onchain.min_fee_for_0conf}
+                            />
+                        )}
+                        {payment?.onchain.min_onchain_payment_confirmations !=
+                            null && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.LSPS1.minOnchainPaymentConfirmations'
+                                )}
+                                value={
+                                    payment?.onchain
+                                        .min_onchain_payment_confirmations
+                                }
+                            />
+                        )}
+                    </>
+                )}
+                {channel && (
+                    <>
+                        <KeyValue
+                            keyValue={localeString('views.Channel.title')}
+                        />
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.LSPS1.fundingOutpoint'
+                            )}
+                            value={channel?.funding_outpoint}
+                            sensitive
+                            showCopyIcon
+                            color={themeColor('highlight')}
+                            mempoolLink={() =>
+                                UrlUtils.goToBlockExplorerTXID(
+                                    channel?.funding_outpoint,
+                                    testnet
+                                )
+                            }
+                        />
+                        <KeyValue
+                            keyValue={localeString('views.LSPS1.fundedAt')}
+                            value={DateTimeUtils.formatDateTime(
+                                channel?.funded_at
+                            )}
+                        />
+                        <KeyValue
+                            keyValue={localeString('general.expiresAt')}
+                            value={DateTimeUtils.formatDateTime(
+                                channel?.expires_at
+                            )}
+                        />
+                    </>
+                )}
+                {orderResponse?.order_state === LSPOrderState.CREATED &&
+                    isFreeOrder && (
+                        <SuccessMessage
+                            message={localeString('views.LSPS1.freeChannel')}
+                        />
+                    )}
+                {orderResponse?.order_state === LSPOrderState.FAILED && (
+                    <ErrorMessage
+                        message={localeString('views.LSPS1.channelOpenFailed')}
+                    />
+                )}
+                {orderResponse?.order_state === LSPOrderState.CREATED &&
+                    orderView &&
+                    !isFreeOrder && (
+                        <>
+                            {(payment.bolt11?.invoice ||
+                                payment.lightning_invoice ||
+                                payment.bolt11_invoice) && (
+                                <>
+                                    <Button
+                                        title={
+                                            payment.onchain
+                                                ? localeString(
+                                                      'views.LSPS1.makePaymentLN'
+                                                  )
+                                                : localeString(
+                                                      'views.LSPS1.makePayment'
+                                                  )
+                                        }
+                                        containerStyle={{
+                                            paddingVertical: 20
+                                        }}
+                                        onPress={() => {
+                                            navigation.navigate(
+                                                'LSPS1PaymentAwait',
+                                                buildPaymentAwaitParams(
+                                                    payment,
+                                                    orderResponse?.order_id,
+                                                    LSPService.LSPS1
+                                                )
+                                            );
+                                        }}
+                                    />
+                                </>
+                            )}
+                            {payment.onchain?.address &&
+                                payment.onchain?.fee_total_sat && (
+                                    <>
+                                        <Button
+                                            title={
+                                                payment.bolt11
+                                                    ? localeString(
+                                                          'views.LSPS1.makePaymentOnchain'
+                                                      )
+                                                    : localeString(
+                                                          'views.LSPS1.makePayment'
+                                                      )
+                                            }
+                                            containerStyle={{
+                                                paddingVertical: 20
+                                            }}
+                                            onPress={() => {
+                                                navigation.navigate('Send', {
+                                                    destination:
+                                                        payment.onchain
+                                                            ?.address,
+                                                    satAmount:
+                                                        payment.onchain
+                                                            ?.fee_total_sat,
+                                                    transactionType: 'On-chain'
+                                                });
+                                            }}
+                                        />
+                                    </>
+                                )}
+                        </>
+                    )}
+            </View>
+        );
+    }
+}

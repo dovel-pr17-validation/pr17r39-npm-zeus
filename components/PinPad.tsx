@@ -1,0 +1,319 @@
+import * as React from 'react';
+import { useMemo, useState } from 'react';
+import {
+    StyleSheet,
+    Text,
+    Pressable,
+    View,
+    AppState,
+    Platform
+} from 'react-native';
+import { themeColor } from '../utils/ThemeUtils';
+import { Row } from './layout/Row';
+import Success from '../assets/images/SVG/Success.svg';
+import Touchable from './Touchable';
+import { fiatStore, settingsStore, unitsStore } from '../stores/Stores';
+import ReactNativeHapticFeedback from 'react-native-haptic-feedback';
+
+import DeleteKey from '../assets/images/SVG/DeleteKey.svg';
+
+interface PinPadProps {
+    appendValue: (newValue: string) => boolean;
+    clearValue: () => void;
+    deleteValue: () => void;
+    submitValue?: () => void;
+    shuffle?: boolean;
+    hidePinLength?: boolean;
+    minLength?: number;
+    maxLength?: number;
+    numberHighlight?: boolean;
+    amount?: boolean;
+}
+
+const DEFAULT_SIZE = 24;
+const BIG_SIZE = 50;
+
+export default function PinPad({
+    appendValue,
+    clearValue,
+    deleteValue,
+    submitValue = () => void 0,
+    shuffle = false,
+    hidePinLength = false,
+    minLength = 4,
+    maxLength = 8,
+    numberHighlight = false,
+    amount = false
+}: PinPadProps) {
+    // PinPad state only depends on pin value length, not the actual pin/amount value
+    // Parent component to PinPad can store pin/amount value
+    const [pinValueLength, setPinValueLength] = useState(0);
+
+    React.useEffect(() => {
+        // For PIN entry we clear the value when the app is backgrounded so the
+        // PIN isn't visible in the OS task-switcher snapshot. Amount input has
+        // no such security concern, and clearing it on backgrounding loses
+        // typed values when the user briefly switches apps (e.g. to check an
+        // amount from another app).
+        if (amount) return;
+
+        const subscription = AppState.addEventListener(
+            'change',
+            (nextAppState) => {
+                if (nextAppState === 'background') {
+                    clearPinValueLength();
+                    clearValue();
+                }
+            }
+        );
+
+        return () => subscription.remove();
+    }, [amount]);
+
+    const bigKeypadButtons =
+        settingsStore.settings &&
+        settingsStore.settings.display &&
+        settingsStore.settings.display.bigKeypadButtons;
+
+    // Sets pinNumbers before first render, and doesn't reset them on state change
+    const pinNumbers = useMemo(() => {
+        let pinNumbers = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
+        if (shuffle) {
+            // shuffle the order of the numbers using schwartzian transform
+            pinNumbers = pinNumbers
+                .map((value) => ({ value, sort: Math.random() }))
+                .sort((a, b) => a.sort - b.sort)
+                .map(({ value }) => value);
+        }
+
+        return pinNumbers;
+    }, []);
+
+    const incrementPinValueLength = () => {
+        if (pinValueLength < maxLength) {
+            setPinValueLength(pinValueLength + 1);
+        }
+    };
+
+    const decrementPinValueLength = () => {
+        if (pinValueLength > 0) {
+            setPinValueLength(pinValueLength - 1);
+        }
+    };
+
+    const clearPinValueLength = () => {
+        setPinValueLength(0);
+    };
+
+    const triggerHapticFeedback = () => {
+        // effectClick is only available on Android
+        const type = Platform.OS === 'android' ? 'effectClick' : 'soft';
+        ReactNativeHapticFeedback.trigger(type);
+    };
+
+    const triggerErrorFeedback = () => {
+        ReactNativeHapticFeedback.trigger('notificationError');
+    };
+
+    const handleAppendWithFeedback = (value: string) => {
+        const wasAccepted = appendValue(value);
+        if (wasAccepted) {
+            incrementPinValueLength();
+            triggerHapticFeedback();
+        } else {
+            triggerErrorFeedback();
+        }
+    };
+
+    return (
+        <View style={styles.pad}>
+            {/* Rows 1-3: Numbers 1-9 */}
+            {[
+                [1, 2, 3],
+                [4, 5, 6],
+                [7, 8, 9]
+            ].map((row, rowIndex) => (
+                <Row key={rowIndex} align="flex-end" style={styles.pinPadRow}>
+                    {row.map((num) => (
+                        <Touchable
+                            key={num}
+                            touch={() =>
+                                handleAppendWithFeedback(pinNumbers[num])
+                            }
+                            highlight={numberHighlight}
+                            style={styles.key}
+                        >
+                            <Text
+                                style={{
+                                    ...styles.pinPadNumber,
+                                    color: themeColor('text'),
+                                    fontSize: bigKeypadButtons
+                                        ? BIG_SIZE
+                                        : DEFAULT_SIZE
+                                }}
+                            >
+                                {pinNumbers[num]}
+                            </Text>
+                        </Touchable>
+                    ))}
+                </Row>
+            ))}
+
+            {/* Row 4: Special bottom row */}
+            <Row align="flex-end" style={styles.pinPadRow}>
+                {/* Left key: decimal point or back button */}
+                {amount ? (
+                    <Touchable
+                        touch={() => handleAppendWithFeedback('.')}
+                        highlight={numberHighlight}
+                        style={styles.key}
+                    >
+                        <Text
+                            style={{
+                                ...styles.pinPadNumber,
+                                color: themeColor('text'),
+                                fontSize: bigKeypadButtons
+                                    ? BIG_SIZE
+                                    : DEFAULT_SIZE
+                            }}
+                        >
+                            {unitsStore.units === 'fiat' &&
+                            fiatStore.getSymbol().separatorSwap
+                                ? ','
+                                : '.'}
+                        </Text>
+                    </Touchable>
+                ) : (
+                    <Touchable
+                        touch={() => {
+                            decrementPinValueLength();
+                            deleteValue();
+                            triggerHapticFeedback();
+                        }}
+                        onLongPress={() => {
+                            clearPinValueLength();
+                            clearValue();
+                            triggerHapticFeedback();
+                        }}
+                        highlight={numberHighlight}
+                        style={styles.key}
+                    >
+                        <Text
+                            style={{
+                                ...styles.pinPadNumber,
+                                color: themeColor('text'),
+                                fontSize: bigKeypadButtons
+                                    ? BIG_SIZE
+                                    : DEFAULT_SIZE
+                            }}
+                        >
+                            {'<'}
+                        </Text>
+                    </Touchable>
+                )}
+
+                {/* Middle key: 0 */}
+                <Touchable
+                    touch={() => handleAppendWithFeedback(pinNumbers[0])}
+                    highlight={numberHighlight}
+                    style={styles.key}
+                >
+                    <Text
+                        style={{
+                            ...styles.pinPadNumber,
+                            color: themeColor('text'),
+                            fontSize: bigKeypadButtons ? BIG_SIZE : DEFAULT_SIZE
+                        }}
+                    >
+                        {pinNumbers[0]}
+                    </Text>
+                </Touchable>
+
+                {/* Right key: delete/clear/submit */}
+                {!hidePinLength &&
+                    (amount ? (
+                        <Touchable
+                            touch={() => {
+                                decrementPinValueLength();
+                                deleteValue();
+                                triggerHapticFeedback();
+                            }}
+                            onLongPress={() => {
+                                clearPinValueLength();
+                                clearValue();
+                                triggerHapticFeedback();
+                            }}
+                            highlight={numberHighlight}
+                            style={styles.key}
+                        >
+                            <DeleteKey
+                                fill={themeColor('text')}
+                                width={bigKeypadButtons ? '45' : '30'}
+                                height={bigKeypadButtons ? '45' : '30'}
+                            />
+                        </Touchable>
+                    ) : (
+                        <Touchable
+                            touch={() => {
+                                clearPinValueLength();
+                                clearValue();
+                                triggerHapticFeedback();
+                            }}
+                            highlight={numberHighlight}
+                            style={styles.key}
+                        >
+                            <Text
+                                style={{
+                                    ...styles.pinPadNumber,
+                                    color: themeColor('text'),
+                                    fontSize: bigKeypadButtons
+                                        ? BIG_SIZE
+                                        : DEFAULT_SIZE
+                                }}
+                            >
+                                C
+                            </Text>
+                        </Touchable>
+                    ))}
+                {!!hidePinLength && pinValueLength >= minLength && (
+                    <Touchable
+                        touch={() => {
+                            submitValue();
+                            clearPinValueLength();
+                            triggerHapticFeedback();
+                        }}
+                        highlight={numberHighlight}
+                        style={styles.key}
+                    >
+                        <Success />
+                    </Touchable>
+                )}
+                {!!hidePinLength && pinValueLength < minLength && (
+                    <Pressable style={styles.key}></Pressable>
+                )}
+            </Row>
+        </View>
+    );
+}
+
+const styles = StyleSheet.create({
+    pinPadRow: {
+        justifyContent: 'space-between',
+        marginTop: 10,
+        marginBottom: 10
+    },
+    pinPadNumber: {
+        fontFamily: 'PPNeueMontreal-Medium'
+    },
+    pad: {
+        justifyContent: 'flex-end',
+        marginBottom: 25
+    },
+    key: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        height: 60
+    }
+});

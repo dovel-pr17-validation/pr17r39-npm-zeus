@@ -1,0 +1,1557 @@
+import * as React from 'react';
+import {
+    Platform,
+    ScrollView,
+    StyleSheet,
+    View,
+    TouchableOpacity
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { reaction } from 'mobx';
+import Slider from '@react-native-community/slider';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { ButtonGroup } from '@rneui/themed';
+
+import Amount from '../components/Amount';
+import AmountInput from '../components/AmountInput';
+import Button from '../components/Button';
+import PaymentInFlightNotice from '../components/PaymentInFlightNotice';
+import SwipeButton from '../components/SwipeButton';
+import Conversion from '../components/Conversion';
+import FeeLimit from '../components/FeeLimit';
+import Accordion from '../components/Accordion';
+import Header from '../components/Header';
+import HopPicker from '../components/HopPicker';
+import KeyValue from '../components/KeyValue';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Screen from '../components/Screen';
+import Switch from '../components/Switch';
+import Text from '../components/Text';
+import TextInput from '../components/TextInput';
+import { Row } from '../components/layout/Row';
+import {
+    ErrorMessage,
+    WarningMessage
+} from '../components/SuccessErrorMessage';
+
+import BalanceStore from '../stores/BalanceStore';
+import ChannelsStore from '../stores/ChannelsStore';
+import InvoicesStore from '../stores/InvoicesStore';
+import TransactionsStore, { SendPaymentReq } from '../stores/TransactionsStore';
+import UnitsStore from '../stores/UnitsStore';
+import NodeInfoStore from '../stores/NodeInfoStore';
+import SettingsStore from '../stores/SettingsStore';
+
+import FeeUtils from '../utils/FeeUtils';
+import { localeString } from '../utils/LocaleUtils';
+import BackendUtils from '../utils/BackendUtils';
+import { sleep } from '../utils/SleepUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import { numberWithCommas } from '../utils/UnitsUtils';
+import {
+    calculateDonationAmount,
+    findDonationPercentageIndex
+} from '../utils/DonationUtils';
+import { clearPendingPaymentData } from '../utils/GraphSyncUtils';
+
+import CaretDown from '../assets/images/SVG/Caret Down.svg';
+import CaretRight from '../assets/images/SVG/Caret Right.svg';
+import QR from '../assets/images/SVG/QR.svg';
+
+interface InvoiceProps {
+    exitSetup: any;
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<'PaymentRequest', { fromGraphSync?: boolean }>;
+    BalanceStore: BalanceStore;
+    InvoicesStore: InvoicesStore;
+    TransactionsStore: TransactionsStore;
+    UnitsStore: UnitsStore;
+    ChannelsStore: ChannelsStore;
+    NodeInfoStore: NodeInfoStore;
+    SettingsStore: SettingsStore;
+}
+
+interface InvoiceState {
+    customAmount: string;
+    satAmount: string | number;
+    enableMultiPathPayment: boolean;
+    enableAtomicMultiPathPayment: boolean;
+    maxParts: string;
+    maxShardAmt: string;
+    feeLimitSat: string;
+    feeOption: string;
+    maxFeePercent: string;
+    timeoutSeconds: string;
+    outgoingChanId: string | any;
+    lastHopPubkey: string | any;
+    lightningReadyToSend: boolean;
+    slideToPayThreshold: number;
+    donationsToggle: boolean;
+    donationPercentage: any;
+    donationAmount: any;
+    selectedIndex: number | null;
+    swipeButtonKey: number;
+    reviewedPaymentRequest: string;
+}
+
+@inject(
+    'BalanceStore',
+    'InvoicesStore',
+    'TransactionsStore',
+    'UnitsStore',
+    'ChannelsStore',
+    'NodeInfoStore',
+    'SettingsStore'
+)
+@observer
+export default class PaymentRequest extends React.Component<
+    InvoiceProps,
+    InvoiceState
+> {
+    focusListener: any;
+    beforeRemoveListener: any;
+    donationDisposer: any;
+    swipeResetDisposer: any;
+    donationLockRequest?: string;
+    isComponentMounted: boolean = false;
+    private scrollViewRef = React.createRef<ScrollView>();
+    state = {
+        customAmount: '',
+        satAmount: '',
+        enableMultiPathPayment: true,
+        enableAtomicMultiPathPayment: false,
+        maxParts: '16',
+        maxShardAmt: '',
+        feeLimitSat: '1000',
+        feeOption: 'fixed',
+        maxFeePercent: '5.0',
+        timeoutSeconds: '60',
+        outgoingChanId: null,
+        lastHopPubkey: null,
+        lightningReadyToSend: false,
+        slideToPayThreshold: 10000,
+        donationsToggle: false,
+        donationPercentage: 0,
+        donationAmount: 0,
+        selectedIndex: null,
+        swipeButtonKey: 0,
+        reviewedPaymentRequest: ''
+    };
+
+    async componentDidMount() {
+        this.isComponentMounted = true;
+        const { SettingsStore, InvoicesStore, BalanceStore, route } =
+            this.props;
+
+        // Clear the decode on every way of leaving (header Back, Android
+        // hardware back, iOS swipe, popTo after a payment), not only the
+        // header Back: a decode still in flight would otherwise land after
+        // the user left and start route queries or LDK probes. Registered
+        // before the first await so an early back is not missed
+        this.beforeRemoveListener = this.props.navigation.addListener(
+            'beforeRemove',
+            () => InvoicesStore.clearPayReq()
+        );
+        const { getSettings, implementation } = SettingsStore;
+        // balance is not refreshed elsewhere after channel changes, so
+        // the no-balance warning could otherwise be stale
+        BalanceStore.getLightningBalance(true);
+        const settings = await getSettings();
+
+        if (route?.params?.fromGraphSync) {
+            clearPendingPaymentData().catch((error) => {
+                console.error(
+                    'Failed to clear pending payment data on PaymentRequest:',
+                    error
+                );
+            });
+        }
+
+        const { defaultDonationPercentage } = settings.payments;
+
+        // Derive donation and fee-mode state from the decoded invoice, and
+        // re-derive whenever a different invoice lands in the store: the
+        // screen live-renders whatever InvoicesStore holds, so state computed
+        // from the invoice must track it or a swapped-in payment request
+        // would be shown (and paid) with the old invoice's donation amount
+        // and fee mode. Guarded by donationLockRequest so a re-decode of the
+        // same request doesn't clobber a donation the user customized.
+        this.donationDisposer = reaction(
+            () => InvoicesStore.pay_req,
+            (pay_req) => {
+                if (!this.isComponentMounted) return;
+                // getPayReq nulls pay_req before decoding a replacement
+                // invoice; wait for the decoded result
+                if (!pay_req) return;
+
+                const currentRequest = InvoicesStore.paymentRequest;
+                if (
+                    currentRequest &&
+                    this.donationLockRequest === currentRequest
+                ) {
+                    return;
+                }
+
+                const defaultPct = Number(defaultDonationPercentage) || 0;
+                const requestAmount = pay_req.getRequestAmount ?? 0;
+
+                this.setState({
+                    feeOption:
+                        requestAmount && requestAmount > 1000
+                            ? 'percent'
+                            : 'fixed',
+                    donationAmount: calculateDonationAmount(
+                        requestAmount,
+                        defaultPct
+                    ),
+                    selectedIndex: findDonationPercentageIndex(
+                        defaultPct,
+                        [5, 10, 20]
+                    ),
+                    donationPercentage: defaultPct
+                });
+
+                this.donationLockRequest = currentRequest;
+            },
+            { fireImmediately: true }
+        );
+
+        this.setState({
+            feeLimitSat: settings?.payments?.defaultFeeFixed || '100',
+            maxFeePercent: settings?.payments?.defaultFeePercentage || '5.0',
+            timeoutSeconds: settings?.payments?.timeoutSeconds || '60',
+            slideToPayThreshold: settings?.payments?.slideToPayThreshold
+        });
+
+        if (implementation === 'embedded-lnd') {
+            this.checkIfLndReady();
+        } else {
+            this.setState({
+                lightningReadyToSend: true
+            });
+        }
+
+        // Pin the invoice the user is reviewing. The view otherwise reads the
+        // invoice straight off the shared InvoicesStore singleton, so if a
+        // second payment string is injected while this screen is open (deep
+        // link, NFC tap, clipboard handler, etc.) the store's pay_req /
+        // paymentRequest get swapped out from under the review. We record what
+        // was reviewed so triggerPayment can refuse to pay a different invoice
+        // than the one on screen when the confirmation began ("review A, pay B").
+        this.setState({
+            reviewedPaymentRequest: InvoicesStore.paymentRequest
+        });
+
+        // If the invoice under review changes while this screen is mounted,
+        // invalidate any in-progress slide-to-pay gesture so it cannot
+        // complete against the swapped-in invoice. The render path notices the
+        // mismatch and replaces the pay controls with a warning; the pin is
+        // only advanced when the user explicitly accepts the new request.
+        this.swipeResetDisposer = reaction(
+            () => InvoicesStore.paymentRequest,
+            () => {
+                if (!this.isComponentMounted) return;
+                this.setState({
+                    swipeButtonKey: this.state.swipeButtonKey + 1
+                });
+            }
+        );
+
+        // Reset slide to pay slider position when screen comes into focus.
+        // Deliberately do NOT re-pin here: a focus event also fires when
+        // returning from a screen pushed on top of this one (e.g. the QR
+        // view), so an invoice injected while the user was away would get
+        // silently re-pinned and paid.
+        const { navigation } = this.props;
+        this.focusListener = navigation.addListener('focus', () => {
+            this.setState({
+                swipeButtonKey: this.state.swipeButtonKey + 1
+            });
+        });
+    }
+
+    componentWillUnmount(): void {
+        this.isComponentMounted = false;
+        if (this.focusListener) {
+            this.focusListener();
+        }
+        if (this.beforeRemoveListener) {
+            this.beforeRemoveListener();
+        }
+        if (this.donationDisposer) {
+            this.donationDisposer();
+        }
+        if (this.swipeResetDisposer) {
+            this.swipeResetDisposer();
+        }
+    }
+
+    checkIfLndReady = async () => {
+        const { BalanceStore, NodeInfoStore } = this.props;
+        const { isLightningReadyToSend } = NodeInfoStore;
+        // re-read the balance each pass: the refresh started on mount may
+        // land after this loop begins, so it idles (no RPCs) while it is 0
+        while (!this.state.lightningReadyToSend && this.isComponentMounted) {
+            if (BalanceStore.lightningBalance !== 0) {
+                try {
+                    const isReady = await isLightningReadyToSend();
+                    if (isReady) {
+                        this.setState({
+                            lightningReadyToSend: true
+                        });
+                    }
+                } catch (e) {
+                    // RPC can fail while LND is still starting; keep polling
+                    console.log('Embedded LND readiness check failed', e);
+                }
+            }
+            await sleep(3000);
+        }
+    };
+
+    displayFeeRecommendation = () => {
+        const { feeLimitSat } = this.state;
+        const { InvoicesStore } = this.props;
+        const { feeEstimate } = InvoicesStore;
+
+        if (
+            feeEstimate &&
+            feeLimitSat &&
+            Number(feeEstimate) > Number(feeLimitSat)
+        ) {
+            return (
+                <Text
+                    style={{
+                        color: themeColor('error')
+                    }}
+                >
+                    {localeString(
+                        'views.PaymentRequest.feeEstimateExceedsLimit'
+                    )}
+                </Text>
+            );
+        }
+        return null;
+    };
+
+    sendPayment = ({
+        payment_request,
+        amount, // used only for no-amount invoices
+        max_parts,
+        max_shard_amt,
+        fee_limit_sat,
+        max_fee_percent,
+        outgoing_chan_id,
+        last_hop_pubkey,
+        amp,
+        timeout_seconds
+    }: SendPaymentReq) => {
+        const { InvoicesStore, TransactionsStore, SettingsStore, navigation } =
+            this.props;
+
+        const { settings } = SettingsStore;
+
+        const enableDonations =
+            Platform.OS !== 'ios' && settings?.payments?.enableDonations;
+        const { donationAmount } = this.state;
+        let feeLimitSat = fee_limit_sat;
+
+        if (!fee_limit_sat) {
+            const { pay_req } = InvoicesStore;
+            const requestAmount = pay_req && pay_req.getRequestAmount;
+            const invoiceAmount = amount || requestAmount;
+            feeLimitSat = FeeUtils.calculateDefaultRoutingFee(
+                Number(invoiceAmount)
+            );
+        }
+
+        TransactionsStore.sendPayment({
+            payment_request,
+            amount,
+            max_parts,
+            max_shard_amt,
+            fee_limit_sat: feeLimitSat,
+            max_fee_percent,
+            outgoing_chan_id,
+            last_hop_pubkey,
+            amp,
+            timeout_seconds
+        });
+
+        navigation.navigate('SendingLightning', {
+            enableDonations,
+            ...(enableDonations &&
+                donationAmount > 0 && {
+                    donationAmount: donationAmount.toString()
+                })
+        });
+    };
+
+    // true when the invoice carries no amount and none has been entered
+    isMissingAmount = () => {
+        const requestAmount =
+            this.props.InvoicesStore.pay_req?.getRequestAmount;
+        return !requestAmount && !(Number(this.state.satAmount) > 0);
+    };
+
+    triggerPayment = () => {
+        const { InvoicesStore, SettingsStore, TransactionsStore } = this.props;
+
+        // Guard against double-submission: bail if a payment is already in
+        // flight so a rapid double-tap or re-fired swipe can't dispatch twice.
+        if (TransactionsStore.paymentInFlight) return;
+
+        // a no-amount invoice can't be paid without an amount: the node
+        // would only reject it after the send guard was taken
+        if (this.isMissingAmount()) return;
+
+        const {
+            enableMultiPathPayment,
+            maxParts,
+            maxShardAmt,
+            feeLimitSat,
+            feeOption,
+            outgoingChanId,
+            lastHopPubkey,
+            satAmount,
+            timeoutSeconds,
+            maxFeePercent,
+            enableAtomicMultiPathPayment
+        } = this.state;
+
+        const { paymentRequest, pay_req } = InvoicesStore;
+
+        // Fail closed: if the invoice in the store no longer matches the one
+        // the user reviewed, it was swapped out from under the review screen.
+        // Refuse to pay rather than paying a different invoice than the one
+        // that was on screen when this confirmation began. Reset the swipe
+        // knob so the gesture doesn't stick; the render path shows the
+        // payment-request-changed warning in place of the pay controls.
+        if (
+            this.state.reviewedPaymentRequest !== '' &&
+            paymentRequest !== this.state.reviewedPaymentRequest
+        ) {
+            this.setState({
+                swipeButtonKey: this.state.swipeButtonKey + 1
+            });
+            return;
+        }
+
+        const { implementation } = SettingsStore;
+
+        // Fail closed if the invoice has expired since it was reviewed:
+        // the invoice can lapse while this screen is open, and expiry is
+        // otherwise only enforced by the recipient
+        if (pay_req?.isExpiredNow()) {
+            // re-render so the expired notice appears and the pay
+            // controls are removed
+            this.forceUpdate();
+            return;
+        }
+
+        const isCLightning: boolean = implementation === 'cln-rest';
+
+        // handle fee percents that use commas
+        const maxFeePercentFormatted = maxFeePercent.replace(/,/g, '.');
+
+        let lockAtomicMultiPathPayment = false;
+        if (
+            pay_req &&
+            pay_req.features &&
+            pay_req.features['30'] &&
+            pay_req.features['30'].is_required
+        ) {
+            lockAtomicMultiPathPayment = true;
+        }
+
+        const enableAmp: boolean =
+            enableAtomicMultiPathPayment || lockAtomicMultiPathPayment;
+
+        // Call sendPayment with the freshest values
+        this.sendPayment({
+            payment_request: paymentRequest,
+            amount: satAmount ? satAmount.toString() : undefined,
+            max_parts: enableMultiPathPayment ? maxParts : '16',
+            max_shard_amt: enableMultiPathPayment ? maxShardAmt : '',
+            fee_limit_sat: feeLimitSat,
+            // CLN takes either a percent cap or the fixed fee_limit_sat cap,
+            // so only send the percent when that mode is selected
+            max_fee_percent:
+                isCLightning && feeOption === 'percent'
+                    ? maxFeePercentFormatted
+                    : undefined,
+            outgoing_chan_id: outgoingChanId ?? '',
+            last_hop_pubkey: lastHopPubkey ?? '',
+            amp: enableAmp,
+            timeout_seconds: timeoutSeconds
+        });
+    };
+
+    render() {
+        const {
+            InvoicesStore,
+            UnitsStore,
+            ChannelsStore,
+            SettingsStore,
+            NodeInfoStore,
+            TransactionsStore,
+            navigation
+        } = this.props;
+        const {
+            enableMultiPathPayment,
+            enableAtomicMultiPathPayment,
+            maxParts,
+            maxShardAmt,
+            feeOption,
+            customAmount,
+            timeoutSeconds,
+            lightningReadyToSend,
+            slideToPayThreshold,
+            donationsToggle,
+            donationAmount,
+            donationPercentage
+        } = this.state;
+        const {
+            pay_req,
+            paymentRequest,
+            getPayReqError,
+            loading,
+            loadingFeeEstimate,
+            successProbability,
+            feeEstimate
+        } = InvoicesStore;
+
+        const locale = SettingsStore.settings.locale;
+        if (pay_req) pay_req.determineFormattedOriginalTimeUntilExpiry(locale);
+
+        const isPayReqExpired = !!pay_req && pay_req.isExpiredNow();
+
+        // variables cannot be destructured traditionally here
+        // due to how we clear the pay_req from the store upon
+        // navigating back
+        const requestAmount =
+            pay_req && pay_req.getRequestAmount
+                ? pay_req.getRequestAmount
+                : undefined;
+        const expiry = pay_req && pay_req.formattedOriginalTimeUntilExpiry;
+        const cltv_expiry = pay_req && pay_req.cltv_expiry;
+        const destination = pay_req && pay_req.destination;
+        const payment_hash = pay_req && pay_req.payment_hash;
+        const timestamp = pay_req && pay_req.timestamp;
+        const getMemo = pay_req && pay_req.getMemo;
+        const getNameDescReceiver = pay_req && pay_req.getNameDescReceiver;
+
+        const donationPercentageOptions = [5, 10, 20];
+
+        const handleButtonPress = (index: number) => {
+            const percentage = donationPercentageOptions[index];
+            const donationAmount = calculateDonationAmount(
+                requestAmount ?? 0,
+                percentage
+            );
+            this.donationLockRequest = paymentRequest;
+            this.setState({
+                donationPercentage: percentage,
+                donationAmount,
+                selectedIndex: index
+            });
+        };
+
+        const handleSliderChange = (value: number) => {
+            const donationAmount = calculateDonationAmount(
+                requestAmount ?? 0,
+                value
+            );
+            const index = findDonationPercentageIndex(
+                value,
+                donationPercentageOptions
+            );
+
+            this.donationLockRequest = paymentRequest;
+            this.setState({
+                donationPercentage: value,
+                donationAmount,
+                selectedIndex: index
+            });
+        };
+
+        const renderButton = (label: string, index: number) => () =>
+            (
+                <Text
+                    style={{
+                        fontFamily: 'PPNeueMontreal-Book',
+                        color:
+                            this.state.selectedIndex === index
+                                ? themeColor('background')
+                                : themeColor('text')
+                    }}
+                >
+                    {label}
+                </Text>
+            );
+
+        const buttons: any = donationPercentageOptions.map(
+            (percent, index) => ({
+                element: renderButton(`${percent}%`, index)
+            })
+        );
+
+        let lockAtomicMultiPathPayment = false;
+        if (
+            pay_req &&
+            pay_req.features &&
+            pay_req.features['30'] &&
+            pay_req.features['30'].is_required
+        ) {
+            lockAtomicMultiPathPayment = true;
+        }
+
+        const enableAmp: boolean =
+            enableAtomicMultiPathPayment || lockAtomicMultiPathPayment;
+        const ampOrMppEnabled: boolean =
+            (BackendUtils.supportsMPP() || BackendUtils.supportsAMP()) &&
+            (enableMultiPathPayment || enableAmp);
+
+        const date = new Date(Number(timestamp) * 1000).toString();
+
+        const { enableTor, implementation, settings } = SettingsStore;
+
+        const enableDonations =
+            Platform.OS !== 'ios' && settings?.payments?.enableDonations;
+
+        const isLdkNode: boolean = implementation === 'ldk-node';
+
+        const isNoAmountInvoice: boolean = !requestAmount;
+
+        const noBalance = this.props.BalanceStore.lightningBalance === 0;
+        const missingAmount = this.isMissingAmount();
+
+        // The screen renders whatever invoice is in the shared InvoicesStore,
+        // so when the store no longer matches the pinned invoice the user has
+        // a different payment request in front of them than the one they were
+        // reviewing. Surface that instead of paying (or silently refusing):
+        // the pay controls are replaced below with a warning and an explicit
+        // button to review the new request, which re-pins it.
+        const payReqChanged =
+            this.state.reviewedPaymentRequest !== '' &&
+            !!paymentRequest &&
+            paymentRequest !== this.state.reviewedPaymentRequest;
+
+        const QRButton = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    navigation.navigate('QR', {
+                        value: `lightning:${paymentRequest}`,
+                        satAmount: requestAmount
+                    })
+                }
+            >
+                <QR fill={themeColor('text')} />
+            </TouchableOpacity>
+        );
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.PaymentRequest.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <Row>
+                            <QRButton />
+                        </Row>
+                    }
+                    navigation={navigation}
+                />
+
+                {(loading || loadingFeeEstimate) && (
+                    <View style={{ marginTop: 40 }}>
+                        <LoadingIndicator />
+                    </View>
+                )}
+
+                <View style={{ flex: 1 }}>
+                    <ScrollView
+                        ref={this.scrollViewRef}
+                        keyboardShouldPersistTaps="handled"
+                    >
+                        {!!getPayReqError && (
+                            <View style={styles.content}>
+                                <Text
+                                    style={{
+                                        ...styles.label,
+                                        color: themeColor('text')
+                                    }}
+                                >
+                                    {`${localeString(
+                                        'views.PaymentRequest.error'
+                                    )}: ${getPayReqError}`}
+                                </Text>
+                            </View>
+                        )}
+
+                        {!loading && !loadingFeeEstimate && !!pay_req && (
+                            <View style={styles.content}>
+                                <>
+                                    {isPayReqExpired && (
+                                        <View
+                                            style={{
+                                                paddingTop: 10,
+                                                paddingBottom: 10
+                                            }}
+                                        >
+                                            <ErrorMessage
+                                                message={localeString(
+                                                    'views.PaymentRequest.invoiceExpired'
+                                                )}
+                                            />
+                                        </View>
+                                    )}
+                                    {!BackendUtils.supportsLightningSends() && (
+                                        <View
+                                            style={{
+                                                paddingTop: 10,
+                                                paddingBottom: 10
+                                            }}
+                                        >
+                                            <WarningMessage
+                                                message={localeString(
+                                                    'views.PaymentRequest.notAllowedToSend'
+                                                )}
+                                            />
+                                        </View>
+                                    )}
+                                    {noBalance &&
+                                        BackendUtils.supportsLightningSends() && (
+                                            <View
+                                                style={{
+                                                    paddingTop: 10,
+                                                    paddingBottom: 10
+                                                }}
+                                            >
+                                                <WarningMessage
+                                                    message={localeString(
+                                                        'views.Send.noLightningBalance'
+                                                    )}
+                                                />
+                                            </View>
+                                        )}
+                                    {isNoAmountInvoice ? (
+                                        <AmountInput
+                                            amount={customAmount}
+                                            title={localeString(
+                                                'views.PaymentRequest.customAmt'
+                                            )}
+                                            onAmountChange={(
+                                                amount: string,
+                                                satAmount: string | number
+                                            ) => {
+                                                this.setState({
+                                                    customAmount: amount,
+                                                    satAmount
+                                                });
+                                            }}
+                                        />
+                                    ) : (
+                                        <View style={styles.center}>
+                                            {/* show the exact invoice amount
+                                            even with msat display off */}
+                                            <Amount
+                                                sats={requestAmount}
+                                                jumboText
+                                                toggleable
+                                                forceMsats
+                                            />
+                                            <View style={{ top: 10 }}>
+                                                <Conversion
+                                                    sats={requestAmount}
+                                                />
+                                            </View>
+                                        </View>
+                                    )}
+                                </>
+
+                                {getNameDescReceiver && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Invoice.payingTo'
+                                        )}
+                                        value={getNameDescReceiver}
+                                    />
+                                )}
+
+                                {getMemo && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Invoice.memo'
+                                        )}
+                                        value={getMemo}
+                                    />
+                                )}
+
+                                {!!timestamp && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.timestamp'
+                                        )}
+                                        value={date}
+                                    />
+                                )}
+
+                                {!!expiry && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.expiry'
+                                        )}
+                                        value={expiry}
+                                    />
+                                )}
+
+                                {!!cltv_expiry && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.cltvExpiry'
+                                        )}
+                                        value={`${cltv_expiry} ${localeString(
+                                            'general.blocks'
+                                        )}`}
+                                    />
+                                )}
+
+                                {!!destination && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'general.destination'
+                                        )}
+                                        value={destination}
+                                        showCopyIcon
+                                    />
+                                )}
+
+                                {!!payment_hash && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.paymentHash'
+                                        )}
+                                        value={payment_hash}
+                                        showCopyIcon
+                                    />
+                                )}
+
+                                {!!successProbability && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.successProbability'
+                                        )}
+                                        value={`${successProbability}%`}
+                                    />
+                                )}
+
+                                {(!!feeEstimate || feeEstimate === 0) && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.PaymentRequest.feeEstimate'
+                                        )}
+                                        value={
+                                            <Amount
+                                                sats={feeEstimate || 0}
+                                                toggleable
+                                            />
+                                        }
+                                    />
+                                )}
+
+                                {BackendUtils.supportsCustomFeeLimit() && (
+                                    <Accordion
+                                        headerLayout="form"
+                                        id="payment-request-fee-settings"
+                                        scrollRef={this.scrollViewRef}
+                                        title={localeString(
+                                            'views.Settings.title'
+                                        )}
+                                        headerStyle={{
+                                            marginTop: 10,
+                                            marginBottom: 10
+                                        }}
+                                    >
+                                        <FeeLimit
+                                            satAmount={
+                                                isNoAmountInvoice
+                                                    ? this.state.satAmount
+                                                    : requestAmount || 0
+                                            }
+                                            onFeeLimitSatChange={(
+                                                value: string
+                                            ) =>
+                                                this.setState({
+                                                    feeLimitSat: value
+                                                })
+                                            }
+                                            onMaxFeePercentChange={(
+                                                value: string
+                                            ) =>
+                                                this.setState({
+                                                    maxFeePercent: value
+                                                })
+                                            }
+                                            onFeeOptionChange={(
+                                                value: string
+                                            ) =>
+                                                this.setState({
+                                                    feeOption: value
+                                                })
+                                            }
+                                            feeOption={feeOption}
+                                            SettingsStore={SettingsStore}
+                                            InvoicesStore={InvoicesStore}
+                                            displayFeeRecommendation
+                                            hide={false}
+                                        />
+                                        {!!pay_req &&
+                                            BackendUtils.supportsHopPicking() && (
+                                                <>
+                                                    {
+                                                        <HopPicker
+                                                            onValueChange={(
+                                                                channels
+                                                            ) =>
+                                                                this.setState({
+                                                                    outgoingChanId:
+                                                                        channels[0]
+                                                                            ?.channelId
+                                                                })
+                                                            }
+                                                            title={localeString(
+                                                                'views.PaymentRequest.firstHop'
+                                                            )}
+                                                            ChannelsStore={
+                                                                ChannelsStore
+                                                            }
+                                                            UnitsStore={
+                                                                UnitsStore
+                                                            }
+                                                        />
+                                                    }
+                                                    {
+                                                        <HopPicker
+                                                            onValueChange={(
+                                                                channels
+                                                            ) =>
+                                                                this.setState({
+                                                                    lastHopPubkey:
+                                                                        channels[0]
+                                                                            ?.remotePubkey
+                                                                })
+                                                            }
+                                                            title={localeString(
+                                                                'views.PaymentRequest.lastHop'
+                                                            )}
+                                                            ChannelsStore={
+                                                                ChannelsStore
+                                                            }
+                                                            UnitsStore={
+                                                                UnitsStore
+                                                            }
+                                                        />
+                                                    }
+                                                </>
+                                            )}
+
+                                        {!!pay_req &&
+                                            BackendUtils.supportsMPP() &&
+                                            !enableTor && (
+                                                <View
+                                                    style={{
+                                                        flex: 1,
+                                                        flexDirection: 'row',
+                                                        marginTop: 25
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            ...styles.label,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                        infoModalText={[
+                                                            localeString(
+                                                                'views.PaymentRequest.mpp.explainer1'
+                                                            ),
+                                                            localeString(
+                                                                'views.PaymentRequest.mpp.explainer2'
+                                                            )
+                                                        ]}
+                                                    >
+                                                        {localeString(
+                                                            'views.PaymentRequest.mpp'
+                                                        )}
+                                                    </Text>
+                                                    <View
+                                                        style={{
+                                                            flex: 1,
+                                                            justifyContent:
+                                                                'flex-end'
+                                                        }}
+                                                    >
+                                                        <Switch
+                                                            value={
+                                                                enableMultiPathPayment
+                                                            }
+                                                            onValueChange={() => {
+                                                                const enable =
+                                                                    !enableMultiPathPayment;
+                                                                this.setState({
+                                                                    enableMultiPathPayment:
+                                                                        enable,
+                                                                    enableAtomicMultiPathPayment:
+                                                                        enableMultiPathPayment
+                                                                            ? false
+                                                                            : true
+                                                                });
+                                                            }}
+                                                        />
+                                                    </View>
+                                                </View>
+                                            )}
+
+                                        {!!pay_req &&
+                                            BackendUtils.supportsAMP() && (
+                                                <View
+                                                    style={{
+                                                        flex: 1,
+                                                        flexDirection: 'row',
+                                                        marginTop: 25,
+                                                        marginBottom: 15
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            ...styles.label,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                        infoModalText={[
+                                                            localeString(
+                                                                'views.PaymentRequest.amp.explainer1'
+                                                            ),
+                                                            localeString(
+                                                                'views.PaymentRequest.amp.explainer2'
+                                                            )
+                                                        ]}
+                                                        infoModalLink="https://docs.lightning.engineering/lightning-network-tools/lnd/amp"
+                                                    >
+                                                        {localeString(
+                                                            'views.PaymentRequest.amp'
+                                                        )}
+                                                    </Text>
+                                                    <View
+                                                        style={{
+                                                            flex: 1,
+                                                            justifyContent:
+                                                                'flex-end'
+                                                        }}
+                                                    >
+                                                        <Switch
+                                                            value={enableAmp}
+                                                            onValueChange={() => {
+                                                                const enable =
+                                                                    !enableAtomicMultiPathPayment;
+                                                                this.setState({
+                                                                    enableAtomicMultiPathPayment:
+                                                                        enable,
+                                                                    enableMultiPathPayment:
+                                                                        enable ||
+                                                                        enableMultiPathPayment
+                                                                });
+                                                            }}
+                                                            disabled={
+                                                                lockAtomicMultiPathPayment
+                                                            }
+                                                        />
+                                                    </View>
+                                                </View>
+                                            )}
+
+                                        {ampOrMppEnabled && (
+                                            <React.Fragment>
+                                                <Text
+                                                    style={{
+                                                        ...styles.label,
+                                                        color: themeColor(
+                                                            'text'
+                                                        )
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'views.PaymentRequest.maxParts'
+                                                    )}
+                                                </Text>
+                                                <TextInput
+                                                    keyboardType="numeric"
+                                                    value={maxParts}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) =>
+                                                        this.setState({
+                                                            maxParts: text
+                                                        })
+                                                    }
+                                                />
+                                                <Text
+                                                    style={{
+                                                        ...styles.labelSecondary,
+                                                        color: themeColor(
+                                                            'secondaryText'
+                                                        )
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'views.PaymentRequest.maxPartsDescription'
+                                                    )}
+                                                </Text>
+                                            </React.Fragment>
+                                        )}
+
+                                        {ampOrMppEnabled && !isLdkNode && (
+                                            <React.Fragment>
+                                                <Text
+                                                    style={{
+                                                        ...styles.label,
+                                                        color: themeColor(
+                                                            'text'
+                                                        )
+                                                    }}
+                                                >
+                                                    {`${localeString(
+                                                        'views.PaymentRequest.maxShardAmt'
+                                                    )} (${localeString(
+                                                        'general.sats'
+                                                    )}) (${localeString(
+                                                        'general.optional'
+                                                    )})`}
+                                                </Text>
+                                                <TextInput
+                                                    keyboardType="numeric"
+                                                    value={maxShardAmt}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) =>
+                                                        this.setState({
+                                                            maxShardAmt: text
+                                                        })
+                                                    }
+                                                />
+                                            </React.Fragment>
+                                        )}
+
+                                        {(BackendUtils.supportsCustomFeeLimit() ||
+                                            isLdkNode) && (
+                                            <>
+                                                <Text
+                                                    style={{
+                                                        ...styles.label,
+                                                        color: themeColor(
+                                                            'text'
+                                                        )
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'views.Settings.Payments.timeoutSeconds'
+                                                    )}
+                                                </Text>
+                                                <TextInput
+                                                    keyboardType="numeric"
+                                                    value={timeoutSeconds}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) =>
+                                                        this.setState({
+                                                            timeoutSeconds: text
+                                                        })
+                                                    }
+                                                />
+                                            </>
+                                        )}
+                                    </Accordion>
+                                )}
+                                {!BackendUtils.supportsCustomFeeLimit() && (
+                                    <FeeLimit
+                                        satAmount={
+                                            isNoAmountInvoice
+                                                ? this.state.satAmount
+                                                : requestAmount || 0
+                                        }
+                                        onFeeLimitSatChange={(value: string) =>
+                                            this.setState({
+                                                feeLimitSat: value
+                                            })
+                                        }
+                                        onMaxFeePercentChange={(
+                                            value: string
+                                        ) =>
+                                            this.setState({
+                                                maxFeePercent: value
+                                            })
+                                        }
+                                        feeOption={feeOption}
+                                        SettingsStore={SettingsStore}
+                                        InvoicesStore={InvoicesStore}
+                                        displayFeeRecommendation
+                                        hide
+                                    />
+                                )}
+                                {enableDonations &&
+                                    NodeInfoStore!.nodeInfo.isMainNet && (
+                                        <TouchableOpacity
+                                            onPress={() => {
+                                                this.setState({
+                                                    donationsToggle:
+                                                        !donationsToggle
+                                                });
+                                            }}
+                                        >
+                                            <View
+                                                style={{
+                                                    marginTop: 10,
+                                                    marginBottom: 10
+                                                }}
+                                            >
+                                                <Row justify="space-around">
+                                                    <View
+                                                        style={{
+                                                            flex: 1,
+                                                            marginRight: 10
+                                                        }}
+                                                    >
+                                                        <KeyValue
+                                                            keyValue={localeString(
+                                                                'views.PaymentRequest.donateToZEUS'
+                                                            )}
+                                                        />
+                                                    </View>
+                                                    {donationsToggle ? (
+                                                        <CaretDown
+                                                            fill={themeColor(
+                                                                'text'
+                                                            )}
+                                                            width="20"
+                                                            height="20"
+                                                        />
+                                                    ) : (
+                                                        <View
+                                                            style={{
+                                                                flexDirection:
+                                                                    'row',
+                                                                alignItems:
+                                                                    'center'
+                                                            }}
+                                                        >
+                                                            {donationAmount >
+                                                                0 && (
+                                                                <Row
+                                                                    style={{
+                                                                        marginRight: 6
+                                                                    }}
+                                                                >
+                                                                    <Text
+                                                                        style={{
+                                                                            color: themeColor(
+                                                                                'highlight'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {`${numberWithCommas(
+                                                                            donationAmount
+                                                                        )} ${localeString(
+                                                                            'general.sats'
+                                                                        )}`}
+                                                                    </Text>
+                                                                    <Text
+                                                                        style={{
+                                                                            color: themeColor(
+                                                                                'secondaryText'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {` (${donationPercentage}%)`}
+                                                                    </Text>
+                                                                </Row>
+                                                            )}
+                                                            <CaretRight
+                                                                fill={themeColor(
+                                                                    'text'
+                                                                )}
+                                                                width="20"
+                                                                height="20"
+                                                            />
+                                                        </View>
+                                                    )}
+                                                </Row>
+                                            </View>
+                                        </TouchableOpacity>
+                                    )}
+                                {donationsToggle && enableDonations && (
+                                    <>
+                                        <Row justify="center">
+                                            <Text
+                                                style={{
+                                                    ...styles.label,
+                                                    color: themeColor('text')
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.PaymentRequest.supportZeus'
+                                                )}
+                                            </Text>
+                                        </Row>
+                                        <ButtonGroup
+                                            selectedIndex={
+                                                this.state.selectedIndex
+                                            }
+                                            onPress={handleButtonPress}
+                                            buttons={buttons}
+                                            selectedButtonStyle={{
+                                                backgroundColor:
+                                                    themeColor('highlight'),
+                                                borderRadius: 12
+                                            }}
+                                            containerStyle={{
+                                                marginTop: 20,
+                                                backgroundColor:
+                                                    themeColor('secondary'),
+                                                borderRadius: 12,
+                                                borderColor:
+                                                    themeColor('secondary')
+                                            }}
+                                            innerBorderStyle={{
+                                                color: themeColor('secondary')
+                                            }}
+                                        />
+
+                                        <Slider
+                                            style={{
+                                                width: '100%',
+                                                height: 40
+                                            }}
+                                            minimumValue={0}
+                                            maximumValue={100}
+                                            step={1}
+                                            value={donationPercentage}
+                                            onValueChange={handleSliderChange}
+                                            minimumTrackTintColor={themeColor(
+                                                'highlight'
+                                            )}
+                                            maximumTrackTintColor={themeColor(
+                                                'secondaryText'
+                                            )}
+                                        />
+                                        <Row justify="flex-end">
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {`${donationPercentage}% `}
+                                            </Text>
+                                        </Row>
+                                        <Row justify="flex-end">
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'highlight'
+                                                    )
+                                                }}
+                                            >
+                                                {numberWithCommas(
+                                                    donationAmount
+                                                ) +
+                                                    ` ${localeString(
+                                                        'general.sats'
+                                                    )}`}
+                                            </Text>
+                                        </Row>
+                                        <Row justify="center">
+                                            <Text
+                                                style={{
+                                                    ...styles.labelSecondary,
+                                                    color: themeColor('text')
+                                                }}
+                                            >
+                                                {`${numberWithCommas(
+                                                    requestAmount || 0
+                                                )} + ${numberWithCommas(
+                                                    donationAmount
+                                                )} = ${numberWithCommas(
+                                                    (requestAmount || 0) +
+                                                        donationAmount
+                                                )} ${localeString(
+                                                    'general.sats'
+                                                )}`}
+                                            </Text>
+                                        </Row>
+                                    </>
+                                )}
+                            </View>
+                        )}
+                    </ScrollView>
+                </View>
+
+                {!!pay_req &&
+                    !isPayReqExpired &&
+                    !loading &&
+                    !loadingFeeEstimate &&
+                    payReqChanged &&
+                    BackendUtils.supportsLightningSends() && (
+                        <View style={{ bottom: 10 }}>
+                            <View style={styles.content}>
+                                <WarningMessage
+                                    message={localeString(
+                                        'views.PaymentRequest.payReqChanged'
+                                    )}
+                                />
+                            </View>
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString(
+                                        'views.PaymentRequest.reviewNewPayReq'
+                                    )}
+                                    onPress={() =>
+                                        this.setState({
+                                            reviewedPaymentRequest:
+                                                InvoicesStore.paymentRequest,
+                                            swipeButtonKey:
+                                                this.state.swipeButtonKey + 1
+                                        })
+                                    }
+                                />
+                            </View>
+                        </View>
+                    )}
+
+                {!!pay_req &&
+                    !isPayReqExpired &&
+                    !loading &&
+                    !loadingFeeEstimate &&
+                    !payReqChanged &&
+                    BackendUtils.supportsLightningSends() && (
+                        <View style={{ bottom: 10 }}>
+                            {!!pay_req && !lightningReadyToSend && !noBalance && (
+                                <>
+                                    <Text
+                                        style={{
+                                            fontFamily: 'PPNeueMontreal-Medium',
+                                            color: themeColor('highlight'),
+                                            margin: 5,
+                                            alignSelf: 'center',
+                                            marginTop: 20,
+                                            marginBottom: 10
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.PaymentRequest.lndGettingReady'
+                                        )}
+                                    </Text>
+                                    <LoadingIndicator size={30} />
+                                </>
+                            )}
+                            <PaymentInFlightNotice
+                                TransactionsStore={TransactionsStore}
+                            />
+                            {requestAmount &&
+                            requestAmount >= slideToPayThreshold ? (
+                                <SwipeButton
+                                    key={this.state.swipeButtonKey}
+                                    onSwipeSuccess={this.triggerPayment}
+                                    disabled={
+                                        TransactionsStore.paymentInFlight ||
+                                        noBalance
+                                    }
+                                    instructionText={localeString(
+                                        'views.PaymentRequest.slideToPay'
+                                    )}
+                                    containerStyle={{
+                                        backgroundColor:
+                                            themeColor('secondaryText')
+                                    }}
+                                    swipeButtonStyle={{
+                                        backgroundColor: themeColor('text')
+                                    }}
+                                />
+                            ) : (
+                                <View style={styles.button}>
+                                    {missingAmount && !noBalance && (
+                                        <Text
+                                            style={{
+                                                ...styles.label,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                ),
+                                                alignSelf: 'center',
+                                                marginBottom: 10
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.PaymentRequest.enterAmount'
+                                            )}
+                                        </Text>
+                                    )}
+                                    <Button
+                                        title={localeString(
+                                            'views.PaymentRequest.payInvoice'
+                                        )}
+                                        icon={{
+                                            name: 'send',
+                                            size: 25
+                                        }}
+                                        onPress={this.triggerPayment}
+                                        disabled={
+                                            !lightningReadyToSend ||
+                                            TransactionsStore.paymentInFlight ||
+                                            noBalance ||
+                                            missingAmount
+                                        }
+                                    />
+                                </View>
+                            )}
+                        </View>
+                    )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    content: {
+        paddingLeft: 20,
+        paddingRight: 20
+    },
+    label: {
+        fontFamily: 'PPNeueMontreal-Book',
+        paddingTop: 5
+    },
+    labelSecondary: {
+        fontFamily: 'PPNeueMontreal-Book',
+        paddingTop: 5
+    },
+    button: {
+        paddingTop: 30,
+        paddingBottom: 15,
+        paddingLeft: 10,
+        paddingRight: 10
+    },
+    center: {
+        alignItems: 'center',
+        marginTop: 25,
+        marginBottom: 25
+    }
+});

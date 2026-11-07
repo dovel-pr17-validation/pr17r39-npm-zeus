@@ -1,0 +1,3315 @@
+import * as React from 'react';
+import {
+    Alert,
+    Dimensions,
+    ScrollView,
+    StyleSheet,
+    TouchableOpacity,
+    View,
+    Platform
+} from 'react-native';
+import BigNumber from 'bignumber.js';
+import { LNURLWithdrawParams } from 'js-lnurl';
+import { ButtonGroup, Icon } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import _map from 'lodash/map';
+import NfcManager from 'react-native-nfc-manager';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import handleAnything from '../utils/handleAnything';
+import { isUnsafeLnurlError } from '../utils/LnurlFetchUtils';
+
+import Wordmark from '../assets/images/SVG/wordmark-black.svg';
+const ZIcon = require('../assets/images/icon_black.png');
+const LightningIcon = require('../assets/images/lightning_black.png');
+const OnChainIcon = require('../assets/images/onchain_black.png');
+const ZPayIcon = require('../assets/images/pay_z_black.png');
+
+const ZIconWhite = require('../assets/images/icon_white.png');
+const LightningIconWhite = require('../assets/images/lightning_white.png');
+const OnChainIconWhite = require('../assets/images/onchain_white.png');
+const ZPayIconWhite = require('../assets/images/pay_z_white.png');
+
+import Amount from '../components/Amount';
+import AmountInput, { getSatAmount } from '../components/AmountInput';
+import Button from '../components/Button';
+import CollapsedQR from '../components/CollapsedQR';
+import DropdownSetting from '../components/DropdownSetting';
+import Header from '../components/Header';
+import HopPicker from '../components/HopPicker';
+import KeyValue from '../components/KeyValue';
+import LoadingIndicator from '../components/LoadingIndicator';
+import PaidIndicator from '../components/PaidIndicator';
+import ModalBox from '../components/ModalBox';
+import { Row } from '../components/layout/Row';
+import Screen from '../components/Screen';
+import SuccessAnimation from '../components/SuccessAnimation';
+import {
+    SuccessMessage,
+    WarningMessage,
+    ErrorMessage
+} from '../components/SuccessErrorMessage';
+import Switch from '../components/Switch';
+import Text from '../components/Text';
+import TextInput from '../components/TextInput';
+import { Spacer } from '../components/layout/Spacer';
+import Accordion from '../components/Accordion';
+
+import Channel from '../models/Channel';
+
+import ChannelsStore from '../stores/ChannelsStore';
+import ModalStore from '../stores/ModalStore';
+import NodeInfoStore from '../stores/NodeInfoStore';
+import InvoicesStore from '../stores/InvoicesStore';
+import PosStore from '../stores/PosStore';
+import SettingsStore, {
+    TIME_PERIOD_KEYS,
+    DefaultInvoiceType
+} from '../stores/SettingsStore';
+import LightningAddressStore from '../stores/LightningAddressStore';
+import LSPStore from '../stores/LSPStore';
+import UnitsStore from '../stores/UnitsStore';
+import BalanceStore from '../stores/BalanceStore';
+import UTXOsStore from '../stores/UTXOsStore';
+
+import { localeString } from '../utils/LocaleUtils';
+import BackendUtils from '../utils/BackendUtils';
+import { toWalletrpcAddressTypeName } from '../utils/LndUtils';
+import { isNfcWithdraw, scanNfcTag } from '../utils/NFCUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import { numberWithCommas, roundUpToWholeSats } from '../utils/UnitsUtils';
+import { buildOnChainUri, buildUnifiedUri } from '../utils/Bip21Utils';
+import { getAmountFromSats } from '../utils/AmountUtils';
+import {
+    ExpirationPreset,
+    TimePeriod,
+    expirationIndexFromSeconds,
+    expirySecondsFromInput,
+    localizedExpiryDuration
+} from '../utils/ExpiryUtils';
+
+import CaretDown from '../assets/images/SVG/Caret Down.svg';
+import CaretRight from '../assets/images/SVG/Caret Right.svg';
+import LockIcon from '../assets/images/SVG/Lock.svg';
+import UnifiedSvg from '../components/SVG/UnifiedSvg';
+import LightningSvg from '../components/SVG/LightningSvg';
+import OnChainSvg from '../components/SVG/OnChainSvg';
+import AddressSvg from '../components/SVG/AddressSvg';
+import Gear from '../assets/images/SVG/Gear.svg';
+import NfcIcon from '../assets/images/SVG/NFC-alt.svg';
+
+interface ReceiveProps {
+    exitSetup: any;
+    navigation: NativeStackNavigationProp<any, any>;
+    ChannelsStore: ChannelsStore;
+    InvoicesStore: InvoicesStore;
+    PosStore: PosStore;
+    ModalStore: ModalStore;
+    NodeInfoStore: NodeInfoStore;
+    SettingsStore: SettingsStore;
+    UnitsStore: UnitsStore;
+    LSPStore: LSPStore;
+    LightningAddressStore: LightningAddressStore;
+    BalanceStore: BalanceStore;
+    UTXOsStore: UTXOsStore;
+    route: Route<
+        'Receive',
+        {
+            lnurlParams: LNURLWithdrawParams | undefined;
+            amount: string;
+            autoGenerate: boolean;
+            autoGenerateOnChain: boolean;
+            autoGenerateChange?: boolean;
+            forceLn?: boolean; // when coming from the LN balance slider action
+            forceOnChain?: boolean; // when coming from the on-chain balance slider action
+            forceLsp?: boolean; // when coming from Create a wrapped invoice in LSP settings
+            account: string;
+            addressType?: string;
+            selectedIndex: number;
+            memo: string;
+            order: any; // Full order, required for receipt printing
+            orderId: string;
+            orderTotal: string;
+            orderTip: string;
+            exchangeRate: string;
+            rate: number;
+            hideRightHeaderComponent: boolean;
+        }
+    >;
+}
+
+interface ReceiveState {
+    initialLoad: boolean;
+    selectedIndex: number;
+    expirationIndex: ExpirationPreset | null;
+    addressType: string;
+    memo: string;
+    receiverName: string;
+    value: string;
+    satAmount: string | number;
+    expiry: string;
+    timePeriod: string;
+    expirySeconds: string;
+    customPreimage: string;
+    ampInvoice: boolean;
+    routeHints: boolean;
+    account: string;
+    // walletrpc address type name matching the non-default account's key
+    // scope, resolved from ListAccounts (undefined until resolved)
+    accountAddressType?: string;
+    blindedPaths: boolean;
+    nfcSupported: boolean;
+    // the last NFC read was not an LNURL-withdraw card
+    nfcError: boolean;
+    // POS
+    orderId: string;
+    orderTotal: string;
+    orderTip: string;
+    exchangeRate: string;
+    rate: number;
+    // LSP
+    needInbound: boolean;
+    enableLSP: boolean;
+    lspIsActive: boolean;
+    flowLspNotConfigured: boolean;
+    routeHintMode: RouteHintMode;
+    selectedRouteHintChannels?: Channel[];
+    hideRightHeaderComponent?: boolean;
+    showAdvanced: boolean;
+}
+
+enum RouteHintMode {
+    Automatic = 0,
+    Custom = 1
+}
+
+const LOCKED_EXPIRY = '1';
+const LOCKED_TIME_PERIOD = 'Hours';
+const LOCKED_EXPIRY_SECONDS = '3600';
+
+const LSP_MIN_CHANNEL_OPEN_FEE_SATS = 1000;
+
+@inject(
+    'ChannelsStore',
+    'InvoicesStore',
+    'ModalStore',
+    'SettingsStore',
+    'UnitsStore',
+    'PosStore',
+    'NodeInfoStore',
+    'LightningAddressStore',
+    'LSPStore',
+    'BalanceStore',
+    'UTXOsStore'
+)
+@observer
+export default class Receive extends React.Component<
+    ReceiveProps,
+    ReceiveState
+> {
+    constructor(props: ReceiveProps) {
+        super(props);
+        this.state = {
+            initialLoad: true,
+            selectedIndex: props.route.params?.selectedIndex ?? 0,
+            expirationIndex: 1,
+            addressType: '0',
+            memo: '',
+            receiverName: '',
+            value: '',
+            satAmount: '',
+            expiry: '1',
+            timePeriod: 'Hours',
+            expirySeconds: '3600',
+            customPreimage: '',
+            ampInvoice: false,
+            routeHints: false,
+            account: 'default',
+            blindedPaths: false,
+            nfcSupported: false,
+            nfcError: false,
+            // POS
+            orderId: '',
+            orderTip: '',
+            orderTotal: '',
+            exchangeRate: '',
+            rate: 0,
+            // LSP
+            needInbound: false,
+            enableLSP: true,
+            lspIsActive: false,
+            flowLspNotConfigured: true,
+            routeHintMode: RouteHintMode.Automatic,
+            selectedRouteHintChannels: undefined,
+            showAdvanced: false
+        };
+    }
+
+    unsubscribeInvoiceWatch: (() => void) | null = null;
+    unsubscribeOnchainWatch: (() => void) | null = null;
+    // set on unmount so address and invoice requests that resolve later
+    // don't start watchers that nothing will stop
+    private unmounted = false;
+    // Bumped for each invoice this view asks InvoicesStore for. The store
+    // only shows the invoice of its latest request, so the result of an
+    // older one must not be watched, recorded for the order or handed on
+    // to the withdraw screen after a failure.
+    private invoiceRequestId = 0;
+    // Bumped by each NFC tag lookup, each invoice request and Cancel. The
+    // tag's LNURL server can answer after any of those, and the answer
+    // must then create, submit or show nothing. Kept apart from
+    // invoiceRequestId so a tap that turns out not to be a withdraw does
+    // not cancel the invoice request still finishing on screen.
+    private nfcLookupId = 0;
+    hopPickerRef: HopPicker | null;
+
+    private startInvoiceRequest = () => {
+        this.nfcLookupId++;
+        const id = ++this.invoiceRequestId;
+        return () => !this.unmounted && id === this.invoiceRequestId;
+    };
+
+    private startNfcLookup = () => {
+        const id = ++this.nfcLookupId;
+        return () => !this.unmounted && id === this.nfcLookupId;
+    };
+
+    private getDefaultIndex = (): number => {
+        const { settings } = this.props.SettingsStore;
+        const defaultInvoiceType =
+            settings?.invoices?.defaultInvoiceType ||
+            DefaultInvoiceType.Lightning;
+        return defaultInvoiceType === DefaultInvoiceType.Lightning ? 1 : 0;
+    };
+
+    private getReceiveModeFlags = (): {
+        lnOnly: boolean;
+        onChainOnly: boolean;
+    } => {
+        const { route, SettingsStore } = this.props;
+        const { posStatus, settings } = SettingsStore;
+        const lnOnly =
+            (settings &&
+                posStatus === 'active' &&
+                settings.pos?.confirmationPreference === 'lnOnly') ||
+            !!route.params?.forceLn ||
+            !BackendUtils.supportsOnchainReceiving();
+        const onChainOnly = !!route.params?.forceOnChain;
+        return { lnOnly, onChainOnly };
+    };
+
+    // Lightning-only screens (POS set to Lightning only, the Lightning
+    // balance action) never show an on-chain address, so they do not ask
+    // for one
+    private getSkipOnchain = (): boolean => {
+        const { settings } = this.props.SettingsStore;
+        return (
+            this.getReceiveModeFlags().lnOnly ||
+            settings?.invoices?.defaultInvoiceType !==
+                DefaultInvoiceType.Unified
+        );
+    };
+
+    private getAddressType = (): string => {
+        const { route, SettingsStore } = this.props;
+        const { settings } = SettingsStore;
+        return (
+            route.params?.addressType || settings?.invoices?.addressType || '0'
+        );
+    };
+
+    async componentDidMount() {
+        const {
+            InvoicesStore,
+            SettingsStore,
+            LightningAddressStore,
+            LSPStore,
+            NodeInfoStore,
+            route
+        } = this.props;
+        const { reset } = InvoicesStore;
+        const { getSettings } = SettingsStore;
+        const { status, lightningAddressHandle } = LightningAddressStore;
+
+        const settings = await getSettings();
+
+        if (
+            settings?.lightningAddress?.enabled &&
+            !lightningAddressHandle &&
+            BackendUtils.supportsLightningAddress()
+        ) {
+            status().catch((e) =>
+                console.log('Error fetching Lightning address status', e)
+            );
+        }
+
+        const { flowLspNotConfigured } = NodeInfoStore.flowLspNotConfigured();
+
+        const newExpirySeconds =
+            Number(settings?.invoices?.expirySeconds) > 0
+                ? settings!.invoices!.expirySeconds!
+                : '3600';
+
+        const expirationIndex = expirationIndexFromSeconds(newExpirySeconds);
+
+        const forceLsp = !!route.params?.forceLsp;
+
+        const { lnOnly, onChainOnly } = this.getReceiveModeFlags();
+
+        // In on-chain-only mode the lightning leg is never displayed, so
+        // the LSP must not wrap it (or surface fee UI for it)
+        const lspIsActive =
+            (settings?.enableLSP || forceLsp) &&
+            BackendUtils.supportsFlowLSP() &&
+            !flowLspNotConfigured &&
+            !onChainOnly;
+
+        // Calculate invoice options once to avoid duplication
+        const routeHints =
+            (settings?.invoices?.routeHints ||
+                !this.props.ChannelsStore.haveAnnouncedChannels) &&
+            !(
+                settings?.invoices?.blindedPaths &&
+                BackendUtils.supportsBolt11BlindedRoutes()
+            );
+        const ampInvoice =
+            (settings?.invoices?.ampInvoice && BackendUtils.supportsAMP()) ||
+            false;
+        const blindedPaths =
+            (settings?.invoices?.blindedPaths &&
+                BackendUtils.supportsBolt11BlindedRoutes()) ||
+            false;
+
+        this.setState({
+            addressType: this.getAddressType(),
+            expirationIndex,
+            memo: settings?.invoices?.memo || '',
+            receiverName: settings?.invoices?.receiverName || '',
+            expiry: settings?.invoices?.expiry || '1',
+            timePeriod: settings?.invoices?.timePeriod || 'Hours',
+            expirySeconds: newExpirySeconds,
+            routeHints,
+            ampInvoice,
+            blindedPaths,
+            enableLSP: settings?.enableLSP || forceLsp,
+            lspIsActive,
+            flowLspNotConfigured
+        });
+
+        // Wallet only fetches LSP info (and peers with the LSP) when the
+        // persisted setting is enabled, so a forced session fetches it here
+        if (forceLsp && lspIsActive && !LSPStore.info?.pubkey) {
+            LSPStore.getLSPInfo().catch(() => {});
+        }
+
+        reset();
+
+        const {
+            lnurlParams: lnurl,
+            amount,
+            autoGenerate,
+            autoGenerateOnChain,
+            autoGenerateChange,
+            account,
+            selectedIndex,
+            hideRightHeaderComponent
+        } = route.params ?? {};
+
+        if (hideRightHeaderComponent) {
+            this.setState({ hideRightHeaderComponent });
+        }
+
+        if (account) {
+            this.setState({ account });
+        }
+
+        if (selectedIndex !== undefined) {
+            this.setState({ selectedIndex });
+        } else if (!lnOnly && !onChainOnly) {
+            this.setState({ selectedIndex: this.getDefaultIndex() });
+        }
+
+        const addressType = this.getAddressType();
+
+        // Non-default accounts exist under a single key scope; address
+        // requests must carry the matching type or lnd rejects them with
+        // "account not found" (ZEUS-2223 / ZEUS-2932)
+        let accountAddressType: string | undefined;
+        if (account && account !== 'default') {
+            accountAddressType =
+                toWalletrpcAddressTypeName(route.params?.addressType) ||
+                (await this.props.UTXOsStore.getAccountAddressType(account));
+            if (accountAddressType) this.setState({ accountAddressType });
+        }
+
+        // POS
+        const memo = route.params?.memo ?? this.state.memo;
+        const { orderId, orderTotal, orderTip, exchangeRate, rate } =
+            route.params ?? {};
+
+        if (orderId) {
+            this.setState({
+                orderId,
+                orderTotal,
+                orderTip,
+                exchangeRate,
+                rate
+            });
+        }
+
+        if (lnurl) {
+            this.props.UnitsStore.resetUnits();
+            let needInbound = false;
+            if (
+                this.state.lspIsActive &&
+                new BigNumber(getSatAmount(lnurl.maxWithdrawable / 1000)).gt(
+                    this.props.ChannelsStore.totalInbound
+                )
+            ) {
+                needInbound = true;
+            }
+            this.setState({
+                memo: lnurl.defaultDescription,
+                value: (lnurl.maxWithdrawable / 1000).toString(),
+                satAmount: getSatAmount(lnurl.maxWithdrawable / 1000),
+                needInbound
+            });
+        }
+
+        if (amount && amount != '0') {
+            let needInbound = false;
+            if (
+                this.state.lspIsActive &&
+                getSatAmount(amount) !== 0 &&
+                new BigNumber(getSatAmount(amount)).gt(
+                    this.props.ChannelsStore.totalInbound
+                )
+            ) {
+                needInbound = true;
+            }
+            this.setState({
+                value: amount,
+                satAmount: getSatAmount(amount),
+                needInbound
+            });
+        }
+
+        if (lnOnly) {
+            this.setState({
+                selectedIndex: 1
+            });
+        }
+
+        if (onChainOnly) {
+            this.setState({
+                selectedIndex: 2
+            });
+        }
+
+        if (autoGenerate) {
+            this.autoGenerateInvoice(
+                getSatAmount(amount).toString(),
+                memo,
+                newExpirySeconds,
+                routeHints,
+                ampInvoice,
+                blindedPaths,
+                addressType,
+                lspIsActive
+            );
+        }
+
+        const onChainType =
+            account && account !== 'default' ? accountAddressType : addressType;
+        if (autoGenerateChange) {
+            this.autoGenerateChange(account, onChainType);
+        } else if (autoGenerateOnChain) {
+            this.autoGenerateOnChainAddress(account, onChainType);
+        }
+
+        this.setState({
+            initialLoad: false
+        });
+
+        if (Platform.OS !== 'android') {
+            return;
+        }
+
+        try {
+            const nfcSupported = await NfcManager.isSupported();
+            this.setState({ nfcSupported });
+        } catch {
+            this.setState({ nfcSupported: false });
+        }
+    }
+
+    async componentDidUpdate(prevProps: ReceiveProps) {
+        const { route, InvoicesStore } = this.props;
+        const { route: prevRoute } = prevProps;
+
+        if (route.params?.amount !== prevRoute.params?.amount) {
+            const { reset } = InvoicesStore;
+
+            reset();
+            const { amount, lnurlParams: lnurl } = route.params ?? {};
+
+            if (amount && amount != '0') {
+                let needInbound = false;
+                if (
+                    this.state.lspIsActive &&
+                    getSatAmount(amount) !== 0 &&
+                    new BigNumber(getSatAmount(amount)).gt(
+                        this.props.ChannelsStore.totalInbound
+                    )
+                ) {
+                    needInbound = true;
+                }
+                this.setState({
+                    value: amount,
+                    satAmount: getSatAmount(amount),
+                    needInbound
+                });
+            }
+
+            if (lnurl) {
+                let needInbound = false;
+                if (
+                    this.state.lspIsActive &&
+                    new BigNumber(
+                        getSatAmount(lnurl.maxWithdrawable / 1000)
+                    ).gt(this.props.ChannelsStore.totalInbound)
+                ) {
+                    needInbound = true;
+                }
+                this.setState({
+                    memo: lnurl.defaultDescription,
+                    value: (lnurl.maxWithdrawable / 1000).toString(),
+                    satAmount: getSatAmount(lnurl.maxWithdrawable / 1000),
+                    needInbound
+                });
+            }
+        }
+    }
+
+    componentWillUnmount() {
+        this.unmounted = true;
+        this.cleanup();
+    }
+
+    stopInvoiceWatcher = () => {
+        if (this.unsubscribeInvoiceWatch) {
+            this.unsubscribeInvoiceWatch();
+            this.unsubscribeInvoiceWatch = null;
+        }
+    };
+
+    stopOnchainWatcher = () => {
+        if (this.unsubscribeOnchainWatch) {
+            this.unsubscribeOnchainWatch();
+            this.unsubscribeOnchainWatch = null;
+        }
+    };
+
+    stopWatchers = () => {
+        this.stopInvoiceWatcher();
+        this.stopOnchainWatcher();
+    };
+
+    cleanup = () => {
+        // Cancel keeps the view mounted: an invoice request or NFC lookup
+        // still pending must not start a watcher, submit an invoice or
+        // open a screen afterwards
+        this.invoiceRequestId++;
+        this.nfcLookupId++;
+
+        // kill all listeners and pollers
+        this.stopWatchers();
+
+        // clear invoice
+        this.props.InvoicesStore.reset();
+
+        // clear any LSP errors
+        this.props.LSPStore.reset(true);
+    };
+
+    onBack = () => {
+        this.cleanup();
+    };
+
+    autoGenerateInvoice = (
+        amount?: string,
+        memo?: string,
+        expirySeconds?: string,
+        routeHints?: boolean,
+        ampInvoice?: boolean,
+        blindedPaths?: boolean,
+        addressType?: string,
+        lspIsActive?: boolean
+    ) => {
+        const { InvoicesStore, PosStore } = this.props;
+        const { receiverName, orderId, orderTip, exchangeRate } = this.state;
+        // Use passed lspIsActive parameter, fall back to state if not provided
+        const effectiveLspIsActive = lspIsActive ?? this.state.lspIsActive;
+        const { createUnifiedInvoice } = InvoicesStore;
+        const skipOnchain = this.getSkipOnchain();
+        const isCurrent = this.startInvoiceRequest();
+
+        // Set synchronously so componentDidMount's initialLoad flip sees
+        // creatingInvoice=true before the checkExistingInvoice microtask runs.
+        InvoicesStore.creatingInvoice = true;
+
+        // POS invoice reuse logic
+        const checkExistingInvoice = async () => {
+            if (orderId) {
+                try {
+                    const existingInvoice = await PosStore.getOrderInvoiceById(
+                        orderId
+                    );
+                    if (!isCurrent()) return false;
+                    if (
+                        existingInvoice &&
+                        PosStore.canReuseInvoice(
+                            existingInvoice,
+                            amount || '0',
+                            orderTip,
+                            exchangeRate
+                        )
+                    ) {
+                        // Reuse existing invoice
+                        InvoicesStore.showStoredInvoice({
+                            paymentRequest: existingInvoice.payment_request,
+                            amount: existingInvoice.amount,
+                            // records from before the fee was stored
+                            // show no fee rather than another quote's
+                            lspFeeSats: existingInvoice.lspFeeSats ?? null
+                        });
+                        this.subscribeInvoice(existingInvoice.rHash);
+                        return true;
+                    }
+                } catch (error) {
+                    console.warn('Error checking existing invoice:', error);
+                }
+            }
+            return false;
+        };
+
+        checkExistingInvoice().then((canReuseInvoice) => {
+            if (!isCurrent()) return;
+            if (canReuseInvoice) {
+                InvoicesStore.creatingInvoice = false;
+                return;
+            }
+
+            createUnifiedInvoice({
+                memo: effectiveLspIsActive
+                    ? ''
+                    : receiverName
+                    ? `${receiverName}:  ${memo}`
+                    : memo || '',
+                value: amount || '0',
+                expirySeconds: effectiveLspIsActive
+                    ? LOCKED_EXPIRY_SECONDS
+                    : expirySeconds || '3600',
+                ampInvoice: effectiveLspIsActive ? false : ampInvoice || false,
+                blindedPaths: effectiveLspIsActive
+                    ? false
+                    : blindedPaths || false,
+                routeHints,
+                addressType: BackendUtils.supportsAddressTypeSelection()
+                    ? addressType || '1'
+                    : undefined,
+                noLsp: !effectiveLspIsActive,
+                forceLsp: !!this.props.route.params?.forceLsp,
+                useLsp: effectiveLspIsActive,
+                skipOnchain,
+                ...this.getUnifiedAccountParams()
+            })
+                .then(
+                    ({
+                        rHash,
+                        paymentRequest,
+                        onChainAddress,
+                        lspFeeSats
+                    }: {
+                        rHash: string;
+                        paymentRequest: string;
+                        onChainAddress?: string;
+                        lspFeeSats?: number | null;
+                    }) => {
+                        if (!isCurrent()) return;
+                        // Store invoice for POS orders
+                        if (orderId && paymentRequest) {
+                            PosStore.recordInvoice({
+                                orderId,
+                                payment_request: paymentRequest,
+                                lspFeeSats,
+                                rHash,
+                                exchangeRate,
+                                amount: amount || '0',
+                                tip: orderTip,
+                                createdAt: Math.floor(Date.now() / 1000),
+                                expirySeconds: expirySeconds || '3600'
+                            });
+                        }
+                        this.subscribeInvoice(rHash, onChainAddress);
+                    }
+                )
+                .catch(() => {
+                    // errors are surfaced via LSPStore/InvoicesStore observables
+                });
+        });
+    };
+
+    // For non-default accounts the on-chain leg of a unified invoice must
+    // come from that account, with its own address type (ZEUS-2223)
+    private getUnifiedAccountParams = () => {
+        const { account, accountAddressType } = this.state;
+        return account !== 'default'
+            ? { account, addressType: accountAddressType }
+            : {};
+    };
+
+    // For non-default accounts, only an account-derived address type may be
+    // sent; the picker/settings default can point at the wrong key scope
+    private buildAddressRequest = (account?: string, address_type?: string) => {
+        const request: any = {};
+        if (account && account !== 'default') {
+            request.account = account;
+            if (address_type) request.type = address_type;
+        } else {
+            request.type = address_type || this.state.addressType;
+            if (account) request.account = account;
+        }
+        return request;
+    };
+
+    autoGenerateOnChainAddress = (account?: string, address_type?: string) => {
+        const { getNewAddress } = this.props.InvoicesStore;
+
+        getNewAddress(this.buildAddressRequest(account, address_type)).then(
+            (onChainAddress: string) => {
+                this.subscribeInvoice(undefined, onChainAddress);
+            }
+        );
+    };
+
+    autoGenerateChange = (account?: string, address_type?: string) => {
+        const { getNewChangeAddress } = this.props.InvoicesStore;
+
+        getNewChangeAddress(
+            this.buildAddressRequest(account, address_type)
+        ).then((onChainAddress: string) => {
+            this.subscribeInvoice(undefined, onChainAddress);
+        });
+    };
+
+    // An LNURL-withdraw invoice is submitted as soon as it is created, so the
+    // LSP fee has to be accepted before that rather than shown next to it.
+    // A fee that the amount doesn't cover is added on top, as InvoicesStore
+    // prices it.
+    confirmLspFee = (feeSats: number, amountSats: string) => {
+        const amount = new BigNumber(amountSats);
+        const message = amount.gt(feeSats)
+            ? localeString('views.Receive.lspFeeConfirmWithdrawal')
+                  .replace('{fee}', numberWithCommas(feeSats))
+                  .replace(
+                      '{amount}',
+                      numberWithCommas(amount.minus(feeSats).toString())
+                  )
+            : localeString('views.Receive.lspFeeOnTopConfirmWithdrawal')
+                  .replace('{fee}', numberWithCommas(feeSats))
+                  .replace(
+                      '{total}',
+                      numberWithCommas(amount.plus(feeSats).toString())
+                  )
+                  .replace('{amount}', numberWithCommas(amount.toString()));
+        return new Promise<boolean>((resolve) => {
+            Alert.alert(
+                localeString('general.lsp'),
+                message,
+                [
+                    {
+                        text: localeString('general.cancel'),
+                        style: 'cancel',
+                        onPress: () => resolve(false)
+                    },
+                    {
+                        text: localeString('general.confirm'),
+                        onPress: () => resolve(true)
+                    }
+                ],
+                { cancelable: false }
+            );
+        });
+    };
+
+    scanNfc = async () => {
+        const str = await scanNfcTag(this.props.ModalStore, 'withdraw');
+        if (!str || this.unmounted) return;
+        this.setState({ nfcError: false });
+        this.validateAddress(str);
+    };
+
+    validateAddress = (text: string) => {
+        const { navigation, InvoicesStore } = this.props;
+        // route.params.amount is in the display unit that was active when it
+        // was passed, and the amount under the QR code toggles that unit:
+        // use the sats it was converted to back then
+        const { lspIsActive, receiverName, satAmount } = this.state;
+        const { createUnifiedInvoice } = InvoicesStore;
+        const skipOnchain = this.getSkipOnchain();
+        // taken before the lookup: a newer tap, invoice or Cancel while the
+        // tag's LNURL server is answering supersedes this tap
+        const lookupIsCurrent = this.startNfcLookup();
+
+        handleAnything(text, satAmount.toString())
+            .then((response) => {
+                // the tag's LNURL server decides when this runs
+                if (!lookupIsCurrent()) return;
+                try {
+                    const [route, props] = response;
+                    const { lnurlParams } = props;
+                    // outside POS mode a tag can also hold an ecash token:
+                    // open it on the screen a cashu: link opens
+                    if (
+                        route === 'CashuToken' &&
+                        this.props.SettingsStore.posStatus !== 'active'
+                    ) {
+                        navigation.navigate(route, props);
+                        return;
+                    }
+                    // otherwise NFC reads here are for LNURL-withdraw (e.g. a
+                    // Bolt Card) only; tell staff about anything else
+                    if (!isNfcWithdraw(route, lnurlParams)) {
+                        this.setState({ nfcError: true });
+                        return;
+                    }
+                    const { memo } = lnurlParams.defaultDescription;
+
+                    // if an amount was entered on the keypad screen before scanning
+                    // we will automatically create an invoice and attempt to withdraw
+                    // otherwise we present the user with the create invoice screen
+                    if (Number(satAmount) > 0) {
+                        const isCurrent = this.startInvoiceRequest();
+                        createUnifiedInvoice({
+                            memo: lspIsActive
+                                ? ''
+                                : receiverName
+                                ? `${receiverName}:  ${memo}`
+                                : memo,
+                            value: satAmount.toString(),
+                            expirySeconds: '3600',
+                            lnurl: lnurlParams,
+                            noLsp: !lspIsActive,
+                            forceLsp: !!this.props.route.params?.forceLsp,
+                            useLsp: lspIsActive,
+                            confirmLspFee: this.confirmLspFee,
+                            skipOnchain,
+                            ...this.getUnifiedAccountParams()
+                        })
+                            .then(
+                                ({
+                                    rHash,
+                                    onChainAddress
+                                }: {
+                                    rHash: string;
+                                    onChainAddress?: string;
+                                }) => {
+                                    if (!isCurrent()) return;
+                                    this.subscribeInvoice(
+                                        rHash,
+                                        onChainAddress
+                                    );
+                                }
+                            )
+                            .catch(() => {
+                                if (!isCurrent()) return;
+                                navigation.navigate(route, {
+                                    satAmount,
+                                    ...props
+                                });
+                            });
+                    } else {
+                        navigation.navigate(route, props);
+                    }
+                } catch (e) {}
+            })
+            .catch((e) => {
+                if (!lookupIsCurrent()) return;
+                // a host policy refusal is not a card that cannot pay
+                if (isUnsafeLnurlError(e)) {
+                    Alert.alert(localeString('general.error'), e.message);
+                    return;
+                }
+                this.setState({ nfcError: true });
+            });
+    };
+
+    handlePaymentReceived = (
+        amount: number,
+        posPayment?: {
+            type: 'ln' | 'onchain';
+            tx: string;
+            preimage?: string;
+        }
+    ) => {
+        const { InvoicesStore, PosStore, BalanceStore, ChannelsStore } =
+            this.props;
+        const { orderId, orderTotal, orderTip, exchangeRate, rate } =
+            this.state;
+
+        // a watcher callback that was in flight when the watchers were
+        // stopped must not mark the next view's invoice as paid
+        if (!this.unmounted) InvoicesStore.setWatchedInvoicePaid(amount);
+        BalanceStore.getCombinedBalance();
+
+        if (
+            posPayment?.type === 'ln' &&
+            BackendUtils.supportsChannelManagement()
+        ) {
+            ChannelsStore.getChannels();
+        }
+
+        if (orderId && posPayment) {
+            PosStore.recordPayment({
+                orderId,
+                orderTotal,
+                orderTip,
+                exchangeRate,
+                rate,
+                ...posPayment
+            });
+            // Clear stored invoice after successful payment
+            PosStore.clearOrderInvoice(orderId);
+        }
+    };
+
+    subscribeInvoice = (rHash?: string, onChainAddress?: string) => {
+        if (this.unmounted) return;
+
+        const { SettingsStore, NodeInfoStore } = this.props;
+        // the on-chain watcher compares against sats; state.value is in the
+        // display unit (sats, BTC, or fiat)
+        const { satAmount } = this.state;
+        const { settings } = SettingsStore;
+        const { nodeInfo } = NodeInfoStore;
+
+        const numConfPreference =
+            settings.pos && settings.pos.confirmationPreference === '1conf'
+                ? 1
+                : 0;
+
+        if (rHash) {
+            this.stopInvoiceWatcher();
+            const unsubscribe = BackendUtils.watchInvoicePaid(
+                { rHash },
+                ({
+                    amountSat,
+                    tx,
+                    preimage
+                }: {
+                    amountSat: number;
+                    tx?: string;
+                    preimage?: string;
+                }) => {
+                    this.stopWatchers();
+                    this.handlePaymentReceived(amountSat, {
+                        type: 'ln',
+                        tx: tx || '',
+                        preimage
+                    });
+                }
+            );
+            // backends without real-time payment detection return
+            // false from the dispatcher
+            if (typeof unsubscribe === 'function')
+                this.unsubscribeInvoiceWatch = unsubscribe;
+        }
+
+        if (onChainAddress) {
+            this.stopOnchainWatcher();
+            const unsubscribe = BackendUtils.watchOnchainReceived(
+                {
+                    address: onChainAddress,
+                    expectedAmountSat: satAmount,
+                    numConfPreference,
+                    blockHeight: nodeInfo?.block_height
+                },
+                ({ amountSat, txid }: { amountSat: number; txid: string }) => {
+                    this.stopWatchers();
+                    this.handlePaymentReceived(amountSat, {
+                        type: 'onchain',
+                        tx: txid
+                    });
+                }
+            );
+            if (typeof unsubscribe === 'function')
+                this.unsubscribeOnchainWatch = unsubscribe;
+        }
+    };
+
+    updateExpirationIndex = (expirationIndex: number) => {
+        if (expirationIndex === 0) {
+            this.setState({
+                expirySeconds: '600',
+                expiry: '10',
+                timePeriod: 'Minutes',
+                expirationIndex: 0
+            });
+        } else if (expirationIndex === 1) {
+            this.setState({
+                expirySeconds: '3600',
+                expiry: '1',
+                timePeriod: 'Hours',
+                expirationIndex: 1
+            });
+        } else if (expirationIndex === 2) {
+            this.setState({
+                expirySeconds: '86400',
+                expiry: '1',
+                timePeriod: 'Days',
+                expirationIndex: 2
+            });
+        } else if (expirationIndex === 3) {
+            this.setState({
+                expirySeconds: '604800',
+                expiry: '1',
+                timePeriod: 'Weeks',
+                expirationIndex: 3
+            });
+        }
+    };
+
+    updateIndex = async (selectedIndex: number) => {
+        const { InvoicesStore } = this.props;
+        const { onChainAddress, payment_request, getNewAddress } =
+            InvoicesStore;
+        const { addressType, account, accountAddressType } = this.state;
+
+        this.setState({
+            selectedIndex
+        });
+
+        // If switching to unified or on-chain and there's a lightning invoice
+        // but no on-chain address, generate one and watch it for payment
+        // alongside the invoice
+        if (
+            (selectedIndex === 0 || selectedIndex === 2) &&
+            payment_request &&
+            !onChainAddress &&
+            BackendUtils.supportsOnchainReceiving()
+        ) {
+            const address = await getNewAddress(
+                this.buildAddressRequest(
+                    account,
+                    account !== 'default' ? accountAddressType : addressType
+                )
+            );
+            // an invoice paid while the request was in flight is done: don't
+            // start an on-chain watcher behind the paid screen
+            if (address && !InvoicesStore.watchedInvoicePaid) {
+                this.subscribeInvoice(undefined, address);
+            }
+        }
+    };
+
+    private modalBoxRef = React.createRef<ModalBox>();
+
+    getFormattedDuration = () => {
+        const { expiry, timePeriod, lspIsActive } = this.state;
+
+        const expiryDisplay = lspIsActive ? LOCKED_EXPIRY : expiry;
+        const periodDisplay = lspIsActive ? LOCKED_TIME_PERIOD : timePeriod;
+
+        return localizedExpiryDuration(expiryDisplay, periodDisplay);
+    };
+
+    render() {
+        const {
+            InvoicesStore,
+            SettingsStore,
+            UnitsStore,
+            LightningAddressStore,
+            LSPStore,
+            NodeInfoStore,
+            navigation,
+            route
+        } = this.props;
+        const {
+            selectedIndex,
+            expirationIndex,
+            addressType,
+            memo,
+            receiverName,
+            value,
+            satAmount,
+            expiry,
+            timePeriod,
+            expirySeconds,
+            customPreimage,
+            ampInvoice,
+            routeHints,
+            account,
+            needInbound,
+            enableLSP,
+            lspIsActive,
+            flowLspNotConfigured,
+            routeHintMode,
+            selectedRouteHintChannels,
+            blindedPaths,
+            hideRightHeaderComponent,
+            nfcSupported,
+            showAdvanced
+        } = this.state;
+
+        const { showLspSettings } = LSPStore;
+        // the fee the shown invoice was priced with, not LSPStore.zeroConfFee,
+        // which a later fee request can replace while this invoice is shown
+        const zeroConfFee = InvoicesStore.payment_request_lsp_fee ?? undefined;
+        const requiresChannelSetup =
+            !!zeroConfFee &&
+            new BigNumber(zeroConfFee).gte(LSP_MIN_CHANNEL_OPEN_FEE_SATS);
+
+        const {
+            createUnifiedInvoice,
+            onChainAddress,
+            payment_request,
+            payment_request_amt,
+            creatingInvoice,
+            creatingInvoiceError,
+            watchedInvoicePaid,
+            watchedInvoicePaidAmt,
+            clearUnified
+        } = InvoicesStore;
+
+        // when the invoice amount doesn't cover the LSP's fee, the fee is
+        // added on top of the wrapped invoice and charged to the sender
+        const feeOnTop =
+            !!zeroConfFee &&
+            !!payment_request_amt &&
+            !new BigNumber(payment_request_amt).gt(zeroConfFee);
+        // the wrapped invoice is for amount + fee, so display the total
+        // the sender will actually pay
+        const displaySatAmount = feeOnTop
+            ? new BigNumber(satAmount).plus(zeroConfFee).toString()
+            : satAmount;
+
+        const { implementation, posStatus, settings, updateSettings } =
+            SettingsStore;
+        const loading =
+            SettingsStore.loading ||
+            InvoicesStore.loading ||
+            this.state.initialLoad;
+        const address = onChainAddress;
+        const { lightningAddress } = LightningAddressStore;
+        const lightningAddressLoading = LightningAddressStore.loading;
+
+        const lspErrorMsg = LSPStore.flow_error_msg;
+        const invoiceErrorMsg = InvoicesStore.error_msg;
+
+        const showCustomPreimageField =
+            settings?.invoices?.showCustomPreimageField;
+
+        // The defaultInvoiceType preference must not suppress the on-chain
+        // leg while the user is looking at the on-chain pane: in forced
+        // on-chain mode (account receive, on-chain slider action) there are
+        // no tabs whose switch would trigger generation later, leaving the
+        // pane permanently blank
+        const skipOnchain = this.getSkipOnchain() && selectedIndex !== 2;
+
+        const { lnOnly, onChainOnly } = this.getReceiveModeFlags();
+
+        const lnurl = route.params?.lnurlParams;
+
+        const ClearButton = () => (
+            <Icon
+                name="cancel"
+                onPress={() => {
+                    if (route.params?.selectedIndex !== undefined) {
+                        this.setState({
+                            account: 'default',
+                            selectedIndex: route.params.selectedIndex
+                        });
+                    } else if (!lnOnly && !onChainOnly) {
+                        this.setState({
+                            account: 'default',
+                            selectedIndex: this.getDefaultIndex()
+                        });
+                    }
+
+                    this.cleanup();
+                }}
+                color={themeColor('text')}
+                underlayColor="transparent"
+                size={30}
+            />
+        );
+
+        const SettingsButton = () => (
+            <TouchableOpacity onPress={() => this.modalBoxRef.current?.open()}>
+                <Gear
+                    style={{ alignSelf: 'center' }}
+                    fill={themeColor('text')}
+                />
+            </TouchableOpacity>
+        );
+
+        const ADDRESS_TYPES = [];
+
+        if (BackendUtils.supportsNestedSegWit()) {
+            ADDRESS_TYPES.push({
+                key: localeString('views.Receive.np2wkhKey'),
+                value: '1',
+                description: BackendUtils.supportsTaproot()
+                    ? localeString('views.Receive.np2wkhDescription')
+                    : localeString('views.Receive.np2wkhDescriptionAlt')
+            });
+        }
+
+        ADDRESS_TYPES.push({
+            key: localeString('views.Receive.p2wkhKey'),
+            value: '0',
+            description: localeString('views.Receive.p2wkhDescription')
+        });
+
+        if (BackendUtils.supportsTaproot()) {
+            ADDRESS_TYPES.push({
+                key: localeString('views.Receive.p2trKey'),
+                value: '4',
+                description: localeString('views.Receive.p2trDescription')
+            });
+        }
+
+        const unifiedButton = () => (
+            <React.Fragment>
+                <UnifiedSvg
+                    circle={false}
+                    selected={selectedIndex === 0 ? true : false}
+                />
+                <Text
+                    style={{
+                        color:
+                            selectedIndex === 0
+                                ? themeColor('background')
+                                : themeColor('text'),
+                        fontFamily: 'PPNeueMontreal-Book'
+                    }}
+                >
+                    {localeString('general.unified')}
+                </Text>
+            </React.Fragment>
+        );
+
+        const lightningButton = () => (
+            <React.Fragment>
+                <LightningSvg
+                    width={50}
+                    height={50}
+                    circle={false}
+                    selected={selectedIndex === 1 ? true : false}
+                />
+                <Text
+                    style={{
+                        color:
+                            selectedIndex === 1
+                                ? themeColor('background')
+                                : themeColor('text'),
+                        fontFamily: 'PPNeueMontreal-Book'
+                    }}
+                >
+                    {localeString('general.lightning')}
+                </Text>
+            </React.Fragment>
+        );
+
+        const onChainButton = () => (
+            <React.Fragment>
+                <OnChainSvg
+                    width={50}
+                    height={50}
+                    circle={false}
+                    selected={selectedIndex === 2 ? true : false}
+                />
+                <Text
+                    style={{
+                        color:
+                            selectedIndex === 2
+                                ? themeColor('background')
+                                : themeColor('text'),
+                        fontFamily: 'PPNeueMontreal-Book'
+                    }}
+                >
+                    {localeString('general.onchain')}
+                </Text>
+            </React.Fragment>
+        );
+
+        const lightningAddressButton = () => (
+            <React.Fragment>
+                <AddressSvg
+                    circle={false}
+                    selected={selectedIndex === 3 ? true : false}
+                />
+                <Text
+                    style={{
+                        color:
+                            selectedIndex === 3
+                                ? themeColor('background')
+                                : themeColor('text'),
+                        fontFamily: 'PPNeueMontreal-Book'
+                    }}
+                >
+                    {localeString('general.lightningAddressCondensed')}
+                </Text>
+            </React.Fragment>
+        );
+
+        const buttons: any =
+            BackendUtils.supportsLightningAddress() && !NodeInfoStore.testnet
+                ? [
+                      { element: unifiedButton },
+                      { element: lightningButton },
+                      { element: onChainButton },
+                      { element: lightningAddressButton }
+                  ]
+                : [
+                      { element: unifiedButton },
+                      { element: lightningButton },
+                      { element: onChainButton }
+                  ];
+
+        const haveUnifiedInvoice = !!payment_request && !!address;
+        const haveInvoice = !!payment_request || !!address;
+
+        let unifiedInvoice,
+            lnInvoice,
+            lnInvoiceCopyValue,
+            btcAddress,
+            btcAddressCopyValue;
+        if (haveUnifiedInvoice) {
+            unifiedInvoice = buildUnifiedUri({
+                address,
+                paymentRequest: payment_request,
+                satAmount,
+                memo
+            });
+        }
+
+        if (payment_request) {
+            lnInvoice = `lightning:${payment_request.toUpperCase()}`;
+            lnInvoiceCopyValue = payment_request;
+        }
+
+        if (address) {
+            btcAddress = buildOnChainUri({ address, satAmount, memo });
+
+            if (Number(satAmount) > 0 || memo) {
+                btcAddressCopyValue = btcAddress;
+            } else {
+                btcAddressCopyValue = address;
+            }
+        }
+
+        const belowDustLimit: boolean =
+            Number(satAmount) !== 0 && Number(satAmount) < 546;
+
+        const windowSize = Dimensions.get('window');
+
+        const tenMButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 0
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.10min')}
+            </Text>
+        );
+        const oneHButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 1
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.1H')}
+            </Text>
+        );
+        const oneDButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 2
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.1D')}
+            </Text>
+        );
+        const oneWButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 3
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.1W')}
+            </Text>
+        );
+
+        const expirationButtons: any = [
+            { element: tenMButton },
+            { element: oneHButton },
+            { element: oneDButton },
+            { element: oneWButton }
+        ];
+
+        const routeHintModeButtons: any = [
+            {
+                element: () => (
+                    <Text
+                        style={{
+                            fontFamily: 'PPNeueMontreal-Book',
+                            color:
+                                routeHintMode === RouteHintMode.Automatic
+                                    ? themeColor('background')
+                                    : themeColor('text')
+                        }}
+                    >
+                        {localeString('general.automatic')}
+                    </Text>
+                )
+            },
+            {
+                element: () => (
+                    <Text
+                        style={{
+                            fontFamily: 'PPNeueMontreal-Book',
+                            color:
+                                routeHintMode === RouteHintMode.Custom
+                                    ? themeColor('background')
+                                    : themeColor('text')
+                        }}
+                    >
+                        {localeString('general.custom')}
+                    </Text>
+                )
+            }
+        ];
+
+        const setRouteHintMode = (mode: RouteHintMode) => {
+            if (this.state.routeHintMode === mode) {
+                return;
+            }
+            this.setState({
+                routeHintMode: mode
+            });
+            if (
+                mode === RouteHintMode.Custom &&
+                (!selectedRouteHintChannels ||
+                    selectedRouteHintChannels.length === 0)
+            ) {
+                this.hopPickerRef?.openPicker();
+            }
+        };
+
+        const enablePrinter: boolean = settings?.pos?.enablePrinter || false;
+
+        // Advanced settings only affect the lightning invoice, which is
+        // never displayed in on-chain-only mode
+        const showAdvancedSettingsToggle =
+            !onChainOnly &&
+            ((BackendUtils.supportsCustomPreimages() &&
+                showCustomPreimageField) ||
+                (BackendUtils.isLNDBased() && !lspIsActive) ||
+                (BackendUtils.supportsAMP() && !lspIsActive) ||
+                (BackendUtils.supportsBolt11BlindedRoutes() && !lspIsActive));
+
+        const baseModalHeight = 300;
+        const itemHeight = ADDRESS_TYPES.length <= 2 ? 25 : 50;
+        const modalHeight = baseModalHeight + ADDRESS_TYPES.length * itemHeight;
+
+        const showButtonGroup =
+            !belowDustLimit &&
+            !lnOnly &&
+            !onChainOnly &&
+            !watchedInvoicePaid &&
+            haveInvoice;
+
+        const showNfcButton =
+            !(
+                selectedIndex === 3 &&
+                (!lightningAddress || lightningAddressLoading)
+            ) && nfcSupported;
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    onBack={this.onBack}
+                    centerComponent={{
+                        text:
+                            posStatus === 'active'
+                                ? localeString('general.pay')
+                                : localeString('views.Receive.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <Row>
+                            {loading && (
+                                <View style={{ marginRight: 10 }}>
+                                    <LoadingIndicator size={30} />
+                                </View>
+                            )}
+                            {watchedInvoicePaid ||
+                            posStatus === 'active' ||
+                            hideRightHeaderComponent ? undefined : route.params
+                                  ?.selectedIndex === 2 ? (
+                                BackendUtils.supportsAddressTypeSelection() &&
+                                account === 'default' ? (
+                                    <SettingsButton />
+                                ) : undefined
+                            ) : haveInvoice ? (
+                                selectedIndex === 2 ? (
+                                    BackendUtils.supportsAddressTypeSelection() &&
+                                    account === 'default' ? (
+                                        <SettingsButton />
+                                    ) : (
+                                        <ClearButton />
+                                    )
+                                ) : (
+                                    <ClearButton />
+                                )
+                            ) : !creatingInvoice &&
+                              BackendUtils.supportsAddressTypeSelection() &&
+                              account === 'default' &&
+                              !route.params?.forceLn &&
+                              (selectedIndex === 2 || selectedIndex === 1) ? (
+                                <SettingsButton />
+                            ) : undefined}
+                        </Row>
+                    }
+                    navigation={navigation}
+                />
+                <View style={{ flex: 1 }}>
+                    {watchedInvoicePaid ? (
+                        <View
+                            style={{
+                                alignItems: 'center',
+                                justifyContent: 'space-evenly',
+                                height: '100%'
+                            }}
+                        >
+                            <PaidIndicator />
+                            <Wordmark
+                                height={windowSize.width * 0.25}
+                                width={windowSize.width}
+                                fill={themeColor('highlight')}
+                            />
+                            <SuccessAnimation />
+                            <View style={{ alignItems: 'center' }}>
+                                <>
+                                    <Text
+                                        style={{
+                                            ...styles.text,
+                                            fontSize:
+                                                windowSize.width *
+                                                windowSize.scale *
+                                                0.017,
+                                            alignSelf: 'center',
+                                            color: themeColor('text'),
+                                            textAlign: 'center'
+                                        }}
+                                    >
+                                        {posStatus === 'active'
+                                            ? localeString(
+                                                  'views.Wallet.Invoices.paid'
+                                              )
+                                            : `${localeString(
+                                                  'views.Receive.youReceived'
+                                              )} ${getAmountFromSats(
+                                                  watchedInvoicePaidAmt ||
+                                                      payment_request_amt ||
+                                                      ''
+                                              )}`}
+                                    </Text>
+                                </>
+                            </View>
+                            {posStatus === 'active' &&
+                                Platform.OS === 'android' &&
+                                enablePrinter && (
+                                    <Button
+                                        title={localeString(
+                                            'pos.views.Order.printReceipt'
+                                        )}
+                                        secondary
+                                        icon={{ name: 'print', size: 25 }}
+                                        onPress={() =>
+                                            navigation.navigate('Order', {
+                                                order: route?.params?.order,
+                                                orderId: this.state.orderId,
+                                                print: true
+                                            })
+                                        }
+                                    />
+                                )}
+                            <Button
+                                title={
+                                    posStatus === 'active'
+                                        ? localeString('general.goBack')
+                                        : localeString(
+                                              'views.SendingLightning.goToWallet'
+                                          )
+                                }
+                                icon={{
+                                    name: 'list',
+                                    size: 25
+                                }}
+                                onPress={() => navigation.popTo('Wallet')}
+                                containerStyle={{ width: '100%' }}
+                            />
+                        </View>
+                    ) : (
+                        <ScrollView
+                            style={styles.content}
+                            keyboardShouldPersistTaps="handled"
+                            keyboardDismissMode="on-drag"
+                        >
+                            {creatingInvoiceError && (
+                                <ErrorMessage
+                                    message={localeString(
+                                        'views.Receive.errorCreate'
+                                    )}
+                                />
+                            )}
+                            {invoiceErrorMsg && (
+                                <ErrorMessage
+                                    message={invoiceErrorMsg}
+                                    dismissable
+                                />
+                            )}
+                            {this.state.nfcError && (
+                                <ErrorMessage
+                                    message={localeString(
+                                        'views.Receive.nfcNotWithdraw'
+                                    )}
+                                />
+                            )}
+
+                            {lspErrorMsg &&
+                                lspIsActive &&
+                                (selectedIndex === 0 ||
+                                    selectedIndex === 1) && (
+                                    <ErrorMessage
+                                        message={lspErrorMsg}
+                                        dismissable
+                                    />
+                                )}
+
+                            {showLspSettings &&
+                                lspIsActive &&
+                                (selectedIndex === 0 ||
+                                    selectedIndex === 1) && (
+                                    <View style={{ margin: 10 }}>
+                                        <Button
+                                            title={localeString(
+                                                'views.Receive.goToLspSettings'
+                                            )}
+                                            onPress={() =>
+                                                navigation.navigate(
+                                                    'LSPSettings'
+                                                )
+                                            }
+                                        />
+                                    </View>
+                                )}
+
+                            <View>
+                                {!!payment_request && (
+                                    <>
+                                        {implementation === 'lndhub' &&
+                                            !!address &&
+                                            !belowDustLimit && (
+                                                <WarningMessage
+                                                    message={localeString(
+                                                        'views.Receive.warningLndHub'
+                                                    )}
+                                                />
+                                            )}
+                                        {!!lnurl && (
+                                            <SuccessMessage
+                                                message={
+                                                    !!lnurl &&
+                                                    `${localeString(
+                                                        'views.Receive.successCreate'
+                                                    )} ${localeString(
+                                                        'views.Receive.andSentTo'
+                                                    )} ${lnurl.domain}`
+                                                }
+                                            />
+                                        )}
+                                    </>
+                                )}
+                                {creatingInvoice && (
+                                    <View style={{ marginTop: 40 }}>
+                                        <LoadingIndicator />
+                                    </View>
+                                )}
+                                {haveInvoice && account !== 'default' && (
+                                    <WarningMessage
+                                        message={`${localeString(
+                                            'general.externalAccount'
+                                        )}: ${account}`}
+                                    />
+                                )}
+                                {haveInvoice &&
+                                    lspIsActive &&
+                                    satAmount === '0' &&
+                                    (selectedIndex === 0 ||
+                                        selectedIndex === 1) && (
+                                        <View
+                                            style={{
+                                                backgroundColor:
+                                                    themeColor('secondary'),
+                                                borderRadius: 10,
+                                                top: 10,
+                                                margin: 10,
+                                                padding: 15,
+                                                borderWidth: 0.5
+                                            }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    fontFamily:
+                                                        'PPNeueMontreal-Medium',
+                                                    color: themeColor('text'),
+                                                    fontSize: 15
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Receive.lspZeroAmt'
+                                                )}
+                                            </Text>
+                                        </View>
+                                    )}
+                                {haveInvoice &&
+                                    // a boolean: a fee of 0 must not become
+                                    // a bare text child of the View
+                                    !!zeroConfFee &&
+                                    zeroConfFee > 0 &&
+                                    (selectedIndex == 0 ||
+                                        selectedIndex == 1) && (
+                                        <TouchableOpacity
+                                            onPress={() =>
+                                                navigation.navigate(
+                                                    new BigNumber(
+                                                        zeroConfFee
+                                                    ).gte(
+                                                        LSP_MIN_CHANNEL_OPEN_FEE_SATS
+                                                    )
+                                                        ? 'LspExplanationFees'
+                                                        : 'LspExplanationRouting'
+                                                )
+                                            }
+                                        >
+                                            <View
+                                                style={{
+                                                    backgroundColor:
+                                                        themeColor('secondary'),
+                                                    borderColor:
+                                                        requiresChannelSetup
+                                                            ? themeColor(
+                                                                  'highlight'
+                                                              )
+                                                            : undefined,
+                                                    borderRadius: 10,
+                                                    top: 10,
+                                                    margin: 10,
+                                                    padding: 15,
+                                                    borderWidth: 0.5
+                                                }}
+                                            >
+                                                <Text
+                                                    style={{
+                                                        fontFamily:
+                                                            'PPNeueMontreal-Medium',
+                                                        color: themeColor(
+                                                            requiresChannelSetup
+                                                                ? 'highlight'
+                                                                : 'text'
+                                                        ),
+                                                        marginBottom: 5
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        new BigNumber(
+                                                            zeroConfFee
+                                                        ).gte(
+                                                            LSP_MIN_CHANNEL_OPEN_FEE_SATS
+                                                        )
+                                                            ? selectedIndex ===
+                                                              0
+                                                                ? 'views.Receive.lspExplainerUnified'
+                                                                : 'views.Receive.lspExplainer'
+                                                            : selectedIndex ===
+                                                              0
+                                                            ? 'views.Receive.lspExplainerRoutingUnified'
+                                                            : 'views.Receive.lspExplainerRouting'
+                                                    )}
+                                                </Text>
+                                                <Amount
+                                                    sats={zeroConfFee}
+                                                    fixedUnits="sats"
+                                                />
+                                                {feeOnTop && (
+                                                    <Text
+                                                        style={{
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Medium',
+                                                            color: themeColor(
+                                                                'text'
+                                                            ),
+                                                            marginTop: 5
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.Receive.lspFeeOnTop'
+                                                        )}
+                                                    </Text>
+                                                )}
+                                                <Text
+                                                    style={{
+                                                        fontFamily:
+                                                            'PPNeueMontreal-Medium',
+                                                        color: themeColor(
+                                                            'secondaryText'
+                                                        ),
+                                                        fontSize: 15,
+                                                        top: 5,
+                                                        textAlign: 'right'
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'general.tapToLearnMore'
+                                                    )}
+                                                </Text>
+                                            </View>
+                                        </TouchableOpacity>
+                                    )}
+                                {haveInvoice &&
+                                    zeroConfFee === 0 &&
+                                    (selectedIndex == 0 ||
+                                        selectedIndex == 1) && (
+                                        <TouchableOpacity
+                                            onPress={() =>
+                                                navigation.navigate(
+                                                    'LspExplanationWrappedInvoices'
+                                                )
+                                            }
+                                        >
+                                            <View
+                                                style={{
+                                                    backgroundColor:
+                                                        themeColor('secondary'),
+                                                    borderRadius: 10,
+                                                    top: 10,
+                                                    margin: 10,
+                                                    padding: 15,
+                                                    borderWidth: 0.5
+                                                }}
+                                            >
+                                                <Text
+                                                    style={{
+                                                        fontFamily:
+                                                            'PPNeueMontreal-Medium',
+                                                        color: themeColor(
+                                                            'text'
+                                                        ),
+                                                        marginBottom: 5
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'views.Receive.lspExplainerZeroFeeWrapper'
+                                                    )}
+                                                </Text>
+                                                <Text
+                                                    style={{
+                                                        fontFamily:
+                                                            'PPNeueMontreal-Medium',
+                                                        color: themeColor(
+                                                            'secondaryText'
+                                                        ),
+                                                        fontSize: 15,
+                                                        top: 5,
+                                                        textAlign: 'right'
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'general.tapToLearnMore'
+                                                    )}
+                                                </Text>
+                                            </View>
+                                        </TouchableOpacity>
+                                    )}
+                                {haveInvoice && !creatingInvoiceError && (
+                                    <View>
+                                        {selectedIndex == 0 &&
+                                            !belowDustLimit &&
+                                            haveUnifiedInvoice &&
+                                            !creatingInvoice && (
+                                                <CollapsedQR
+                                                    value={unifiedInvoice || ''}
+                                                    expanded
+                                                    textBottom
+                                                    truncateLongValue
+                                                    logo={
+                                                        themeColor(
+                                                            'invertQrIcons'
+                                                        )
+                                                            ? ZIconWhite
+                                                            : ZIcon
+                                                    }
+                                                    nfcSupported={nfcSupported}
+                                                    satAmount={displaySatAmount}
+                                                    displayAmount
+                                                />
+                                            )}
+                                        {selectedIndex == 1 &&
+                                            !belowDustLimit &&
+                                            haveUnifiedInvoice &&
+                                            !creatingInvoice && (
+                                                <CollapsedQR
+                                                    value={lnInvoice || ''}
+                                                    copyValue={
+                                                        lnInvoiceCopyValue
+                                                    }
+                                                    expanded
+                                                    textBottom
+                                                    truncateLongValue
+                                                    logo={
+                                                        themeColor(
+                                                            'invertQrIcons'
+                                                        )
+                                                            ? LightningIconWhite
+                                                            : LightningIcon
+                                                    }
+                                                    nfcSupported={nfcSupported}
+                                                    satAmount={displaySatAmount}
+                                                    displayAmount
+                                                />
+                                            )}
+                                        {selectedIndex == 2 &&
+                                            !belowDustLimit &&
+                                            btcAddress &&
+                                            !creatingInvoice && (
+                                                <CollapsedQR
+                                                    value={btcAddress}
+                                                    copyValue={
+                                                        btcAddressCopyValue
+                                                    }
+                                                    expanded
+                                                    textBottom
+                                                    truncateLongValue
+                                                    logo={
+                                                        themeColor(
+                                                            'invertQrIcons'
+                                                        )
+                                                            ? OnChainIconWhite
+                                                            : OnChainIcon
+                                                    }
+                                                    nfcSupported={nfcSupported}
+                                                    satAmount={
+                                                        Number(satAmount) > 0
+                                                            ? roundUpToWholeSats(
+                                                                  satAmount
+                                                              )
+                                                            : undefined
+                                                    }
+                                                    displayAmount
+                                                />
+                                            )}
+
+                                        {selectedIndex == 3 &&
+                                            !lightningAddressLoading &&
+                                            !lightningAddress && (
+                                                <View
+                                                    style={{
+                                                        marginTop: 20,
+                                                        marginBottom: 20
+                                                    }}
+                                                >
+                                                    <Button
+                                                        title={localeString(
+                                                            'views.Receive.createLightningAddress'
+                                                        )}
+                                                        onPress={() =>
+                                                            navigation.navigate(
+                                                                'LightningAddress'
+                                                            )
+                                                        }
+                                                    />
+                                                </View>
+                                            )}
+
+                                        {selectedIndex == 3 &&
+                                            !lightningAddressLoading &&
+                                            lightningAddress &&
+                                            !creatingInvoice && (
+                                                <CollapsedQR
+                                                    value={`lightning:${lightningAddress}`}
+                                                    copyValue={lightningAddress}
+                                                    expanded
+                                                    textBottom
+                                                    hideText
+                                                    labelBottom={
+                                                        lightningAddress
+                                                    }
+                                                    logo={
+                                                        themeColor(
+                                                            'invertQrIcons'
+                                                        )
+                                                            ? ZPayIconWhite
+                                                            : ZPayIcon
+                                                    }
+                                                    nfcSupported={nfcSupported}
+                                                />
+                                            )}
+
+                                        {selectedIndex == 3 &&
+                                            lightningAddressLoading && (
+                                                <View style={{ margin: 40 }}>
+                                                    <LoadingIndicator />
+                                                </View>
+                                            )}
+
+                                        {(selectedIndex === 0 ||
+                                            selectedIndex === 1) &&
+                                            (belowDustLimit ||
+                                                !haveUnifiedInvoice) &&
+                                            !creatingInvoice && (
+                                                <CollapsedQR
+                                                    value={lnInvoice || ''}
+                                                    copyValue={
+                                                        lnInvoiceCopyValue
+                                                    }
+                                                    expanded
+                                                    textBottom
+                                                    truncateLongValue
+                                                    nfcSupported={nfcSupported}
+                                                    satAmount={displaySatAmount}
+                                                    displayAmount
+                                                />
+                                            )}
+                                        {!creatingInvoice &&
+                                            (showButtonGroup ||
+                                                showNfcButton) && (
+                                                <>
+                                                    <View
+                                                        style={{
+                                                            alignItems:
+                                                                'center',
+                                                            marginTop: 30
+                                                        }}
+                                                    >
+                                                        <TouchableOpacity
+                                                            activeOpacity={0.5}
+                                                            onPress={() =>
+                                                                this.setState({
+                                                                    showAdvanced:
+                                                                        !this
+                                                                            .state
+                                                                            .showAdvanced
+                                                                })
+                                                            }
+                                                            style={{
+                                                                height: 40,
+                                                                paddingHorizontal: 12,
+                                                                borderRadius: 12,
+                                                                justifyContent:
+                                                                    'center'
+                                                            }}
+                                                        >
+                                                            <View
+                                                                style={{
+                                                                    flexDirection:
+                                                                        'row',
+                                                                    alignItems:
+                                                                        'center',
+                                                                    justifyContent:
+                                                                        'center'
+                                                                }}
+                                                            >
+                                                                <Text
+                                                                    style={{
+                                                                        color: themeColor(
+                                                                            'secondaryText'
+                                                                        ),
+                                                                        fontFamily:
+                                                                            'PPNeueMontreal-Book',
+                                                                        fontSize: 16
+                                                                    }}
+                                                                >
+                                                                    {localeString(
+                                                                        'general.advanced'
+                                                                    )}
+                                                                </Text>
+                                                                {showAdvanced ? (
+                                                                    <CaretDown
+                                                                        fill={themeColor(
+                                                                            'secondaryText'
+                                                                        )}
+                                                                        width="20"
+                                                                        height="20"
+                                                                        style={{
+                                                                            marginLeft: 8
+                                                                        }}
+                                                                    />
+                                                                ) : (
+                                                                    <CaretRight
+                                                                        fill={themeColor(
+                                                                            'secondaryText'
+                                                                        )}
+                                                                        width="20"
+                                                                        height="20"
+                                                                        style={{
+                                                                            marginLeft: 8
+                                                                        }}
+                                                                    />
+                                                                )}
+                                                            </View>
+                                                        </TouchableOpacity>
+                                                    </View>
+
+                                                    {showAdvanced &&
+                                                        showNfcButton &&
+                                                        nfcSupported && (
+                                                            <View
+                                                                style={[
+                                                                    styles.button
+                                                                ]}
+                                                            >
+                                                                <Button
+                                                                    title={
+                                                                        posStatus ===
+                                                                        'active'
+                                                                            ? localeString(
+                                                                                  'general.payNfc'
+                                                                              )
+                                                                            : localeString(
+                                                                                  'general.receiveNfc'
+                                                                              )
+                                                                    }
+                                                                    icon={
+                                                                        <NfcIcon
+                                                                            stroke={themeColor(
+                                                                                'highlight'
+                                                                            )}
+                                                                            width={
+                                                                                25
+                                                                            }
+                                                                            height={
+                                                                                25
+                                                                            }
+                                                                            style={{
+                                                                                marginRight: 10
+                                                                            }}
+                                                                        />
+                                                                    }
+                                                                    onPress={() =>
+                                                                        this.scanNfc()
+                                                                    }
+                                                                    secondary
+                                                                />
+                                                            </View>
+                                                        )}
+                                                </>
+                                            )}
+                                    </View>
+                                )}
+                                {!haveInvoice &&
+                                    !creatingInvoice &&
+                                    !loading &&
+                                    route.params?.selectedIndex !== 2 && (
+                                        <>
+                                            {!onChainOnly &&
+                                                BackendUtils.supportsFlowLSP() &&
+                                                !flowLspNotConfigured && (
+                                                    <View
+                                                        style={{
+                                                            flexDirection:
+                                                                'row',
+                                                            marginTop: 10,
+                                                            marginBottom: 15
+                                                        }}
+                                                    >
+                                                        <View
+                                                            style={{
+                                                                flex: 1,
+                                                                justifyContent:
+                                                                    'center'
+                                                            }}
+                                                        >
+                                                            <Text
+                                                                style={{
+                                                                    ...styles.secondaryText,
+                                                                    color: themeColor(
+                                                                        'secondaryText'
+                                                                    )
+                                                                }}
+                                                                infoModalText={[
+                                                                    localeString(
+                                                                        'views.Receive.lspSwitchExplainer1'
+                                                                    ),
+                                                                    localeString(
+                                                                        'views.Receive.lspSwitchExplainer2'
+                                                                    )
+                                                                ]}
+                                                                infoModalAdditionalButtons={[
+                                                                    {
+                                                                        title: localeString(
+                                                                            'general.learnMore'
+                                                                        ),
+                                                                        callback:
+                                                                            () =>
+                                                                                navigation.navigate(
+                                                                                    'LspExplanationOverview'
+                                                                                )
+                                                                    }
+                                                                ]}
+                                                            >
+                                                                {localeString(
+                                                                    'views.Settings.LSP.enableLSP'
+                                                                )}
+                                                            </Text>
+                                                        </View>
+                                                        <View
+                                                            style={{
+                                                                alignSelf:
+                                                                    'center',
+                                                                marginLeft: 5
+                                                            }}
+                                                        >
+                                                            <Switch
+                                                                value={
+                                                                    enableLSP
+                                                                }
+                                                                disabled={
+                                                                    !!route
+                                                                        .params
+                                                                        ?.forceLsp
+                                                                }
+                                                                onValueChange={async () => {
+                                                                    // never persist a change while the LSP is forced on
+                                                                    if (
+                                                                        route
+                                                                            .params
+                                                                            ?.forceLsp
+                                                                    )
+                                                                        return;
+                                                                    this.setState(
+                                                                        {
+                                                                            enableLSP:
+                                                                                !enableLSP,
+                                                                            lspIsActive:
+                                                                                !enableLSP &&
+                                                                                BackendUtils.supportsFlowLSP() &&
+                                                                                !flowLspNotConfigured
+                                                                        }
+                                                                    );
+                                                                    await updateSettings(
+                                                                        {
+                                                                            enableLSP:
+                                                                                !enableLSP
+                                                                        }
+                                                                    );
+                                                                }}
+                                                            />
+                                                        </View>
+                                                    </View>
+                                                )}
+
+                                            {(!enableLSP ||
+                                                flowLspNotConfigured) && (
+                                                <>
+                                                    <Text
+                                                        style={{
+                                                            ...styles.secondaryText,
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.Receive.memo'
+                                                        )}
+                                                    </Text>
+                                                    <TextInput
+                                                        placeholder={localeString(
+                                                            'views.Receive.memoPlaceholder'
+                                                        )}
+                                                        value={memo}
+                                                        onChangeText={(
+                                                            text: string
+                                                        ) => {
+                                                            this.setState({
+                                                                memo: text
+                                                            });
+                                                            clearUnified();
+                                                        }}
+                                                    />
+                                                </>
+                                            )}
+
+                                            <AmountInput
+                                                amount={value}
+                                                title={`${localeString(
+                                                    'general.amount'
+                                                )} ${
+                                                    lnurl &&
+                                                    lnurl.minWithdrawable !==
+                                                        lnurl.maxWithdrawable
+                                                        ? ` (${Math.ceil(
+                                                              lnurl.minWithdrawable /
+                                                                  1000
+                                                          )} - ${Math.floor(
+                                                              lnurl.maxWithdrawable /
+                                                                  1000
+                                                          )})`
+                                                        : ''
+                                                }`}
+                                                locked={
+                                                    lnurl &&
+                                                    lnurl.minWithdrawable ===
+                                                        lnurl.maxWithdrawable
+                                                        ? true
+                                                        : false
+                                                }
+                                                onAmountChange={(
+                                                    amount: string,
+                                                    satAmount: string | number
+                                                ) => {
+                                                    let needInbound = false;
+                                                    if (
+                                                        lspIsActive &&
+                                                        satAmount != '0' &&
+                                                        new BigNumber(
+                                                            satAmount
+                                                        ).gt(
+                                                            this.props
+                                                                .ChannelsStore
+                                                                .totalInbound
+                                                        )
+                                                    ) {
+                                                        needInbound = true;
+                                                    }
+                                                    this.setState({
+                                                        value: amount,
+                                                        satAmount,
+                                                        needInbound
+                                                    });
+                                                }}
+                                            />
+
+                                            {needInbound && (
+                                                <TouchableOpacity
+                                                    onPress={() =>
+                                                        navigation.navigate(
+                                                            'LspExplanationFees'
+                                                        )
+                                                    }
+                                                >
+                                                    <View
+                                                        style={{
+                                                            backgroundColor:
+                                                                themeColor(
+                                                                    'secondary'
+                                                                ),
+                                                            borderRadius: 10,
+                                                            borderColor:
+                                                                themeColor(
+                                                                    'highlight'
+                                                                ),
+                                                            padding: 15,
+                                                            borderWidth: 0.5,
+                                                            top: 5,
+                                                            marginBottom: 20
+                                                        }}
+                                                    >
+                                                        <Text
+                                                            style={{
+                                                                fontFamily:
+                                                                    'PPNeueMontreal-Medium',
+                                                                color: themeColor(
+                                                                    'text'
+                                                                ),
+                                                                fontSize: 15
+                                                            }}
+                                                        >
+                                                            {this.props
+                                                                .ChannelsStore
+                                                                .channels
+                                                                .length === 0
+                                                                ? localeString(
+                                                                      'views.Wallet.KeypadPane.lspExplainerFirstChannel'
+                                                                  )
+                                                                : localeString(
+                                                                      'views.Wallet.KeypadPane.lspExplainer'
+                                                                  )}
+                                                        </Text>
+                                                        <Text
+                                                            style={{
+                                                                fontFamily:
+                                                                    'PPNeueMontreal-Medium',
+                                                                color: themeColor(
+                                                                    'secondaryText'
+                                                                ),
+                                                                fontSize: 15,
+                                                                top: 5,
+                                                                textAlign:
+                                                                    'right'
+                                                            }}
+                                                        >
+                                                            {localeString(
+                                                                'general.tapToLearnMore'
+                                                            )}
+                                                        </Text>
+                                                    </View>
+                                                </TouchableOpacity>
+                                            )}
+
+                                            {!onChainOnly &&
+                                                BackendUtils.supportsSettingInvoiceExpiration() && (
+                                                    <Accordion
+                                                        headerLayout="form"
+                                                        key={`receive-expiration-${lspIsActive}`}
+                                                        id="receive-expiration"
+                                                        title={localeString(
+                                                            'views.Receive.expiration'
+                                                        )}
+                                                        disabled={lspIsActive}
+                                                        renderHeader={(
+                                                            isOpen
+                                                        ) => (
+                                                            <Row
+                                                                justify="space-between"
+                                                                style={{
+                                                                    alignItems:
+                                                                        'center'
+                                                                }}
+                                                            >
+                                                                <View
+                                                                    style={{
+                                                                        flex: 1
+                                                                    }}
+                                                                >
+                                                                    <Row
+                                                                        justify="space-between"
+                                                                        style={{
+                                                                            alignItems:
+                                                                                'center'
+                                                                        }}
+                                                                    >
+                                                                        <View
+                                                                            style={{
+                                                                                flex: 1
+                                                                            }}
+                                                                        >
+                                                                            <KeyValue
+                                                                                keyValue={localeString(
+                                                                                    'views.Receive.expiration'
+                                                                                )}
+                                                                            />
+                                                                        </View>
+
+                                                                        {!isOpen && (
+                                                                            <Text
+                                                                                style={{
+                                                                                    ...styles.secondaryText,
+                                                                                    color: themeColor(
+                                                                                        'secondaryText'
+                                                                                    ),
+                                                                                    textAlign:
+                                                                                        'center',
+                                                                                    fontSize: 14
+                                                                                }}
+                                                                            >
+                                                                                {this.getFormattedDuration()}
+                                                                            </Text>
+                                                                        )}
+                                                                    </Row>
+                                                                </View>
+
+                                                                {lspIsActive ? (
+                                                                    <LockIcon
+                                                                        fill={themeColor(
+                                                                            'secondaryText'
+                                                                        )}
+                                                                        width="20"
+                                                                        height="20"
+                                                                    />
+                                                                ) : isOpen ? (
+                                                                    <CaretDown
+                                                                        fill={themeColor(
+                                                                            'text'
+                                                                        )}
+                                                                        width="20"
+                                                                        height="20"
+                                                                    />
+                                                                ) : (
+                                                                    <CaretRight
+                                                                        fill={themeColor(
+                                                                            'text'
+                                                                        )}
+                                                                        width="20"
+                                                                        height="20"
+                                                                    />
+                                                                )}
+                                                            </Row>
+                                                        )}
+                                                    >
+                                                        <>
+                                                            <Row
+                                                                style={{
+                                                                    width: '100%'
+                                                                }}
+                                                            >
+                                                                <TextInput
+                                                                    keyboardType="numeric"
+                                                                    value={
+                                                                        expiry
+                                                                    }
+                                                                    style={{
+                                                                        width: '58%'
+                                                                    }}
+                                                                    onChangeText={(
+                                                                        text: string
+                                                                    ) => {
+                                                                        const digits =
+                                                                            text.replace(
+                                                                                /[^0-9]/g,
+                                                                                ''
+                                                                            );
+                                                                        const expirySeconds =
+                                                                            expirySecondsFromInput(
+                                                                                digits,
+                                                                                timePeriod as TimePeriod
+                                                                            );
+                                                                        this.setState(
+                                                                            {
+                                                                                expiry: digits,
+                                                                                expirySeconds,
+                                                                                expirationIndex:
+                                                                                    expirationIndexFromSeconds(
+                                                                                        expirySeconds
+                                                                                    )
+                                                                            }
+                                                                        );
+                                                                    }}
+                                                                />
+                                                                <Spacer
+                                                                    width={4}
+                                                                />
+                                                                <View
+                                                                    style={{
+                                                                        flex: 1
+                                                                    }}
+                                                                >
+                                                                    <DropdownSetting
+                                                                        selectedValue={
+                                                                            timePeriod
+                                                                        }
+                                                                        values={
+                                                                            TIME_PERIOD_KEYS
+                                                                        }
+                                                                        onValueChange={async (
+                                                                            value: string
+                                                                        ) => {
+                                                                            const expirySeconds =
+                                                                                expirySecondsFromInput(
+                                                                                    expiry,
+                                                                                    value as TimePeriod
+                                                                                );
+                                                                            this.setState(
+                                                                                {
+                                                                                    timePeriod:
+                                                                                        value,
+                                                                                    expirySeconds,
+                                                                                    expirationIndex:
+                                                                                        expirationIndexFromSeconds(
+                                                                                            expirySeconds
+                                                                                        )
+                                                                                }
+                                                                            );
+                                                                        }}
+                                                                    />
+                                                                </View>
+                                                            </Row>
+
+                                                            <ButtonGroup
+                                                                onPress={
+                                                                    this
+                                                                        .updateExpirationIndex
+                                                                }
+                                                                selectedIndex={
+                                                                    expirationIndex
+                                                                }
+                                                                buttons={
+                                                                    expirationButtons
+                                                                }
+                                                                selectedButtonStyle={{
+                                                                    backgroundColor:
+                                                                        themeColor(
+                                                                            'highlight'
+                                                                        ),
+                                                                    borderRadius: 12
+                                                                }}
+                                                                containerStyle={{
+                                                                    backgroundColor:
+                                                                        themeColor(
+                                                                            'secondary'
+                                                                        ),
+                                                                    borderRadius: 12,
+                                                                    borderWidth: 0,
+                                                                    height: 30,
+                                                                    marginBottom:
+                                                                        Platform.OS ===
+                                                                        'ios'
+                                                                            ? 16
+                                                                            : 0
+                                                                }}
+                                                                innerBorderStyle={{
+                                                                    color: themeColor(
+                                                                        'secondary'
+                                                                    )
+                                                                }}
+                                                            />
+                                                        </>
+                                                    </Accordion>
+                                                )}
+
+                                            {showAdvancedSettingsToggle && (
+                                                <Accordion
+                                                    headerLayout="form"
+                                                    id="receive-advanced-settings"
+                                                    title={localeString(
+                                                        'general.advancedSettings'
+                                                    )}
+                                                >
+                                                    <>
+                                                        {BackendUtils.supportsCustomPreimages() &&
+                                                            showCustomPreimageField && (
+                                                                <>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.secondaryText,
+                                                                            color: themeColor(
+                                                                                'secondaryText'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {localeString(
+                                                                            'views.Receive.customPreimage'
+                                                                        )}
+                                                                    </Text>
+                                                                    <TextInput
+                                                                        value={
+                                                                            customPreimage
+                                                                        }
+                                                                        onChangeText={(
+                                                                            text: string
+                                                                        ) =>
+                                                                            this.setState(
+                                                                                {
+                                                                                    customPreimage:
+                                                                                        text
+                                                                                }
+                                                                            )
+                                                                        }
+                                                                    />
+                                                                </>
+                                                            )}
+
+                                                        {BackendUtils.isLNDBased() &&
+                                                            !lspIsActive && (
+                                                                <View
+                                                                    style={{
+                                                                        flexDirection:
+                                                                            'row',
+                                                                        marginBottom:
+                                                                            !routeHints
+                                                                                ? 0
+                                                                                : Platform.OS ===
+                                                                                  'ios'
+                                                                                ? 10
+                                                                                : 6
+                                                                    }}
+                                                                >
+                                                                    <View
+                                                                        style={{
+                                                                            flex: 1,
+                                                                            justifyContent:
+                                                                                'center'
+                                                                        }}
+                                                                    >
+                                                                        <Text
+                                                                            style={{
+                                                                                ...styles.secondaryText,
+                                                                                color: themeColor(
+                                                                                    'secondaryText'
+                                                                                )
+                                                                            }}
+                                                                            infoModalText={[
+                                                                                localeString(
+                                                                                    'views.Receive.routeHintSwitchExplainer1'
+                                                                                ),
+                                                                                localeString(
+                                                                                    'views.Receive.routeHintSwitchExplainer2'
+                                                                                ),
+                                                                                localeString(
+                                                                                    'views.Receive.routeHintSwitchExplainer3'
+                                                                                )
+                                                                            ]}
+                                                                        >
+                                                                            {localeString(
+                                                                                'views.Receive.routeHints'
+                                                                            )}
+                                                                        </Text>
+                                                                    </View>
+                                                                    <View
+                                                                        style={{
+                                                                            alignSelf:
+                                                                                'center',
+                                                                            marginLeft: 5
+                                                                        }}
+                                                                    >
+                                                                        <Switch
+                                                                            value={
+                                                                                routeHints
+                                                                            }
+                                                                            onValueChange={() =>
+                                                                                this.setState(
+                                                                                    {
+                                                                                        routeHints:
+                                                                                            !routeHints
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                            disabled={
+                                                                                blindedPaths
+                                                                            }
+                                                                        />
+                                                                    </View>
+                                                                </View>
+                                                            )}
+
+                                                        {BackendUtils.isLNDBased() &&
+                                                            !lspIsActive &&
+                                                            routeHints && (
+                                                                <Row>
+                                                                    <Text
+                                                                        style={{
+                                                                            ...styles.secondaryText,
+                                                                            color: themeColor(
+                                                                                'secondaryText'
+                                                                            )
+                                                                        }}
+                                                                    >
+                                                                        {localeString(
+                                                                            'general.mode'
+                                                                        )}
+                                                                    </Text>
+                                                                    <ButtonGroup
+                                                                        onPress={
+                                                                            setRouteHintMode
+                                                                        }
+                                                                        selectedIndex={
+                                                                            routeHintMode
+                                                                        }
+                                                                        buttons={
+                                                                            routeHintModeButtons
+                                                                        }
+                                                                        selectedButtonStyle={{
+                                                                            backgroundColor:
+                                                                                themeColor(
+                                                                                    'highlight'
+                                                                                ),
+                                                                            borderRadius: 12
+                                                                        }}
+                                                                        containerStyle={{
+                                                                            backgroundColor:
+                                                                                themeColor(
+                                                                                    'secondary'
+                                                                                ),
+                                                                            borderRadius: 12,
+                                                                            borderWidth: 0,
+                                                                            height: 30,
+                                                                            flex: 1
+                                                                        }}
+                                                                        innerBorderStyle={{
+                                                                            color: themeColor(
+                                                                                'secondary'
+                                                                            )
+                                                                        }}
+                                                                    />
+                                                                </Row>
+                                                            )}
+
+                                                        {BackendUtils.isLNDBased() &&
+                                                            routeHints && (
+                                                                <HopPicker
+                                                                    ref={(
+                                                                        ref
+                                                                    ) => {
+                                                                        this.hopPickerRef =
+                                                                            ref;
+                                                                    }}
+                                                                    onValueChange={(
+                                                                        channels
+                                                                    ) => {
+                                                                        this.setState(
+                                                                            {
+                                                                                selectedRouteHintChannels:
+                                                                                    channels
+                                                                            }
+                                                                        );
+                                                                    }}
+                                                                    onCancel={() => {
+                                                                        if (
+                                                                            !selectedRouteHintChannels?.length
+                                                                        ) {
+                                                                            setRouteHintMode(
+                                                                                RouteHintMode.Automatic
+                                                                            );
+                                                                        }
+                                                                    }}
+                                                                    title={localeString(
+                                                                        'views.Receive.customRouteHints'
+                                                                    )}
+                                                                    ChannelsStore={
+                                                                        this
+                                                                            .props
+                                                                            .ChannelsStore
+                                                                    }
+                                                                    UnitsStore={
+                                                                        UnitsStore
+                                                                    }
+                                                                    containerStyle={{
+                                                                        display:
+                                                                            routeHintMode ===
+                                                                            RouteHintMode.Automatic
+                                                                                ? 'none'
+                                                                                : 'flex'
+                                                                    }}
+                                                                    clearOnTap={
+                                                                        false
+                                                                    }
+                                                                    selectionMode={
+                                                                        'multiple'
+                                                                    }
+                                                                    selectedChannels={
+                                                                        selectedRouteHintChannels
+                                                                    }
+                                                                />
+                                                            )}
+
+                                                        {BackendUtils.supportsAMP() &&
+                                                            !lspIsActive && (
+                                                                <View
+                                                                    style={{
+                                                                        flexDirection:
+                                                                            'row',
+                                                                        marginTop: 20
+                                                                    }}
+                                                                >
+                                                                    <View
+                                                                        style={{
+                                                                            flex: 1,
+                                                                            justifyContent:
+                                                                                'center'
+                                                                        }}
+                                                                    >
+                                                                        <Text
+                                                                            style={{
+                                                                                ...styles.secondaryText,
+                                                                                color: themeColor(
+                                                                                    'secondaryText'
+                                                                                )
+                                                                            }}
+                                                                            infoModalText={[
+                                                                                localeString(
+                                                                                    'views.Receive.ampSwitchExplainer1'
+                                                                                ),
+                                                                                localeString(
+                                                                                    'views.Receive.ampSwitchExplainer2'
+                                                                                )
+                                                                            ]}
+                                                                            infoModalLink="https://docs.lightning.engineering/lightning-network-tools/lnd/amp"
+                                                                        >
+                                                                            {localeString(
+                                                                                'views.Receive.ampInvoice'
+                                                                            )}
+                                                                        </Text>
+                                                                    </View>
+                                                                    <View
+                                                                        style={{
+                                                                            alignSelf:
+                                                                                'center',
+                                                                            marginLeft: 5
+                                                                        }}
+                                                                    >
+                                                                        <Switch
+                                                                            value={
+                                                                                ampInvoice
+                                                                            }
+                                                                            onValueChange={() =>
+                                                                                this.setState(
+                                                                                    {
+                                                                                        ampInvoice:
+                                                                                            !ampInvoice
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                            disabled={
+                                                                                blindedPaths
+                                                                            }
+                                                                        />
+                                                                    </View>
+                                                                </View>
+                                                            )}
+
+                                                        {BackendUtils.supportsBolt11BlindedRoutes() &&
+                                                            !lspIsActive && (
+                                                                <View
+                                                                    style={{
+                                                                        flexDirection:
+                                                                            'row',
+                                                                        marginTop: 20
+                                                                    }}
+                                                                >
+                                                                    <View
+                                                                        style={{
+                                                                            flex: 1,
+                                                                            justifyContent:
+                                                                                'center'
+                                                                        }}
+                                                                    >
+                                                                        <Text
+                                                                            style={{
+                                                                                ...styles.secondaryText,
+                                                                                color: themeColor(
+                                                                                    'secondaryText'
+                                                                                )
+                                                                            }}
+                                                                            infoModalText={[
+                                                                                localeString(
+                                                                                    'views.Receive.blindedPathsExplainer1'
+                                                                                ),
+                                                                                localeString(
+                                                                                    'views.Receive.blindedPathsExplainer2'
+                                                                                )
+                                                                            ]}
+                                                                            infoModalLink="https://lightningprivacy.com/en/blinded-trampoline"
+                                                                        >
+                                                                            {localeString(
+                                                                                'views.Receive.blindedPaths'
+                                                                            )}
+                                                                        </Text>
+                                                                    </View>
+                                                                    <View
+                                                                        style={{
+                                                                            alignSelf:
+                                                                                'center',
+                                                                            marginLeft: 5
+                                                                        }}
+                                                                    >
+                                                                        <Switch
+                                                                            value={
+                                                                                blindedPaths
+                                                                            }
+                                                                            onValueChange={() =>
+                                                                                this.setState(
+                                                                                    {
+                                                                                        blindedPaths:
+                                                                                            !blindedPaths,
+                                                                                        ampInvoice:
+                                                                                            false,
+                                                                                        routeHints:
+                                                                                            false
+                                                                                    }
+                                                                                )
+                                                                            }
+                                                                        />
+                                                                    </View>
+                                                                </View>
+                                                            )}
+                                                    </>
+                                                </Accordion>
+                                            )}
+
+                                            <View style={styles.button}>
+                                                <Button
+                                                    title={
+                                                        localeString(
+                                                            'views.Receive.createInvoice'
+                                                        ) +
+                                                        (lnurl
+                                                            ? ` ${localeString(
+                                                                  'views.Receive.andSubmitTo'
+                                                              )} ${
+                                                                  lnurl.domain
+                                                              }`
+                                                            : '')
+                                                    }
+                                                    disabled={
+                                                        (lspIsActive &&
+                                                            (!satAmount ||
+                                                                satAmount ===
+                                                                    '0')) ||
+                                                        !expiry
+                                                    }
+                                                    onPress={() => {
+                                                        // Clear the old error messages (if present)
+                                                        LSPStore.reset(true);
+                                                        // If clearButton was used in on-chain tab
+                                                        // and a new invoice below dust limit is created
+                                                        // reset selectedIndex to 1 (lightning)
+                                                        if (
+                                                            selectedIndex ===
+                                                                2 &&
+                                                            belowDustLimit
+                                                        ) {
+                                                            this.setState({
+                                                                selectedIndex: 1
+                                                            });
+                                                        }
+                                                        const isCurrent =
+                                                            this.startInvoiceRequest();
+                                                        createUnifiedInvoice({
+                                                            memo: lspIsActive
+                                                                ? ''
+                                                                : receiverName
+                                                                ? `${receiverName}:  ${memo}`
+                                                                : memo,
+                                                            value:
+                                                                satAmount.toString() ||
+                                                                '0',
+                                                            expirySeconds:
+                                                                lspIsActive
+                                                                    ? LOCKED_EXPIRY_SECONDS
+                                                                    : expirySeconds ||
+                                                                      '3600',
+                                                            lnurl,
+                                                            ampInvoice:
+                                                                lspIsActive
+                                                                    ? false
+                                                                    : ampInvoice ||
+                                                                      false,
+                                                            blindedPaths:
+                                                                lspIsActive
+                                                                    ? false
+                                                                    : blindedPaths ||
+                                                                      false,
+                                                            routeHints,
+                                                            routeHintChannels:
+                                                                routeHintMode ===
+                                                                RouteHintMode.Custom
+                                                                    ? selectedRouteHintChannels
+                                                                    : undefined,
+                                                            addressType:
+                                                                BackendUtils.supportsAddressTypeSelection()
+                                                                    ? addressType
+                                                                    : undefined,
+                                                            customPreimage:
+                                                                BackendUtils.supportsCustomPreimages() &&
+                                                                showCustomPreimageField
+                                                                    ? customPreimage
+                                                                    : undefined,
+                                                            noLsp: !lspIsActive,
+                                                            forceLsp:
+                                                                !!route.params
+                                                                    ?.forceLsp,
+                                                            useLsp: lspIsActive,
+                                                            confirmLspFee:
+                                                                this
+                                                                    .confirmLspFee,
+                                                            skipOnchain,
+                                                            ...this.getUnifiedAccountParams()
+                                                        })
+                                                            .then(
+                                                                ({
+                                                                    rHash,
+                                                                    onChainAddress
+                                                                }: {
+                                                                    rHash: string;
+                                                                    onChainAddress?: string;
+                                                                }) => {
+                                                                    if (
+                                                                        !isCurrent()
+                                                                    )
+                                                                        return;
+                                                                    this.subscribeInvoice(
+                                                                        rHash,
+                                                                        onChainAddress
+                                                                    );
+                                                                }
+                                                            )
+                                                            .catch(() => {
+                                                                // errors are surfaced via LSPStore/InvoicesStore observables
+                                                            });
+                                                    }}
+                                                />
+                                            </View>
+                                        </>
+                                    )}
+                            </View>
+                        </ScrollView>
+                    )}
+                </View>
+                {showAdvanced && showButtonGroup && (
+                    <View style={{ bottom: 0 }}>
+                        {!belowDustLimit &&
+                            !lnOnly &&
+                            !onChainOnly &&
+                            !watchedInvoicePaid && (
+                                <ButtonGroup
+                                    onPress={this.updateIndex}
+                                    selectedIndex={selectedIndex}
+                                    buttons={buttons}
+                                    selectedButtonStyle={{
+                                        backgroundColor:
+                                            themeColor('highlight'),
+                                        borderRadius: 12
+                                    }}
+                                    containerStyle={{
+                                        backgroundColor:
+                                            themeColor('secondary'),
+                                        borderRadius: 12,
+                                        borderWidth: 0,
+                                        height: 80
+                                    }}
+                                    innerBorderStyle={{
+                                        color: themeColor('secondary')
+                                    }}
+                                />
+                            )}
+                    </View>
+                )}
+                <ModalBox
+                    style={{
+                        backgroundColor: themeColor('modalBackground'),
+                        borderTopLeftRadius: 20,
+                        borderTopRightRadius: 20,
+                        height: modalHeight,
+                        paddingLeft: 24,
+                        paddingRight: 24
+                    }}
+                    swipeToClose={true}
+                    backButtonClose={true}
+                    position="bottom"
+                    ref={this.modalBoxRef}
+                >
+                    <ScrollView>
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontSize: 24,
+                                fontWeight: 'bold',
+                                paddingTop: 24,
+                                paddingBottom: 24
+                            }}
+                        >
+                            {localeString('views.Receive.addressType')}
+                        </Text>
+                        {_map(ADDRESS_TYPES, (d, index) => (
+                            <TouchableOpacity
+                                key={index}
+                                onPress={() => {
+                                    // If same address type is selected, close modal
+                                    if (d.value === addressType) {
+                                        this.modalBoxRef.current?.close();
+                                        return;
+                                    }
+                                    InvoicesStore.clearAddress();
+                                    this.setState({ addressType: d.value });
+
+                                    // Only auto-generate if we're in on-chain mode
+                                    if (selectedIndex === 2) {
+                                        this.autoGenerateOnChainAddress(
+                                            account,
+                                            d.value
+                                        );
+                                    }
+                                    this.modalBoxRef.current?.close();
+                                }}
+                                style={{
+                                    backgroundColor: themeColor('secondary'),
+                                    borderColor:
+                                        d.value === addressType
+                                            ? themeColor('highlight')
+                                            : themeColor('secondaryText'),
+                                    borderRadius: 4,
+                                    borderWidth:
+                                        d.value === addressType ? 2 : 1,
+                                    padding: 16,
+                                    marginBottom: 24
+                                }}
+                            >
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontSize: 16,
+                                        fontWeight: 'bold',
+                                        marginBottom: 4
+                                    }}
+                                >
+                                    {d.key}
+                                </Text>
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontSize: 16,
+                                        fontWeight: 'normal'
+                                    }}
+                                >
+                                    {d.description}
+                                </Text>
+                            </TouchableOpacity>
+                        ))}
+                    </ScrollView>
+                </ModalBox>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    content: {
+        paddingLeft: 20,
+        paddingRight: 20
+    },
+    button: {
+        paddingTop: 25,
+        paddingBottom: 15
+    },
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    secondaryText: {
+        fontFamily: 'PPNeueMontreal-Book'
+    }
+});

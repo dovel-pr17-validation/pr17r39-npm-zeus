@@ -1,0 +1,1547 @@
+import React from 'react';
+import { Alert, ScrollView, View, TouchableOpacity } from 'react-native';
+import { LinearProgress } from '@rneui/themed';
+
+import ReactNativeBlobUtil from 'react-native-blob-util';
+import { inject, observer } from 'mobx-react';
+import { crypto } from 'bitcoinjs-lib';
+import BigNumber from 'bignumber.js';
+import Bolt11Utils from '../../utils/Bolt11Utils';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+
+import lndMobile from '../../lndmobile/LndMobileInjection';
+const { createClaimTransaction, buildReverseClaimTransaction } =
+    lndMobile.swaps;
+
+import Screen from '../../components/Screen';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import Amount from '../../components/Amount';
+import Button from '../../components/Button';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import {
+    ErrorMessage,
+    WarningMessage
+} from '../../components/SuccessErrorMessage';
+import { Row } from '../../components/layout/Row';
+import Text from '../../components/Text';
+
+import BackendUtils from '../../utils/BackendUtils';
+import {
+    isPlausibleSatPerVbyte,
+    reverseClaimMinerFee
+} from '../../utils/FeeUtils';
+import handleAnything from '../../utils/handleAnything';
+import { localeString, pascalToHumanReadable } from '../../utils/LocaleUtils';
+import { sleep } from '../../utils/SleepUtils';
+import { font } from '../../utils/FontUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { numberWithCommas } from '../../utils/UnitsUtils';
+import {
+    nativeSwapEndpoint,
+    swapNetworkName,
+    swapWebSocketUrl
+} from '../../utils/SwapUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+import FeeStore from '../../stores/FeeStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import SwapStore, { ReverseLockupCheck } from '../../stores/SwapStore';
+import { nodeInfoStore, unitsStore } from '../../stores/Stores';
+
+import Swap, { SwapState, SwapType } from '../../models/Swap';
+import {
+    SubmarineClaimTransaction,
+    ReverseClaimTransaction
+} from '../../models/ClaimTransaction';
+
+import CaretDown from '../../assets/images/SVG/Caret Down.svg';
+import CaretRight from '../../assets/images/SVG/Caret Right.svg';
+import QR from '../../assets/images/SVG/QR.svg';
+
+// The host's WebSocket update can carry any JSON. Its error and failure
+// reason are rendered as text, and String() throws on an object such as
+// {"toString":1}, so only strings are shown. A host that resends such an
+// update on every subscribe would otherwise keep a swap waiting for its
+// refund from being opened.
+const updateText = (data: any) => ({
+    error: !data?.error
+        ? undefined
+        : typeof data.error === 'string'
+        ? data.error
+        : localeString('general.unknownError'),
+    failureReason:
+        typeof data?.failureReason === 'string' && data.failureReason
+            ? data.failureReason
+            : undefined
+});
+
+interface SwapDetailsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<
+        'SwapDetails',
+        {
+            swapData: Swap;
+            keys: any;
+            endpoint: string;
+            serviceProvider: string;
+            invoice: string;
+            fee: string;
+        }
+    >;
+    FeeStore?: FeeStore;
+    InvoicesStore?: InvoicesStore;
+    NodeInfoStore?: NodeInfoStore;
+    SwapStore?: SwapStore;
+}
+
+interface SwapDetailsState {
+    updates: string | null;
+    failureReason: string;
+    error: string | { message?: string } | null;
+    loading: boolean;
+    socketConnected: boolean;
+    swapTreeToggle: boolean;
+    swapData: Swap;
+    lockupNotice: string | null;
+    // the current rate, for a reverse swap with none stored
+    currentClaimFeeRate?: number;
+}
+
+// how often to re-check an unconfirmed or unreachable lockup
+const LOCKUP_RECHECK_MS = 60 * 1000;
+
+@inject('FeeStore', 'InvoicesStore', 'NodeInfoStore', 'SwapStore')
+@observer
+export default class SwapDetails extends React.Component<
+    SwapDetailsProps,
+    SwapDetailsState
+> {
+    constructor(props: SwapDetailsProps) {
+        super(props);
+        this.state = {
+            updates: null,
+            failureReason: '',
+            error: null,
+            loading: false,
+            socketConnected: true,
+            swapTreeToggle: false,
+            swapData: new Swap(props.route.params.swapData),
+            lockupNotice: null
+        };
+    }
+
+    componentDidMount() {
+        const { swapData } = this.state;
+
+        // reset units to help prevent wrong amount being sent
+        unitsStore.resetUnits();
+
+        if (!swapData) {
+            console.error('No swap data provided.');
+            return;
+        }
+
+        if (swapData.isSubmarineSwap) {
+            const finalStatus = [
+                SwapState.TransactionRefunded,
+                SwapState.TransactionClaimed
+            ];
+
+            const failedStatus = [
+                SwapState.InvoiceFailedToPay,
+                SwapState.TransactionLockupFailed,
+                SwapState.SwapExpired
+            ];
+
+            if (
+                finalStatus.includes(swapData?.status) ||
+                (failedStatus.includes(swapData?.status) &&
+                    swapData?.lockupTransaction?.hex)
+            ) {
+                this.setState({
+                    updates: swapData.status,
+                    socketConnected: false
+                });
+                return;
+            }
+
+            this.getSwapUpdates(swapData, swapData.isSubmarineSwap);
+        } else {
+            const failedStatus = [
+                SwapState.InvoiceExpired,
+                SwapState.TransactionRefunded,
+                SwapState.SwapExpired
+            ];
+            if (failedStatus.includes(swapData?.status)) {
+                this.setState({
+                    updates: swapData.status,
+                    socketConnected: false
+                });
+                return;
+            }
+
+            // the claim awaits this same lookup
+            this.loadCurrentClaimFeeRate();
+            this.getReverseSwapUpdates(swapData, swapData.isSubmarineSwap);
+        }
+    }
+
+    renderSwapTree = (swapTree: any) => {
+        const { swapTreeToggle } = this.state;
+        if (!swapTree) return null;
+
+        return (
+            <View>
+                <TouchableOpacity
+                    onPress={() => {
+                        this.setState({
+                            swapTreeToggle: !swapTreeToggle
+                        });
+                    }}
+                >
+                    <View
+                        style={{
+                            marginTop: 10,
+                            marginBottom: 10
+                        }}
+                    >
+                        <Row justify="space-between">
+                            <View style={{ flex: 1 }}>
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.SwapDetails.swapTree'
+                                    )}
+                                />
+                            </View>
+                            {swapTreeToggle ? (
+                                <CaretDown
+                                    fill={themeColor('text')}
+                                    width="20"
+                                    height="20"
+                                />
+                            ) : (
+                                <CaretRight
+                                    fill={themeColor('text')}
+                                    width="20"
+                                    height="20"
+                                />
+                            )}
+                        </Row>
+                    </View>
+                </TouchableOpacity>
+                {swapTreeToggle &&
+                    Object.entries(swapTree).map(
+                        ([key, value]: [string, any]) => {
+                            key = pascalToHumanReadable(key);
+                            return (
+                                <View key={key}>
+                                    <KeyValue keyValue={key} />
+                                    {typeof value === 'object' ? (
+                                        Object.entries(value).map(
+                                            ([nestedKey, nestedValue]: [
+                                                string,
+                                                any
+                                            ]) => {
+                                                nestedKey =
+                                                    pascalToHumanReadable(
+                                                        nestedKey
+                                                    );
+                                                return (
+                                                    <KeyValue
+                                                        key={nestedKey}
+                                                        keyValue={nestedKey}
+                                                        value={nestedValue}
+                                                    />
+                                                );
+                                            }
+                                        )
+                                    ) : (
+                                        <KeyValue
+                                            key={key}
+                                            keyValue={key}
+                                            value={value}
+                                        />
+                                    )}
+                                </View>
+                            );
+                        }
+                    )}
+            </View>
+        );
+    };
+
+    getSwapUpdates = async (createdResponse: any, isSubmarineSwap: boolean) => {
+        const { keys, endpoint, invoice } = this.props.route.params;
+
+        const { SwapStore } = this.props;
+
+        if (!createdResponse || !createdResponse.id) {
+            // the swap holds the refund key or preimage; don't log it
+            console.error('Invalid response: swap has no ID');
+            this.setState({ error: 'Invalid response received.' });
+            return;
+        }
+
+        let submitted = false;
+
+        console.log('Connecting to WebSocket for updates...');
+        this.setState({ loading: true });
+
+        // Create a WebSocket connection
+        const webSocket = new WebSocket(swapWebSocketUrl(endpoint));
+
+        // Handle WebSocket connection open
+        webSocket.onopen = () => {
+            console.log('WebSocket connection opened');
+            webSocket.send(
+                JSON.stringify({
+                    op: 'subscribe',
+                    channel: 'swap.update',
+                    args: [createdResponse.id]
+                })
+            );
+        };
+
+        // Handle incoming WebSocket messages
+        webSocket.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+
+            if (msg.event !== 'update') {
+                return;
+            }
+
+            console.log('Got WebSocket update');
+            console.log(msg);
+
+            const data = msg.args[0];
+            const { error, failureReason } = updateText(data);
+
+            // Check for API errors
+            if (error) {
+                if (error === 'Operation timeout') {
+                    this.setState({
+                        error: 'The operation timed out.',
+                        loading: false,
+                        socketConnected: false
+                    });
+                    webSocket.close();
+                    return;
+                }
+
+                this.setState({
+                    error,
+                    loading: false,
+                    socketConnected: false
+                });
+                webSocket.close();
+                return;
+            }
+
+            // Update the status in the component state
+            this.setState({
+                updates: data.status,
+                failureReason,
+                loading: false
+            });
+
+            // Update the status in Encrypted Storage
+            await SwapStore?.updateSwapStatus(
+                createdResponse.id,
+                data.status,
+                isSubmarineSwap,
+                failureReason
+            );
+
+            switch (data.status) {
+                case SwapState.InvoiceSet:
+                    console.log('Waiting for onchain transaction...');
+                    break;
+                case SwapState.TransactionClaimPending:
+                    if (submitted) {
+                        console.log(
+                            'Cooperative claim transaction already created and submitted successfully. Skipping.'
+                        );
+                    } else {
+                        console.log(
+                            'Creating cooperative claim transaction...'
+                        );
+
+                        const claimTxDetails = await this.fetchClaimDetails(
+                            createdResponse.id,
+                            endpoint
+                        );
+                        console.log('Fetched claim details');
+
+                        const isValid = this.validatePreimage(
+                            claimTxDetails?.preimage,
+                            invoice
+                        );
+                        console.log('Is valid?', isValid);
+
+                        if (!isValid) {
+                            console.error('Invalid preimage received');
+                            return;
+                        }
+
+                        console.log(
+                            'Preimage validated. Proceeding with claim transaction...'
+                        );
+                        submitted = await this.createClaimTransaction(
+                            claimTxDetails,
+                            createdResponse,
+                            keys,
+                            endpoint
+                        );
+                    }
+                    break;
+
+                case SwapState.InvoiceFailedToPay:
+                case SwapState.TransactionLockupFailed:
+                case SwapState.SwapExpired:
+                    if (
+                        isSubmarineSwap &&
+                        !this.state.swapData?.lockupTransaction?.hex
+                    ) {
+                        const lockupTx = await SwapStore?.getLockupTransaction(
+                            createdResponse.id,
+                            endpoint
+                        );
+                        this.setState((prevState) => ({
+                            swapData: new Swap({
+                                ...prevState.swapData,
+                                lockupTransaction: lockupTx
+                            })
+                        }));
+                    }
+
+                    if (failureReason) {
+                        webSocket.close();
+                        this.setState({
+                            error: failureReason,
+                            socketConnected: false
+                        });
+                    }
+                    break;
+
+                case SwapState.TransactionClaimed:
+                    webSocket.close();
+                    failureReason &&
+                        this.setState({
+                            error: failureReason,
+                            socketConnected: false
+                        });
+                    break;
+
+                default:
+                    console.log('Unhandled status:', data.status);
+            }
+        };
+
+        webSocket.onerror = (error) => {
+            if (error.message) {
+                this.setState({
+                    error: error.message,
+                    loading: false
+                });
+            }
+            console.error('WebSocket error:', error);
+        };
+
+        webSocket.onclose = () => {
+            console.log('WebSocket connection closed');
+        };
+
+        this.componentWillUnmount = () => {
+            if (webSocket) {
+                webSocket.close();
+            }
+        };
+    };
+
+    getReverseSwapUpdates = (
+        createdResponse: any,
+        isSubmarineSwap: boolean
+    ) => {
+        const { keys, endpoint, fee } = this.props.route.params;
+        const { swapData } = this.state;
+
+        const { SwapStore } = this.props;
+
+        if (!createdResponse || !createdResponse.id) {
+            // the swap holds the refund key or preimage; don't log it
+            console.error('Invalid response: swap has no ID');
+            this.setState({ error: 'Invalid response received.' });
+            return;
+        }
+
+        // a claim recorded as broadcast, on this screen or an earlier visit.
+        // A legacy rescue may carry the host's claimTxid, which stops the
+        // claim here; the invoice then expires and the payment returns. It
+        // can't be ignored on imported swaps, since this wallet records its
+        // own claims on them in the same field.
+        let submitted = !!swapData?.claimTxid;
+        // set once the host reports the invoice settled: it has the
+        // preimage, so a lockup already spent means the swap is done
+        let invoiceSettled = false;
+        let verifyingLockup = false;
+        let lockupRecheck: ReturnType<typeof setTimeout> | undefined;
+        // Set once the screen unmounts or the swap reaches a final state, so
+        // a lookup still in flight can't schedule another recheck
+        let stopped = false;
+        // A rescued swap paid from elsewhere has no trusted amount, so the
+        // user confirms the lockup amount before the preimage is revealed
+        let confirmedLockupAmount: number | undefined;
+        let confirmingAmount = false;
+        let amountDeclined = false;
+        const stopRechecks = () => {
+            stopped = true;
+            clearTimeout(lockupRecheck);
+        };
+
+        // The provider's update is not proof of a lockup. Look the
+        // transaction up on the user's mempool instance and only claim,
+        // which reveals the preimage, once it is confirmed and pays the
+        // swap's output in full.
+        const claimIfLockupVerified = async (transactionHex: string) => {
+            if (
+                stopped ||
+                submitted ||
+                verifyingLockup ||
+                confirmingAmount ||
+                amountDeclined ||
+                !SwapStore
+            )
+                return;
+            verifyingLockup = true;
+            clearTimeout(lockupRecheck);
+            try {
+                const result = await this.createReverseClaimTransaction(
+                    createdResponse,
+                    keys,
+                    endpoint,
+                    swapData.lockupAddress!,
+                    swapData.claimDestinationAddress || '',
+                    swapData.preimage,
+                    transactionHex,
+                    fee,
+                    confirmedLockupAmount,
+                    () => stopped
+                );
+                if (result === 'unsent') {
+                    // Boltz sends no update after invoice.settled, so send
+                    // the stored claim again while the screen is open
+                    if (!stopped) {
+                        lockupRecheck = setTimeout(
+                            () => claimIfLockupVerified(transactionHex),
+                            LOCKUP_RECHECK_MS
+                        );
+                    }
+                    return;
+                }
+                if (typeof result === 'boolean') {
+                    submitted = result;
+                    return;
+                }
+                if (stopped) return;
+                const lockup = result;
+
+                if (lockup.status === 'confirm-amount') {
+                    confirmingAmount = true;
+                    this.setState({ lockupNotice: null, loading: false });
+                    Alert.alert(
+                        localeString('views.SwapDetails.confirmLockupAmount'),
+                        lockup.paidAmount != null
+                            ? localeString(
+                                  'views.SwapDetails.confirmLockupAmount.shortfall'
+                              )
+                                  .replace(
+                                      '{{paid}}',
+                                      numberWithCommas(lockup.paidAmount)
+                                  )
+                                  .replace(
+                                      '{{amount}}',
+                                      numberWithCommas(lockup.amount ?? 0)
+                                  )
+                            : localeString(
+                                  'views.SwapDetails.confirmLockupAmount.message'
+                              ).replace(
+                                  '{{amount}}',
+                                  numberWithCommas(lockup.amount ?? 0)
+                              ),
+                        [
+                            {
+                                text: localeString('general.cancel'),
+                                style: 'cancel',
+                                onPress: () => {
+                                    confirmingAmount = false;
+                                    amountDeclined = true;
+                                    this.setState({
+                                        error: localeString(
+                                            'views.SwapDetails.lockupAmountDeclined'
+                                        )
+                                    });
+                                }
+                            },
+                            {
+                                text: localeString(
+                                    'views.SwapDetails.confirmLockupAmount.claim'
+                                ),
+                                onPress: () => {
+                                    confirmingAmount = false;
+                                    confirmedLockupAmount = lockup.amount;
+                                    claimIfLockupVerified(transactionHex);
+                                }
+                            }
+                        ],
+                        { cancelable: false }
+                    );
+                    return;
+                }
+
+                if (
+                    lockup.status === 'invalid' &&
+                    lockup.reason === 'lockup-spent' &&
+                    (invoiceSettled || this.state.swapData?.claimTransactionHex)
+                ) {
+                    // The host may hold the preimage, so the spend is
+                    // usually this wallet's claim, possibly sent from
+                    // another device. After the timeout the host's refund
+                    // spends the lockup too.
+                    if (!lockup.spentBy) {
+                        this.setState({
+                            lockupNotice: localeString(
+                                'views.SwapDetails.lockupVerificationUnavailable'
+                            )
+                        });
+                        lockupRecheck = setTimeout(
+                            () => claimIfLockupVerified(transactionHex),
+                            LOCKUP_RECHECK_MS
+                        );
+                        return;
+                    }
+                    stopRechecks();
+                    if (lockup.spentBy === 'claim') {
+                        console.log(
+                            'Reverse swap lockup already spent by a claim from this wallet'
+                        );
+                        this.setState({ lockupNotice: null });
+                        return;
+                    }
+                    console.error(
+                        'Reverse swap lockup verification failed:',
+                        'lockup-refunded',
+                        lockup.spendingTxid
+                    );
+                    this.setState({
+                        error: localeString(
+                            'views.SwapDetails.lockupSpentElsewhere'
+                        ),
+                        lockupNotice: null,
+                        loading: false
+                    });
+                    return;
+                }
+
+                if (lockup.status === 'invalid') {
+                    console.error(
+                        'Reverse swap lockup verification failed:',
+                        lockup.reason
+                    );
+                    this.setState({
+                        error: localeString(
+                            'views.SwapDetails.lockupVerificationFailed'
+                        ),
+                        lockupNotice: null,
+                        loading: false
+                    });
+                    return;
+                }
+
+                if (lockup.status !== 'ok') {
+                    this.setState({
+                        lockupNotice: localeString(
+                            lockup.status === 'unconfirmed'
+                                ? 'views.SwapDetails.waitingForLockupConfirmation'
+                                : 'views.SwapDetails.lockupVerificationUnavailable'
+                        )
+                    });
+                    lockupRecheck = setTimeout(
+                        () => claimIfLockupVerified(transactionHex),
+                        LOCKUP_RECHECK_MS
+                    );
+                    return;
+                }
+            } finally {
+                verifyingLockup = false;
+            }
+        };
+
+        // The host settles the hold invoice as soon as it has the preimage,
+        // which a cooperative claim sends before ZEUS broadcasts. If the
+        // broadcast never went out, the lockup is still ours to claim until
+        // the timeout: resend a stored claim, or fetch the lockup from the
+        // host and claim it through the usual checks.
+        const recoverSettledClaim = async () => {
+            // A claim in progress on this screen is what told the host the
+            // preimage; it stores and broadcasts its own transaction
+            if (submitted || stopped || verifyingLockup || !SwapStore) return;
+            if (this.state.swapData?.claimTransactionHex) {
+                await claimIfLockupVerified('');
+                return;
+            }
+            const lockup = await SwapStore.getReverseLockupTransactionHex(
+                createdResponse.id,
+                endpoint
+            );
+            if (stopped || submitted) return;
+            if (lockup.status === 'none') {
+                stopRechecks();
+                return;
+            }
+            // The screen would otherwise rest on invoice.settled, which
+            // looks finished, with the lockup still unclaimed
+            if (lockup.status === 'unavailable') {
+                this.setState({
+                    lockupNotice: localeString(
+                        'views.SwapDetails.lockupVerificationUnavailable'
+                    )
+                });
+                clearTimeout(lockupRecheck);
+                lockupRecheck = setTimeout(
+                    recoverSettledClaim,
+                    LOCKUP_RECHECK_MS
+                );
+                return;
+            }
+            await claimIfLockupVerified(lockup.hex);
+        };
+
+        console.log('Connecting to WebSocket for updates...');
+        this.setState({ loading: true });
+
+        // Create a WebSocket connection
+        const webSocket = new WebSocket(swapWebSocketUrl(endpoint));
+
+        // Handle WebSocket connection open
+        webSocket.onopen = () => {
+            console.log('WebSocket connection opened');
+            webSocket.send(
+                JSON.stringify({
+                    op: 'subscribe',
+                    channel: 'swap.update',
+                    args: [createdResponse.id]
+                })
+            );
+        };
+
+        // Handle incoming WebSocket messages
+        webSocket.onmessage = async (event) => {
+            const msg = JSON.parse(event.data);
+
+            if (msg.event !== 'update') {
+                return;
+            }
+
+            console.log('Got WebSocket update');
+            console.log(msg);
+
+            const data = msg.args[0];
+            const { error, failureReason } = updateText(data);
+
+            // Check for API errors
+            if (error) {
+                stopRechecks();
+                if (error === 'Operation timeout') {
+                    this.setState({
+                        error: 'The operation timed out.',
+                        loading: false,
+                        socketConnected: false
+                    });
+                    webSocket.close();
+                    return;
+                }
+
+                this.setState({
+                    error,
+                    loading: false,
+                    socketConnected: false
+                });
+                webSocket.close();
+                return;
+            }
+
+            // Update the status in the component state
+            this.setState({ updates: data.status, loading: false });
+
+            // Update the status in Encrypted Storage
+            await SwapStore?.updateSwapStatus(
+                createdResponse.id,
+                data.status,
+                isSubmarineSwap
+            );
+
+            switch (data.status) {
+                case SwapState.Created:
+                    console.log('Waiting for invoice to be paid');
+                    break;
+
+                case SwapState.TransactionMempool:
+                case SwapState.TransactionConfirmed:
+                    if (submitted) {
+                        console.log(
+                            'Claim transaction already created and submitted successfully. Skipping.'
+                        );
+                    } else if (data.transaction?.hex) {
+                        await claimIfLockupVerified(data.transaction.hex);
+                    }
+                    break;
+
+                case SwapState.InvoiceExpired:
+                case SwapState.TransactionFailed:
+                case SwapState.SwapExpired:
+                    stopRechecks();
+                    webSocket.close();
+                    failureReason &&
+                        this.setState({
+                            error: failureReason,
+                            socketConnected: false
+                        });
+                    break;
+
+                case SwapState.InvoiceSettled:
+                    console.log('Swap invoice settled');
+                    invoiceSettled = true;
+                    webSocket.close();
+                    this.setState({
+                        socketConnected: false
+                    });
+                    if (submitted) {
+                        stopRechecks();
+                    } else {
+                        await recoverSettledClaim();
+                    }
+                    break;
+
+                default:
+                    console.log('Unhandled status:', data.status);
+                    break;
+            }
+        };
+
+        webSocket.onerror = (error) => {
+            if (error.message) {
+                this.setState({
+                    error: error.message,
+                    loading: false
+                });
+            }
+            console.error('WebSocket error:', error);
+        };
+
+        webSocket.onclose = () => {
+            console.log('WebSocket connection closed');
+        };
+
+        this.componentWillUnmount = () => {
+            stopRechecks();
+            if (webSocket) {
+                webSocket.close();
+            }
+        };
+    };
+
+    fetchClaimDetails = async (swapId: string, endpoint: string) => {
+        const response = await ReactNativeBlobUtil.fetch(
+            'GET',
+            `${endpoint}/swap/submarine/${swapId}/claim`,
+            { 'Content-Type': 'application/json' }
+        );
+        return response.json();
+    };
+
+    /**
+     * Validate the preimage by comparing its hash with the invoice's payment hash.
+     */
+    validatePreimage = (preimage: string, invoice: string): boolean => {
+        let decoded;
+
+        try {
+            decoded = Bolt11Utils.decode(invoice);
+        } catch (error) {
+            console.log(error);
+        }
+
+        const invoicePreimageHash = Buffer.from(
+            decoded?.payment_hash || '',
+            'hex'
+        );
+
+        return crypto
+            .sha256(Buffer.from(preimage, 'hex'))
+            .equals(invoicePreimageHash);
+    };
+
+    /**
+     * Create and send a claim transaction
+     */
+    createClaimTransaction = async (
+        claimTxDetails: any,
+        createdResponse: any,
+        keys: any,
+        endpoint: string
+    ): Promise<boolean> => {
+        try {
+            const claim = SubmarineClaimTransaction.build({
+                swap: new Swap({ ...createdResponse, keys }),
+                endpoint: nativeSwapEndpoint(endpoint),
+                claimTxDetails
+            });
+            if (!claim) return false;
+
+            try {
+                await createClaimTransaction(claim);
+
+                console.log('Claim transaction submitted successfully.');
+                return true;
+            } catch (error) {
+                console.log('Error submitting claim tx', error);
+                return false;
+            }
+        } catch (e) {
+            console.log('Error creating claim tx ', e);
+            return false;
+        }
+    };
+
+    /**
+     * Resolve the address a reverse swap's claim should pay out to.
+     *
+     * A rescued swap has none: ZEUS attaches the address client-side and
+     * never sends it to the host (only claimPublicKey and preimageHash go
+     * over the wire), so /swap/restore has nothing to return, and any
+     * address a rescued swap has stored is ignored, including one this
+     * wallet generated on an earlier attempt. SwapStore falls back to a
+     * fresh address from the wallet in use, which is the same source the
+     * swap creation screen defaults to. That address is kept for the rest
+     * of this screen's session, so rechecks while the lockup confirms
+     * don't each take another one.
+     */
+    resolveDestinationAddress = async (swapId: string): Promise<string> => {
+        if (this.resolvedClaimAddress) return this.resolvedClaimAddress;
+
+        const { InvoicesStore, SwapStore } = this.props;
+
+        const destinationAddress =
+            (await SwapStore?.resolveClaimAddress({
+                swapId,
+                destinationAddress:
+                    this.state.swapData?.claimDestinationAddress,
+                canReceiveOnchain: BackendUtils.supportsOnchainReceiving(),
+                getNewAddress: () =>
+                    InvoicesStore!.getNewAddress({ unified: true })
+            })) || '';
+
+        if (destinationAddress) this.resolvedClaimAddress = destinationAddress;
+        return destinationAddress;
+    };
+
+    private resolvedClaimAddress?: string;
+
+    // The fee the reverse claim pays. A swap created since the fee is
+    // decided at creation stores it with its rate, so this returns the
+    // stored fee. One stored before that, or a rescued swap, pays at least
+    // currentRate (else 2 sat/vB) on the largest claim. Legacy rescues
+    // stored the host's fields, so a rescued swap's stored fee and rate
+    // are ignored.
+    claimMinerFee = (currentRate?: number): number | undefined => {
+        const { swapData } = this.state;
+        const { fee } = this.props.route.params;
+        const stored = swapData?.imported ? undefined : swapData;
+        return reverseClaimMinerFee(
+            stored?.claimMinerFee,
+            stored?.claimFeeRate ??
+                (fee ? Number(fee) : undefined) ??
+                currentRate ??
+                2
+        );
+    };
+
+    private currentClaimFeeRateLookup?: Promise<number | undefined>;
+
+    // The rate the Swaps screen would pre-fill now, for a swap that has
+    // none stored. Looked up once and kept in state, so the amount shown
+    // and the claim use the same rate. Undefined if none is needed or the
+    // lookup fails, and then both use the 2 sat/vB floor. A failed lookup
+    // is not kept, so a claim made later looks the rate up again.
+    loadCurrentClaimFeeRate = (): Promise<number | undefined> => {
+        if (!this.currentClaimFeeRateLookup) {
+            const lookup = this.fetchCurrentClaimFeeRate().then((rate) => {
+                if (
+                    rate === undefined &&
+                    this.currentClaimFeeRateLookup === lookup
+                ) {
+                    this.currentClaimFeeRateLookup = undefined;
+                }
+                return rate;
+            });
+            this.currentClaimFeeRateLookup = lookup;
+        }
+        return this.currentClaimFeeRateLookup;
+    };
+
+    fetchCurrentClaimFeeRate = async (): Promise<number | undefined> => {
+        const { swapData } = this.state;
+        if (
+            (!swapData?.imported && swapData?.claimFeeRate != null) ||
+            this.props.route.params.fee
+        ) {
+            return undefined;
+        }
+        try {
+            const fees = await this.props.FeeStore?.getOnchainFeesviaMempool();
+            const rate = fees?.fastestFee;
+            if (!isPlausibleSatPerVbyte(rate)) return undefined;
+            this.setState({ currentClaimFeeRate: Number(rate) });
+            return Number(rate);
+        } catch (e) {
+            console.log('Error fetching fee rates for claim', e);
+            return undefined;
+        }
+    };
+
+    /**
+     * Create and send a claim transaction for a reverse swap
+     */
+    createReverseClaimTransaction = async (
+        createdResponse: any,
+        keys: any,
+        endpoint: string,
+        lockupAddress: string,
+        destinationAddress: string,
+        preimage: any,
+        transactionHex: string,
+        fee: string,
+        confirmedLockupAmount?: number,
+        // true once the screen is done with the swap: no new native claim
+        // may start after that, though one already running finishes
+        isStopped: () => boolean = () => false
+    ): Promise<boolean | 'unsent' | ReverseLockupCheck> => {
+        try {
+            const { SwapStore } = this.props;
+            if (!SwapStore) return { status: 'unavailable' };
+
+            // A claim built on an earlier attempt may already have sent the
+            // preimage to the host. Broadcast that transaction again rather
+            // than build another one.
+            let claimHex: string | undefined =
+                this.state.swapData?.claimTransactionHex;
+            let claim: ReturnType<typeof ReverseClaimTransaction.build> = null;
+
+            // Once something else spent the lockup, such as the host's
+            // refund after the timeout, the stored claim can never confirm
+            if (claimHex) {
+                const spend = await SwapStore.checkStoredClaim(
+                    claimHex,
+                    preimage
+                );
+                if (spend.status === 'invalid') return spend;
+            }
+
+            if (!claimHex) {
+                const minerFee = this.claimMinerFee(
+                    await this.loadCurrentClaimFeeRate()
+                );
+                if (minerFee === undefined) {
+                    this.setState({
+                        error: localeString('views.SwapDetails.claimFailed'),
+                        loading: false
+                    });
+                    return false;
+                }
+
+                // a rescued swap arrives without one, and a claim cannot be
+                // built - let alone paid out - without somewhere to pay to
+                const claimAddress =
+                    destinationAddress ||
+                    (await this.resolveDestinationAddress(createdResponse.id));
+                if (!claimAddress) {
+                    this.setState({
+                        error: localeString(
+                            'views.SwapDetails.claimAddressFailed'
+                        ),
+                        loading: false
+                    });
+                    return false;
+                }
+
+                claim = ReverseClaimTransaction.build({
+                    swap: new Swap({
+                        ...createdResponse,
+                        keys,
+                        preimage,
+                        lockupAddress,
+                        destinationAddress: claimAddress
+                    }),
+                    transactionHex,
+                    feeRate: Number(fee || 2),
+                    minerFee
+                });
+                // build fails closed on a swap missing the material a valid
+                // claim needs; say so rather than leaving the screen spinning
+                if (!claim) {
+                    this.setState({
+                        error: localeString('views.SwapDetails.claimFailed'),
+                        loading: false
+                    });
+                    return false;
+                }
+            }
+
+            // allow some retries in case of alt network
+            // tx propagation issues
+            for (let i = 0; i <= 10; i++) {
+                try {
+                    await sleep(1000);
+                    // a claim that may have reached the host is still
+                    // broadcast; only a new one may not start
+                    if (!claimHex && isStopped()) return false;
+
+                    if (!claimHex) {
+                        // Fee/address resolution and a previous attempt can
+                        // take arbitrarily long. Never reuse an earlier
+                        // unspent/deadline check before revealing the
+                        // preimage.
+                        const lockup = await SwapStore.verifyReverseLockup(
+                            new Swap({
+                                ...createdResponse,
+                                keys,
+                                preimage,
+                                lockupAddress
+                            }),
+                            transactionHex,
+                            { confirmedLockupAmount }
+                        );
+                        if (isStopped()) return false;
+                        if (lockup.status !== 'ok') return lockup;
+                        this.setState({ lockupNotice: null });
+
+                        const builtHex = await buildReverseClaimTransaction({
+                            ...claim!,
+                            network: swapNetworkName(
+                                this.props.NodeInfoStore!.nodeInfo
+                            )
+                        });
+                        claimHex = builtHex;
+                        // stored before the first broadcast: from here on
+                        // the host may hold the preimage
+                        await SwapStore.saveClaimTransaction(
+                            createdResponse.id,
+                            builtHex
+                        );
+                        this.setState((prevState) => ({
+                            swapData: new Swap({
+                                ...prevState.swapData,
+                                claimTransactionHex: builtHex
+                            })
+                        }));
+                    }
+
+                    const txid = await SwapStore.broadcastSwapTransaction(
+                        claimHex,
+                        endpoint
+                    );
+                    await SwapStore.saveClaimTxid(createdResponse.id, txid);
+                    this.setState((prevState) => ({
+                        swapData: new Swap({
+                            ...prevState.swapData,
+                            claimTxid: txid
+                        })
+                    }));
+
+                    console.log(
+                        'Reverse claim transaction broadcast successfully.',
+                        { attempt: i + 1, txid }
+                    );
+                    // an earlier attempt (e.g. on transaction.mempool) may
+                    // have failed and set an error that no longer applies
+                    this.setState({ error: null });
+                    return true;
+                } catch (error) {
+                    console.log('Error submitting reverse claim tx', {
+                        error,
+                        attempt: i + 1
+                    });
+                }
+            }
+            this.setState({
+                error: localeString('views.SwapDetails.claimBroadcastFailed'),
+                loading: false
+            });
+            // a signed claim is stored, but no broadcast went through
+            return claimHex ? 'unsent' : false;
+        } catch (e) {
+            console.log('Error creating reverse claim tx ', e);
+            this.setState({
+                error: localeString('views.SwapDetails.claimFailed'),
+                loading: false
+            });
+            return false;
+        }
+    };
+
+    timelockIndicator = () => {
+        const { swapData } = this.state;
+
+        if (!nodeInfoStore.nodeInfo.currentBlockHeight) return '';
+
+        if (
+            new BigNumber(swapData.timeoutBlockHeight).gt(
+                nodeInfoStore.nodeInfo.currentBlockHeight
+            )
+        ) {
+            return '🔒';
+        }
+
+        return '';
+    };
+
+    render() {
+        const { navigation, SwapStore } = this.props;
+
+        const { updates, error, failureReason, swapData, lockupNotice } =
+            this.state;
+
+        const serviceProvider = this.props.route.params?.serviceProvider ?? '';
+
+        const progressUpdate = swapData.isSubmarineSwap
+            ? updates === SwapState.InvoiceSet
+                ? localeString('views.SwapDetails.waitingForOnchainTx')
+                : updates === SwapState.TransactionMempool
+                ? localeString('views.SwapDetails.waitingForConf')
+                : ''
+            : updates === SwapState.Created
+            ? localeString('views.SwapDetails.waitingForInvoicePayment')
+            : updates === SwapState.TransactionMempool
+            ? localeString('views.SwapDetails.waitingForConf')
+            : '';
+
+        const QRButton = () => {
+            if (!swapData.qrCodeValue) {
+                return null;
+            }
+
+            return (
+                <TouchableOpacity
+                    onPress={() =>
+                        navigation.navigate('QR', {
+                            value: swapData.qrCodeValue
+                        })
+                    }
+                >
+                    <QR
+                        fill={themeColor('text')}
+                        style={{ alignSelf: 'center' }}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        const failure = failureReason || swapData.failureReason;
+
+        const showPayButton =
+            !!swapData.qrCodeValue &&
+            (updates === SwapState.InvoiceSet || updates === SwapState.Created);
+
+        const showRefundButton =
+            swapData.lockupTransaction &&
+            (updates === SwapState.InvoiceFailedToPay ||
+                updates === SwapState.TransactionLockupFailed ||
+                (swapData.isSubmarineSwap &&
+                    updates === SwapState.SwapExpired) ||
+                (failure && error));
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.SwapDetails.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <Row style={{ gap: 10 }}>
+                            {this.state.loading && (
+                                <LoadingIndicator size={35} />
+                            )}
+                            {!this.state.loading &&
+                                (updates === SwapState.InvoiceSet ||
+                                    (swapData.type === SwapType.Reverse &&
+                                        updates === SwapState.Created)) && (
+                                    <QRButton />
+                                )}
+                        </Row>
+                    }
+                    navigation={navigation}
+                />
+                <ScrollView
+                    style={{ marginHorizontal: 20 }}
+                    showsVerticalScrollIndicator={false}
+                >
+                    <View style={{ marginBottom: 15 }}>
+                        <Text
+                            style={{
+                                textAlign: 'center',
+                                fontFamily: font('marlideBold'),
+                                fontSize: 28
+                            }}
+                        >
+                            {swapData.type}
+                        </Text>
+                        <Text
+                            style={{
+                                textAlign: 'center',
+                                fontFamily: font('marlide'),
+                                fontSize: 22
+                            }}
+                        >
+                            {swapData.type === SwapType.Submarine
+                                ? 'on-chain to Lightning'
+                                : 'Lightning to on-chain'}
+                        </Text>
+                    </View>
+                    {this.state.socketConnected && progressUpdate && (
+                        <View
+                            style={{
+                                flex: 1,
+                                justifyContent: 'center',
+                                alignItems: 'center',
+                                margin: 15,
+                                gap: 4
+                            }}
+                        >
+                            <LinearProgress color={themeColor('highlight')} />
+                            <Text
+                                style={{
+                                    textAlign: 'center',
+                                    fontSize: 14,
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    marginTop: 10
+                                }}
+                            >
+                                {progressUpdate}
+                            </Text>
+                        </View>
+                    )}
+                    {lockupNotice && !error && (
+                        <WarningMessage message={lockupNotice} />
+                    )}
+                    {error && (
+                        <ErrorMessage
+                            message={
+                                typeof error === 'object' && 'message' in error
+                                    ? error?.message
+                                    : String(error)
+                            }
+                        />
+                    )}
+
+                    {updates && (
+                        <KeyValue
+                            keyValue={localeString('general.status')}
+                            value={SwapStore?.formatStatus(updates)}
+                            color={SwapStore?.statusColor(updates as SwapState)}
+                        />
+                    )}
+
+                    {failure && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.SwapSettings.failureReason'
+                            )}
+                            value={SwapStore?.formatStatus(failure)}
+                            color={SwapStore?.statusColor(failure as SwapState)}
+                        />
+                    )}
+
+                    {(serviceProvider || swapData?.serviceProvider) && (
+                        <KeyValue
+                            keyValue={localeString('general.serviceProvider')}
+                            value={serviceProvider || swapData.serviceProvider}
+                        />
+                    )}
+
+                    <KeyValue
+                        keyValue={localeString('views.SwapDetails.swapId')}
+                        value={swapData.id}
+                        showCopyIcon
+                    />
+
+                    {swapData.isSubmarineSwap && (
+                        <>
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.SwapDetails.expectedAmount'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={swapData?.getAmount}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                            />
+                        </>
+                    )}
+                    {swapData.isSubmarineSwap && (
+                        <KeyValue
+                            keyValue={localeString('general.address')}
+                            value={swapData.effectiveLockupAddress}
+                            showCopyIcon
+                        />
+                    )}
+                    {swapData?.txid && (
+                        <KeyValue
+                            keyValue={localeString('views.SendingOnChain.txid')}
+                            value={swapData.txid}
+                            showCopyIcon
+                            mempoolLink={() =>
+                                UrlUtils.goToBlockExplorerTXID(
+                                    swapData?.txid!,
+                                    this.props.NodeInfoStore!.nodeInfo.isTestNet
+                                )
+                            }
+                            sensitive
+                        />
+                    )}
+                    {swapData.isReverseSwap && (
+                        <>
+                            {swapData?.invoice && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.Invoice.title'
+                                    )}
+                                    value={swapData.invoice}
+                                    showCopyIcon
+                                />
+                            )}
+                            {/* a legacy rescue's amount came from the host */}
+                            {!swapData.imported && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.SwapDetails.onchainAmount'
+                                    )}
+                                    value={
+                                        <Amount
+                                            sats={
+                                                SwapStore?.getReverseSwapReceiveAmount(
+                                                    swapData?.getAmount,
+                                                    this.claimMinerFee(
+                                                        this.state
+                                                            .currentClaimFeeRate
+                                                    ) ?? swapData?.claimMinerFee
+                                                ) || 0
+                                            }
+                                            sensitive
+                                            toggleable
+                                        />
+                                    }
+                                />
+                            )}
+                        </>
+                    )}
+                    {swapData.isReverseSwap && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.SwapDetails.lockupAddress'
+                            )}
+                            value={swapData.lockupAddress}
+                            showCopyIcon
+                        />
+                    )}
+
+                    <KeyValue
+                        keyValue={localeString(
+                            'views.SwapDetails.timeoutBlockHeight'
+                        )}
+                        infoModalText={localeString(
+                            'views.SwapDetails.timeoutBlockHeight.explainer'
+                        )}
+                        value={`${numberWithCommas(
+                            swapData.timeoutBlockHeight
+                        )} ${this.timelockIndicator()}`}
+                    />
+                    {swapData.isSubmarineSwap && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.SwapDetails.claimPublicKey'
+                            )}
+                            value={swapData?.servicePubKey}
+                            showCopyIcon
+                        />
+                    )}
+                    {swapData.isReverseSwap && swapData.refundPubKey && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.SwapDetails.refundPublicKey'
+                            )}
+                            value={swapData.refundPubKey}
+                            showCopyIcon
+                        />
+                    )}
+                    {swapData.isReverseSwap && swapData?.preimageHash && (
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.SwapDetails.preimageHash'
+                            )}
+                            value={swapData?.preimageHash}
+                            showCopyIcon
+                        />
+                    )}
+
+                    {/* Render Swap Tree */}
+                    {this.renderSwapTree(swapData?.swapTree || swapData?.tree)}
+                </ScrollView>
+                {showPayButton && (
+                    <Button
+                        title={localeString('views.PaymentRequest.payInvoice')}
+                        containerStyle={{
+                            paddingVertical: 10
+                        }}
+                        onPress={() => {
+                            if (swapData.qrCodeValue) {
+                                handleAnything(swapData.qrCodeValue).then(
+                                    ([route, props]) => {
+                                        navigation.navigate(route, props);
+                                    }
+                                );
+                            }
+                        }}
+                        secondary
+                    />
+                )}
+                {showRefundButton && (
+                    <Button
+                        title={localeString('views.Swaps.refundSwap')}
+                        containerStyle={{ paddingVertical: 10 }}
+                        onPress={() => {
+                            const { endpoint } = this.props.route.params;
+                            navigation.navigate('RefundSwap', {
+                                swapData: new Swap({
+                                    ...swapData,
+                                    endpoint
+                                })
+                            });
+                        }}
+                        secondary
+                    />
+                )}
+            </Screen>
+        );
+    }
+}

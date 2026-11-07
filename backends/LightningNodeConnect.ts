@@ -1,0 +1,1260 @@
+import {
+    NativeModules,
+    NativeEventEmitter,
+    EmitterSubscription
+} from 'react-native';
+
+import LNC from '../zeus_modules/@lightninglabs/lnc-rn';
+import { lnrpc, walletrpc } from '../zeus_modules/@lightninglabs/lnc-core';
+
+import { settingsStore, nodeInfoStore } from '../stores/Stores';
+import CredentialStore, { hash } from './LNC/credentialStore';
+
+import OpenChannelRequest from '../models/OpenChannelRequest';
+
+import Base64Utils from '../utils/Base64Utils';
+import { snakeize } from '../utils/DataFormatUtils';
+import {
+    decideLncPayEvent,
+    deriveExpectedPaymentHash
+} from '../utils/LncPayUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { findPaymentByHash } from '../utils/PaymentLookupUtils';
+import {
+    toLnrpcAddressType,
+    toWalletrpcAddressTypeName
+} from '../utils/LndUtils';
+import {
+    isEventForRequest,
+    newStreamRequestId
+} from '../utils/StreamRequestUtils';
+import VersionUtils from '../utils/VersionUtils';
+import {
+    DEFAULT_MAX_TRANSACTIONS,
+    getNewestTransactions,
+    TransactionPageRequest
+} from '../utils/OnchainTransactionUtils';
+
+import { sha256Bytes } from '../utils/HashingUtils';
+import BigNumber from 'bignumber.js';
+
+export default class LightningNodeConnect {
+    private client: any;
+    customMessagesListener: EmitterSubscription | null = null;
+
+    // Lifecycle code may close an old client, but RPCs must only use the
+    // selected wallet's session. A pending native dial can outlive a switch.
+    get lnc(): any {
+        if (!this.isSelectedSession(this.client)) {
+            throw new Error(
+                localeString('stores.SettingsStore.lncConnectError')
+            );
+        }
+        return this.client;
+    }
+
+    private isSelectedSession = (client: any) => {
+        const {
+            implementation,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer
+        } = settingsStore;
+        return (
+            !!client &&
+            implementation === 'lightning-node-connect' &&
+            client._namespace === hash(pairingPhrase || '') &&
+            client.credentials?.serverHost ===
+                (mailboxServer === 'custom-defined'
+                    ? customMailboxServer
+                    : mailboxServer)
+        );
+    };
+
+    // Default true: checkPerms currently forces all perms true (ZEUS-3642),
+    // and it only runs after a successful connect, so uninitialized perms
+    // would misreport a failed connection as a read-only wallet (and NWC
+    // subscribe-before-checkPerms on app resume would drop sign_message).
+    // Restore hasPerms in checkPerms before relying on these flags.
+    permOpenChannel: boolean = true;
+    permSendCoins: boolean = true;
+    permSendLN: boolean = true;
+    permNewAddress: boolean = true;
+    permImportAccount: boolean = true;
+    permForwardingHistory: boolean = true;
+    permSignMessage: boolean = true;
+
+    // Instances moved off while their native dial was still in progress,
+    // keyed by namespace. The dial cannot be cancelled (see LNC.disconnect),
+    // so the instance is kept until the dial lands or its wallet is opened
+    // again, rather than stacking a second client on the same session.
+    private parked = new Map<string, any>();
+
+    initLNC = async () => {
+        const { pairingPhrase, mailboxServer, customMailboxServer } =
+            settingsStore;
+
+        // One namespace per wallet. Upstream keys its mobile clients by
+        // namespace, so the shared 'default' meant every LNC wallet fought
+        // over a single native connection.
+        const namespace = hash(pairingPhrase || '');
+        const serverHost =
+            mailboxServer === 'custom-defined'
+                ? customMailboxServer
+                : mailboxServer;
+
+        // Same wallet and mailbox with a native client that is connected or
+        // still dialing: keep it. The native client redials on its own, and
+        // InitLNC would replace it without stopping it, leaving two clients
+        // on one mailbox session.
+        if (await this.isReusable(this.client, namespace, serverHost)) return;
+
+        // Upstream's InitLNC replaces the namespace's mobile client outright
+        // (m[nameSpace] = newMobileClient()) without closing the connection
+        // already on it. Tear the previous session down first; a dial still
+        // in progress cannot be torn down, so park it instead.
+        await this.disconnect();
+        if (this.client && (await this.isDialing(this.client))) {
+            this.parked.set(this.client._namespace, this.client);
+        }
+        this.client = undefined;
+
+        await this.releaseLandedDials(namespace);
+
+        const parked = this.parked.get(namespace);
+        if (parked) {
+            this.parked.delete(namespace);
+            if (await this.isReusable(parked, namespace, serverHost)) {
+                this.client = parked;
+                return;
+            }
+            // The mailbox changed. The old dial keeps running against the
+            // old host; stop routing its events to a credential store that
+            // the fresh client below now owns.
+            parked.dispose();
+        }
+
+        const credentialStore = await new CredentialStore(
+            pairingPhrase
+        ).initialize();
+
+        // Load before overlaying the settings values: load() replaces the
+        // whole persisted blob, so anything assigned beforehand is discarded.
+        await credentialStore.load(pairingPhrase);
+        credentialStore.pairingPhrase = pairingPhrase;
+        credentialStore.serverHost = serverHost;
+
+        this.client = new LNC({ namespace, credentialStore });
+    };
+
+    private isDialing = async (lnc: any) => {
+        try {
+            return await lnc.isDialing();
+        } catch (e) {
+            console.log('LNC: isDialing check failed', e);
+            return false;
+        }
+    };
+
+    private isReusable = async (
+        lnc: any,
+        namespace: string,
+        serverHost: string
+    ) => {
+        if (!lnc) return false;
+        if (lnc._namespace !== namespace) return false;
+        if (lnc.credentials?.serverHost !== serverHost) return false;
+        if (await this.isDialing(lnc)) return true;
+        try {
+            return await lnc.isConnected();
+        } catch (e) {
+            return false;
+        }
+    };
+
+    // A parked dial that has since connected is a live session for a wallet
+    // that is not open. Its keys have been reported by now, so close it.
+    private releaseLandedDials = async (keep: string) => {
+        for (const [namespace, lnc] of [...this.parked]) {
+            if (namespace === keep || (await this.isDialing(lnc))) continue;
+            this.parked.delete(namespace);
+            await this.closeSession(lnc);
+        }
+    };
+
+    connect = async () => {
+        await this.wakeDeadSession();
+        return await this.lnc.connect();
+    };
+
+    // A client whose mailbox session died keeps its gRPC channel (native
+    // IsConnected stays true), and connect() leaves it alone. grpc-go puts a
+    // channel that lost its transport into IDLE and only redials when an RPC
+    // is made, so without one the session never comes back (litd restart,
+    // airplane mode). The RPC's own result does not matter.
+    private wakeDeadSession = async () => {
+        try {
+            if (!(await this.lnc.isConnected())) return;
+            const status = await this.lnc.status();
+            if (!status || status === 'Connected') return;
+        } catch (e) {
+            return;
+        }
+        this.lnc.lnd.lightning.getInfo({}).catch(() => {});
+    };
+    checkPerms = async () => {
+        // ZEUS-3642: we are temporarily returning all perms
+        // as true until resolved
+        // https://github.com/ZeusLN/zeus/issues/3642
+        //
+        // this.permOpenChannel = await this.lnc.hasPerms(
+        //     'lnrpc.Lightning.OpenChannel'
+        // );
+        // this.permSendCoins = await this.lnc.hasPerms(
+        //     'lnrpc.Lightning.SendCoins'
+        // );
+        // this.permSendLN = await this.lnc.hasPerms(
+        //     'routerrpc.Router.SendPaymentV2'
+        // );
+        // this.permNewAddress = await this.lnc.hasPerms(
+        //     'lnrpc.Lightning.NewAddress'
+        // );
+        // this.permImportAccount = await this.lnc.hasPerms(
+        //     'walletrpc.WalletKit.ImportAccount'
+        // );
+        // this.permForwardingHistory = await this.lnc.hasPerms(
+        //     'lnrpc.Lightning.ForwardingHistory'
+        // );
+        // this.permSignMessage = await this.lnc.hasPerms(
+        //     'signrpc.Signer.SignMessage'
+        // );
+        this.permOpenChannel = true;
+        this.permSendCoins = true;
+        this.permSendLN = true;
+        this.permNewAddress = true;
+        this.permImportAccount = true;
+        this.permForwardingHistory = true;
+        this.permSignMessage = true;
+    };
+    // IsConnected on the native side only reports that an RPC connection
+    // was established once (lndConn != nil); it stays true after the
+    // mailbox session dies. The mailbox status is what tracks the session.
+    isConnected = async () => {
+        const client = this.client;
+        if (!this.isSelectedSession(client)) return false;
+        try {
+            if (!(await client.isConnected())) return false;
+        } catch (e) {
+            // rejects with 'unknown namespace' when the native client was
+            // never initialized, which is just another way of saying no
+            console.log('LNC: isConnected check failed', e);
+            return false;
+        }
+        try {
+            const status = await client.status();
+            return (
+                this.client === client &&
+                this.isSelectedSession(client) &&
+                (!status || status === 'Connected')
+            );
+        } catch (e) {
+            console.log('LNC: status check failed', e);
+            return this.client === client && this.isSelectedSession(client);
+        }
+    };
+    disconnect = async () => {
+        if (!this.client) return;
+        await this.closeSession(this.client);
+    };
+    private closeSession = async (lnc: any) => {
+        // Let queued credential writes land before the session goes away. An
+        // LNC pairing phrase is single use, so a wallet whose freshly paired
+        // localKey/remoteKey never reached the keychain can never reconnect.
+        try {
+            await lnc.credentials?.flushWrites?.();
+        } catch (e) {
+            console.log('LNC: error flushing credential writes', e);
+        }
+        try {
+            await lnc.disconnect();
+        } catch (e) {
+            console.log('LNC: error disconnecting', e);
+        }
+    };
+
+    getTransactions = async (data?: Partial<TransactionPageRequest> | null) => {
+        const fetchPage = async (request: TransactionPageRequest) =>
+            await this.lnc.lnd.lightning
+                .getTransactions({
+                    startHeight: request.start_height,
+                    endHeight: request.end_height,
+                    maxTransactions: request.max_transactions
+                })
+                .then(
+                    (data: lnrpc.TransactionDetails) =>
+                        snakeize(data).transactions || []
+                );
+        const transactions =
+            data?.start_height !== undefined || data?.end_height !== undefined
+                ? await fetchPage({
+                      start_height: data.start_height,
+                      end_height: data.end_height,
+                      max_transactions:
+                          data.max_transactions ?? DEFAULT_MAX_TRANSACTIONS
+                  })
+                : await getNewestTransactions({
+                      fetchPage,
+                      limit: data?.max_transactions ?? DEFAULT_MAX_TRANSACTIONS
+                  });
+        return {
+            transactions: transactions.reverse()
+        };
+    };
+    getChannels = async () =>
+        await this.lnc.lnd.lightning
+            .listChannels({})
+            .then((data: lnrpc.ListChannelsResponse) => snakeize(data));
+    getPendingChannels = async () =>
+        await this.lnc.lnd.lightning
+            .pendingChannels({})
+            .then((data: lnrpc.PendingChannelsResponse) => snakeize(data));
+    getClosedChannels = async () =>
+        await this.lnc.lnd.lightning
+            .closedChannels({})
+            .then((data: lnrpc.ClosedChannelsResponse) => snakeize(data));
+    getChannelInfo = async (chanId: string) => {
+        const request = { chanId, chanPoint: '' };
+        return await this.lnc.lnd.lightning
+            .getChanInfo(request)
+            .then((data: lnrpc.ChannelEdge) => snakeize(data));
+    };
+    getBlockchainBalance = async (req: lnrpc.WalletBalanceRequest) =>
+        await this.lnc.lnd.lightning
+            .walletBalance(req)
+            .then((data: lnrpc.WalletBalanceResponse) => snakeize(data));
+    getLightningBalance = async (req: lnrpc.ChannelBalanceRequest) =>
+        await this.lnc.lnd.lightning
+            .channelBalance(req)
+            .then((data: lnrpc.ChannelBalanceResponse) => snakeize(data));
+    sendCoins = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .sendCoins({
+                addr: data.addr,
+                sat_per_vbyte: data.sat_per_vbyte,
+                amount: data.amount,
+                spend_unconfirmed: data.spend_unconfirmed,
+                send_all: data.send_all,
+                outpoints: data.outpoints,
+                label: data.label
+            })
+            .then((data: lnrpc.SendCoinsResponse) => snakeize(data));
+    sendCustomMessage = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .sendCustomMessage({
+                peer: Base64Utils.hexToBase64(data.peer),
+                type: data.type,
+                data: Base64Utils.hexToBase64(data.data)
+            })
+            .then((data: lnrpc.SendCustomMessageResponse) => snakeize(data));
+    // same callback signature as the LND REST backend so callers like
+    // LSPStore can subscribe without implementation branching
+    subscribeCustomMessages = (onResponse: any, onError: any) => {
+        const streamingCall = this.lnc.lnd.lightning.subscribeCustomMessages(
+            {}
+        );
+
+        const { LncModule } = NativeModules;
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        // events for this call arrive under the RPC method name, so a
+        // re-subscription reuses the same event name; drop the previous
+        // listener so messages are not handled twice
+        this.customMessagesListener?.remove();
+        this.customMessagesListener = eventEmitter.addListener(
+            streamingCall,
+            (event: any) => {
+                if (!event.result || event.result === 'EOF') return;
+                try {
+                    onResponse({ result: JSON.parse(event.result) });
+                } catch (error) {
+                    onError(error);
+                }
+            }
+        );
+    };
+    getMyNodeInfo = async () =>
+        await this.lnc.lnd.lightning
+            .getInfo({})
+            .then((data: lnrpc.GetInfoResponse) => snakeize(data));
+    getNetworkInfo = async () =>
+        await this.lnc.lnd.lightning
+            .getNetworkInfo({})
+            .then((data: lnrpc.NetworkInfo) => snakeize(data));
+    getInvoices = async (
+        params: { limit?: number; reversed?: boolean } = {
+            limit: 500,
+            reversed: true
+        }
+    ) =>
+        await this.lnc.lnd.lightning
+            .listInvoices({
+                reversed:
+                    params?.reversed !== undefined ? params.reversed : true,
+                ...(params?.limit && {
+                    num_max_invoices: params.limit
+                })
+            })
+            .then((data: lnrpc.ListInvoiceResponse) => snakeize(data));
+    createInvoice = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .addInvoice({
+                memo: data.memo,
+                value_msat: data.value_msat || Number(data.value) * 1000,
+                expiry: data.expiry_seconds,
+                is_amp: data.is_amp,
+                is_blinded: data.is_blinded,
+                private: data.private,
+                r_preimage: data.preimage
+                    ? Base64Utils.hexToBase64(data.preimage)
+                    : undefined,
+                route_hints: data.route_hints
+            })
+            .then((data: lnrpc.AddInvoiceResponse) => snakeize(data));
+    getPayments = async (
+        params: {
+            maxPayments?: number;
+            reversed?: boolean;
+            creationDateStart?: number;
+        } = {
+            maxPayments: 500,
+            reversed: true
+        }
+    ) =>
+        await this.lnc.lnd.lightning
+            .listPayments({
+                include_incomplete: true,
+                ...(params?.maxPayments && {
+                    max_payments: params.maxPayments
+                }),
+                reversed:
+                    params?.reversed !== undefined ? params.reversed : true,
+                ...(params?.creationDateStart && {
+                    creation_date_start: params.creationDateStart
+                })
+            })
+            .then((data: lnrpc.ListPaymentsResponse) => snakeize(data));
+    // scans payments pages; trackPaymentV2 over LNC is a stream and would
+    // need view-level event plumbing
+    lookupPayment = async (data: {
+        payment_hash: string;
+        creation_date_start?: number;
+    }) =>
+        await findPaymentByHash(
+            (request) => this.getPayments(request),
+            data.payment_hash,
+            data.creation_date_start
+        );
+    getNewAddress = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .newAddress({
+                type: toLnrpcAddressType(data.type),
+                account: data.account || 'default'
+            })
+            .then((data: walletrpc.AddrRequest) => snakeize(data));
+    getNewChangeAddress = async (data: any) =>
+        await this.lnc.lnd.walletKit
+            .nextAddr({
+                // NextAddr takes walletrpc.AddressType, whose names and
+                // numbering differ from lnrpc.AddressType
+                type: toWalletrpcAddressTypeName(data.type),
+                account: data.account || 'default',
+                change: true
+            })
+            .then((data: walletrpc.AddrResponse) => snakeize(data));
+    openChannelSync = async (data: OpenChannelRequest) => {
+        let request: any = {
+            private: data.privateChannel,
+            scid_alias: data.scidAlias,
+            local_funding_amount: data.local_funding_amount || 0,
+            min_confs: data.min_confs,
+            node_pubkey_string: data.node_pubkey_string,
+            sat_per_vbyte: data.sat_per_vbyte,
+            spend_unconfirmed: data.spend_unconfirmed,
+            close_address: data.close_address,
+            memo: data.memo
+        };
+
+        if (data.fundMax) {
+            request.fund_max = true;
+            delete request.local_funding_amount;
+        }
+
+        if (data.simpleTaprootChannel) {
+            request.commitment_type = lnrpc.CommitmentType['SIMPLE_TAPROOT'];
+        }
+
+        if (data.utxos && data.utxos.length > 0) {
+            request.outpoints = data.utxos.map((utxo: string) => {
+                const [txid_str, output_index] = utxo.split(':');
+                return {
+                    txid_str,
+                    output_index: Number(output_index)
+                };
+            });
+        }
+        return await this.lnc.lnd.lightning
+            .openChannelSync(request)
+            .then((data: lnrpc.ChannelPoint) => snakeize(data));
+    };
+
+    openChannelStream = (data: OpenChannelRequest) => {
+        let request: any = {
+            private: data.privateChannel || false,
+            scid_alias: data.scidAlias,
+            local_funding_amount: data.local_funding_amount,
+            min_confs: data.min_confs,
+            node_pubkey: Base64Utils.hexToBase64(data.node_pubkey_string),
+            sat_per_vbyte: !data.funding_shim ? data.sat_per_vbyte : undefined,
+            spend_unconfirmed: data.spend_unconfirmed,
+            funding_shim: data.funding_shim
+        };
+
+        if (data.fundMax) {
+            request.fund_max = true;
+        }
+
+        if (data.simpleTaprootChannel) {
+            request.commitment_type = lnrpc.CommitmentType['SIMPLE_TAPROOT'];
+        }
+
+        if (data.utxos && data.utxos.length > 0) {
+            request.outpoints = data.utxos.map((utxo: string) => {
+                const [txid_str, output_index] = utxo.split(':');
+                return {
+                    txid_str,
+                    output_index: Number(output_index)
+                };
+            });
+        }
+
+        if (data.funding_shim) {
+            request.funding_shim = data.funding_shim;
+            delete request.sat_per_vbyte;
+        }
+
+        // Streaming RPCs are started through subscribe() rather than the
+        // typed lnd proxy so the request id reaches the native module
+        const requestId = newStreamRequestId();
+        const streamingCall = this.lnc.subscribe(
+            'lnrpc.Lightning.OpenChannel',
+            request,
+            requestId
+        );
+
+        const { LncModule } = NativeModules;
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        return new Promise((resolve, reject) => {
+            const listener = eventEmitter.addListener(
+                streamingCall,
+                (event: any) => {
+                    if (!isEventForRequest(event, requestId)) return;
+                    if (event.result && event.result !== 'EOF') {
+                        let result;
+                        try {
+                            result = JSON.parse(event.result);
+
+                            resolve({ result });
+                            listener.remove();
+                        } catch (e) {
+                            try {
+                                result = JSON.parse(event);
+                            } catch (e2) {
+                                result = event.result || event;
+                            }
+
+                            reject(result);
+                            listener.remove();
+                        }
+                    }
+                }
+            );
+        });
+    };
+    connectPeer = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .connectPeer(data)
+            .then((data: lnrpc.ConnectPeerRequest) => snakeize(data));
+    decodePaymentRequest = async (urlParams?: Array<string>) =>
+        await this.lnc.lnd.lightning
+            .decodePayReq({ pay_req: urlParams && urlParams[0] })
+            .then((data: lnrpc.PayReq) => snakeize(data));
+    payLightningInvoice = (data: any) => {
+        // sendPaymentV2 is a streaming RPC: the call returns the event name
+        // ('routerrpc.Router.SendPaymentV2') and results arrive on a channel
+        // shared by every concurrent payment. The request id tells this
+        // payment's events (including errors) apart; the payment hash check
+        // in decideLncPayEvent stays as a second guard. Resolve with this
+        // payment's terminal result so callers get the same promise
+        // contract as every other backend. The expected hash must be
+        // derived before pubkey is stripped.
+        const expectedHash = deriveExpectedPaymentHash(data);
+        if (data.pubkey) delete data.pubkey;
+
+        const requestId = newStreamRequestId();
+        const streamingCall = this.lnc.subscribe(
+            'routerrpc.Router.SendPaymentV2',
+            {
+                ...data,
+                allow_self_payment: true
+            },
+            requestId
+        );
+
+        const { LncModule } = NativeModules;
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            let subscription: EmitterSubscription;
+
+            const settle = (fn: () => void) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                subscription.remove();
+                fn();
+            };
+
+            // If the stream dies without a terminal event, resolve with the
+            // designed in-transit shape rather than rejecting: the payment
+            // may still settle node-side, and a hard failure here invites a
+            // retry (a double-send on keysend, where every attempt carries
+            // a fresh preimage).
+            const timeoutMs =
+                ((Number(data.timeout_seconds) || 60) + 60) * 1000;
+            const timer = setTimeout(
+                () =>
+                    settle(() =>
+                        resolve({
+                            payment_error: localeString(
+                                'views.SendingLightning.paymentTimedOut'
+                            ),
+                            // outcome unknown on the node: lets the caller
+                            // track the payment to a terminal state
+                            // instead of reporting failure. No
+                            // dispatch_deadline_ms: the stream is never
+                            // cancelled, so the request could still reach
+                            // the node through the mailbox.
+                            payment_timed_out: true
+                        })
+                    ),
+                timeoutMs
+            );
+
+            subscription = eventEmitter.addListener(
+                streamingCall,
+                (event: any) => {
+                    if (!isEventForRequest(event, requestId)) return;
+                    const decision = decideLncPayEvent(
+                        event?.result,
+                        expectedHash
+                    );
+                    if (decision.kind === 'terminal') {
+                        settle(() => resolve(decision.result));
+                    } else if (decision.kind === 'error') {
+                        settle(() => reject(decision.error));
+                    }
+                    // 'ignore': EOF, a non-terminal status, or another payment's event
+                }
+            );
+        });
+    };
+    closeChannel = (urlParams?: Array<string>) => {
+        let params: any = {
+            channel_point: {
+                funding_txid_str: urlParams && urlParams[0],
+                output_index: urlParams && urlParams[1] && Number(urlParams[1])
+            },
+            force: urlParams && urlParams[2]
+        };
+
+        if (urlParams && urlParams[3] && !urlParams[2]) {
+            params.sat_per_vbyte = Number(urlParams[3]);
+        }
+
+        if (urlParams && urlParams[4]) {
+            params.delivery_address = urlParams[4];
+        }
+
+        // closeChannel is a streaming RPC: the call returns the event name
+        // and updates arrive on a channel shared by every concurrent close.
+        // The request id tells this close's updates apart. Resolve on
+        // close_pending, the first update of a close, so callers get the
+        // same promise contract as the other backends. chan_close only
+        // arrives once the close has confirmed, so it is skipped.
+        const requestId = newStreamRequestId();
+        const streamingCall = this.lnc.subscribe(
+            'lnrpc.Lightning.CloseChannel',
+            params,
+            requestId
+        );
+
+        const { LncModule } = NativeModules;
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        const CHANNEL_CLOSE_TIMEOUT_MS = 60000;
+        return new Promise((resolve, reject) => {
+            const finish = () => {
+                clearTimeout(timeout);
+                listener.remove();
+            };
+            // Timeout: resolve optimistically. If the peer disconnects during
+            // a cooperative close, LND keeps the stream open without sending
+            // close_pending or an error.
+            const timeout = setTimeout(() => {
+                finish();
+                resolve({});
+            }, CHANNEL_CLOSE_TIMEOUT_MS);
+            const listener = eventEmitter.addListener(
+                streamingCall,
+                (event: any) => {
+                    if (!isEventForRequest(event, requestId)) return;
+                    if (!event.result || event.result === 'EOF') return;
+                    let result;
+                    try {
+                        result = JSON.parse(event.result);
+                    } catch (e) {
+                        result = event.result;
+                    }
+                    if (result?.chan_close) return;
+                    finish();
+                    if (result?.close_pending) {
+                        resolve(result);
+                    } else {
+                        reject(
+                            new Error(
+                                typeof result === 'string'
+                                    ? result
+                                    : JSON.stringify(result)
+                            )
+                        );
+                    }
+                }
+            );
+        });
+    };
+    abandonChannel = async (
+        urlParams?: Array<string | boolean | undefined>
+    ) => {
+        const fundingTxidStr =
+            urlParams && typeof urlParams[0] === 'string'
+                ? urlParams[0]
+                : undefined;
+        const outputIndex =
+            urlParams && typeof urlParams[1] === 'string'
+                ? Number(urlParams[1])
+                : 0;
+
+        const params: any = {
+            channelPoint: {
+                fundingTxidStr,
+                fundingTxidBytes: undefined,
+                outputIndex
+            }
+        };
+
+        // Only include boolean parameters if they are explicitly set (not undefined)
+        if (urlParams && urlParams[2]) {
+            params.pendingFundingShimOnly = Boolean(urlParams[2]);
+        }
+
+        if (urlParams && urlParams[3]) {
+            params.iKnowWhatIAmDoing = Boolean(urlParams[3]);
+        }
+
+        return this.lnc.lnd.lightning.abandonChannel(params);
+    };
+    getNodeInfo = async (urlParams?: Array<string>) =>
+        await this.lnc.lnd.lightning
+            .getNodeInfo({ pub_key: urlParams && urlParams[0] })
+            .then((data: lnrpc.NodeInfo) => snakeize(data));
+    getFees = async () =>
+        await this.lnc.lnd.lightning
+            .feeReport({})
+            .then((data: lnrpc.FeeReportResponse) => snakeize(data));
+    setFees = async (data: any) => {
+        // handle commas in place of decimals
+        const base_fee_msat = data.base_fee_msat.replace(/,/g, '.');
+        const fee_rate = data.fee_rate.replace(/,/g, '.');
+
+        let params;
+
+        if (data.global) {
+            params = {
+                base_fee_msat,
+                fee_rate: `${Number(fee_rate) / 100}`,
+                ...(this.supportInboundFees() && {
+                    inboundFee: {
+                        ...(data.base_fee_msat_inbound !== '' && {
+                            base_fee_msat: data.base_fee_msat_inbound
+                        }),
+                        ...(data.fee_rate_inbound !== '' &&
+                            data.fee_rate_inbound !== undefined && {
+                                fee_rate_ppm: `${new BigNumber(
+                                    data.fee_rate_inbound
+                                )
+                                    .multipliedBy(10000)
+                                    .toFixed(0)}`
+                            })
+                    }
+                }),
+
+                global: true,
+                time_lock_delta: Number(data.time_lock_delta),
+                min_htlc_msat: data.min_htlc
+                    ? `${Number(data.min_htlc) * 1000}`
+                    : null,
+                max_htlc_msat: data.max_htlc
+                    ? `${Number(data.max_htlc) * 1000}`
+                    : null,
+                min_htlc_msat_specified: data.min_htlc ? true : false
+            };
+        } else {
+            params = {
+                base_fee_msat,
+                fee_rate: `${Number(fee_rate) / 100}`,
+                ...(this.supportInboundFees() && {
+                    inboundFee: {
+                        ...(data.base_fee_msat_inbound !== '' && {
+                            base_fee_msat: data.base_fee_msat_inbound
+                        }),
+                        ...(data.fee_rate_inbound !== '' &&
+                            data.fee_rate_inbound !== undefined && {
+                                fee_rate_ppm: `${new BigNumber(
+                                    data.fee_rate_inbound
+                                )
+                                    .multipliedBy(10000)
+                                    .toFixed(0)}`
+                            })
+                    }
+                }),
+                chan_point: {
+                    funding_txid_str: data.chan_point.funding_txid_str,
+                    output_index: data.chan_point.output_index
+                },
+                time_lock_delta: Number(data.time_lock_delta),
+                min_htlc_msat: data.min_htlc
+                    ? `${Number(data.min_htlc) * 1000}`
+                    : null,
+                max_htlc_msat: data.max_htlc
+                    ? `${Number(data.max_htlc) * 1000}`
+                    : null,
+                min_htlc_msat_specified: data.min_htlc ? true : false
+            };
+        }
+
+        return await this.lnc.lnd.lightning
+            .updateChannelPolicy(params)
+            .then((data: lnrpc.PolicyUpdateResponse) => snakeize(data));
+    };
+    // takes a raw PolicyUpdateRequest, used by Developer Tools
+    updateChannelPolicy = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .updateChannelPolicy(data)
+            .then((res: lnrpc.PolicyUpdateResponse) => snakeize(res));
+    getRoutes = async (urlParams?: Array<string>) =>
+        await this.lnc.lnd.lightning
+            .queryRoutes({
+                pub_key: urlParams && urlParams[0],
+                amt: urlParams && urlParams[1] && Number(urlParams[1])
+            })
+            .then((data: lnrpc.QueryRoutesResponse) => snakeize(data));
+    getForwardingHistory = async (
+        hours = 24,
+        chanIdIn?: string,
+        chanIdOut?: string
+    ) => {
+        const req: any = {
+            numMaxEvents: 10000000,
+            startTime: Math.round(
+                new Date(Date.now() - hours * 60 * 60 * 1000).getTime() / 1000
+            ).toString(),
+            endTime: Math.round(new Date().getTime() / 1000).toString(),
+            indexOffset: 0
+        };
+        if (this.supports('v0.20.0')) {
+            if (chanIdIn) {
+                req.incomingChanIds = [chanIdIn];
+            }
+            if (chanIdOut) {
+                req.outgoingChanIds = [chanIdOut];
+            }
+        }
+        return await this.lnc.lnd.lightning
+            .forwardingHistory(req)
+            .then((data: lnrpc.ForwardingHistoryResponse) => snakeize(data));
+    };
+    // Coin Control
+    fundPsbt = async (req: walletrpc.FundPsbtRequest) =>
+        await this.lnc.lnd.walletKit
+            .fundPsbt(req)
+            .then((data: walletrpc.FundPsbtResponse) => snakeize(data));
+    signPsbt = async (req: walletrpc.SignPsbtRequest) =>
+        await this.lnc.lnd.walletKit
+            .signPsbt(req)
+            .then((data: walletrpc.SignPsbtResponse) => snakeize(data));
+    finalizePsbt = async (req: walletrpc.FinalizePsbtRequest) =>
+        await this.lnc.lnd.walletKit
+            .finalizePsbt(req)
+            .then((data: walletrpc.FinalizePsbtResponse) => snakeize(data));
+    publishTransaction = async (req: any) => {
+        if (req.tx_hex) req.tx_hex = Base64Utils.hexToBase64(req.tx_hex);
+        return await this.lnc.lnd.walletKit
+            .publishTransaction(req)
+            .then((data: walletrpc.PublishResponse) => snakeize(data));
+    };
+    fundingStateStep = async (req: any) => {
+        // Finalize
+        if (req.psbt_finalize?.final_raw_tx)
+            req.psbt_finalize.final_raw_tx = Base64Utils.hexToBase64(
+                req.psbt_finalize.final_raw_tx
+            );
+
+        return await this.lnc.lnd.lightning
+            .fundingStateStep(req)
+            .then((data: lnrpc.FundingStateStepResp) => snakeize(data));
+    };
+    getUTXOs = async (req: walletrpc.ListUnspentRequest) =>
+        await this.lnc.lnd.walletKit
+            .listUnspent(req)
+            .then((data: walletrpc.ListUnspentResponse) => snakeize(data));
+    bumpFee = async (req: walletrpc.BumpFeeRequest) =>
+        await this.lnc.lnd.walletKit
+            .bumpFee(snakeize(req))
+            .then((data: walletrpc.BumpFeeResponse) => snakeize(data));
+    bumpForceCloseFee = async (req: walletrpc.BumpForceCloseFeeRequest) =>
+        await this.lnc.lnd.walletKit
+            .bumpForceCloseFee(snakeize(req))
+            .then((data: walletrpc.BumpForceCloseFeeResponse) =>
+                snakeize(data)
+            );
+    listAccounts = async () =>
+        await this.lnc.lnd.walletKit
+            .listAccounts({})
+            .then((data: walletrpc.ListAccountsResponse) => snakeize(data));
+    listAddresses = async () =>
+        await this.lnc.lnd.walletKit
+            .listAddresses({})
+            .then((data: walletrpc.ListAddressesResponse) => snakeize(data));
+    importAccount = async (req: walletrpc.ImportAccountRequest) =>
+        await this.lnc.lnd.walletKit
+            .importAccount(req)
+            .then((data: walletrpc.ImportAccountResponse) => snakeize(data));
+    signMessage = async (message: string) =>
+        await this.lnc.lnd.lightning
+            .signMessage({ msg: Base64Utils.utf8ToBase64(message) })
+            .then((data: lnrpc.SignMessageResponse) => snakeize(data));
+    verifyMessage = async (req: lnrpc.VerifyMessageRequest) =>
+        await this.lnc.lnd.lightning
+            .verifyMessage({
+                msg:
+                    typeof req.msg === 'string'
+                        ? Base64Utils.utf8ToBase64(req.msg)
+                        : req.msg,
+                signature: req.signature
+            })
+            .then((data: lnrpc.VerifyMessageResponse) => snakeize(data));
+    signMessageWithAddr = async (msg: string, addr: string) =>
+        await this.lnc.lnd.walletKit
+            .signMessageWithAddr({
+                msg:
+                    typeof msg === 'string'
+                        ? Base64Utils.utf8ToBase64(msg)
+                        : Base64Utils.bytesToBase64(msg as Uint8Array),
+                addr
+            })
+            .then((data: walletrpc.SignMessageWithAddrResponse) =>
+                snakeize(data)
+            );
+    verifyMessageWithAddr = async (
+        msg: string,
+        signature: string,
+        addr: string
+    ) =>
+        await this.lnc.lnd.walletKit
+            .verifyMessageWithAddr({
+                msg:
+                    typeof msg === 'string'
+                        ? Base64Utils.utf8ToBase64(msg)
+                        : Base64Utils.bytesToBase64(msg as Uint8Array),
+                signature,
+                addr
+            })
+            .then((data: walletrpc.VerifyMessageWithAddrResponse) =>
+                snakeize(data)
+            );
+    lnurlAuth = async (r_hash: string) => {
+        const signed = await this.signMessage(r_hash);
+        return {
+            signature: sha256Bytes(
+                Base64Utils.stringToUint8Array(signed.signature)
+            )
+        };
+    };
+    lookupInvoice = async (data: any) =>
+        await this.lnc.lnd.lightning
+            .lookupInvoice({ r_hash: Base64Utils.hexToBase64(data.r_hash) })
+            .then((data: lnrpc.Invoice) => snakeize(data));
+    subscribeInvoice = (r_hash: string) =>
+        this.lnc.lnd.invoices.subscribeSingleInvoice({ r_hash });
+    subscribeInvoices = () => this.lnc.lnd.lightning.subscribeInvoices();
+    subscribeTransactions = () =>
+        this.lnc.lnd.lightning.subscribeTransactions();
+    watchActivityUpdates = (
+        onTransaction: () => void,
+        onInvoice: () => void
+    ): (() => void) => {
+        const { LncModule } = NativeModules;
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        const transactionsListener = eventEmitter.addListener(
+            this.subscribeTransactions(),
+            onTransaction
+        );
+        const invoicesListener = eventEmitter.addListener(
+            this.subscribeInvoices(),
+            onInvoice
+        );
+        return () => {
+            transactionsListener.remove();
+            invoicesListener.remove();
+        };
+    };
+    watchInvoicePaid = (
+        { rHash }: { rHash: string },
+        onPaid: (payload: {
+            amountSat: number;
+            tx?: string;
+            preimage?: string;
+        }) => void
+    ): (() => void) => {
+        const { LncModule } = NativeModules;
+        const eventName = this.subscribeInvoice(rHash);
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        const listener = eventEmitter.addListener(eventName, (event: any) => {
+            if (event.result) {
+                if (
+                    typeof event.result === 'string' &&
+                    event.result.includes('rpc error: code = Canceled')
+                ) {
+                    listener.remove();
+                    return;
+                }
+                try {
+                    const result = JSON.parse(event.result);
+                    if (result === 'EOF') {
+                        listener.remove();
+                        return;
+                    }
+                    if (result.settled) {
+                        listener.remove();
+                        onPaid({
+                            amountSat: Number(result.amt_paid_sat),
+                            tx: result.payment_request,
+                            preimage: result.r_preimage
+                        });
+                    }
+                } catch (error) {
+                    console.error(error);
+                    listener.remove();
+                }
+            }
+        });
+        return () => listener.remove();
+    };
+    watchOnchainReceived = (
+        {
+            address,
+            expectedAmountSat,
+            numConfPreference
+        }: {
+            address: string;
+            expectedAmountSat?: string | number;
+            numConfPreference: number;
+            blockHeight?: number;
+        },
+        onReceived: (payload: { amountSat: number; txid: string }) => void
+    ): (() => void) => {
+        const { LncModule } = NativeModules;
+        const eventName = this.subscribeTransactions();
+        const eventEmitter = new NativeEventEmitter(LncModule);
+        const listener = eventEmitter.addListener(eventName, (event: any) => {
+            if (event.result) {
+                if (
+                    typeof event.result === 'string' &&
+                    event.result.includes('rpc error: code = Canceled')
+                ) {
+                    listener.remove();
+                    return;
+                }
+                try {
+                    const result = JSON.parse(event.result);
+                    if (result === 'EOF') {
+                        listener.remove();
+                        return;
+                    }
+                    if (
+                        result.dest_addresses.includes(address) &&
+                        result.num_confirmations >= numConfPreference &&
+                        Number(result.amount) >= Number(expectedAmountSat ?? 0)
+                    ) {
+                        listener.remove();
+                        onReceived({
+                            amountSat: Number(result.amount),
+                            txid: result.tx_hash
+                        });
+                    }
+                } catch (error) {
+                    console.error(error);
+                    listener.remove();
+                }
+            }
+        });
+        return () => listener.remove();
+    };
+
+    supports = (minVersion: string, eosVersion?: string) => {
+        const { nodeInfo } = nodeInfoStore;
+        const { version } = nodeInfo;
+        const { isSupportedVersion } = VersionUtils;
+        return isSupportedVersion(version, minVersion, eosVersion);
+    };
+
+    listPeers = async () => {
+        try {
+            const res = await this.lnc.lnd.lightning.listPeers({});
+            return res.peers ?? [];
+        } catch (err) {
+            console.error('listPeers error:', err);
+        }
+    };
+
+    disconnectPeer = async (pubkey: string) => {
+        try {
+            await this.lnc.lnd.lightning.disconnectPeer({ pubKey: pubkey });
+            return true;
+        } catch (error) {
+            console.error(`Error disconnecting peer ${pubkey}:`, error);
+            return null;
+        }
+    };
+
+    getWatchtowerInfo = async (pubkey: string) =>
+        await this.lnc.lnd.watchtowerClient
+            .getTowerInfo({
+                pubkey,
+                includeSessions: true
+            })
+            .then((data: any) => snakeize(data));
+
+    listWatchtowers = async (includeSessions = true) =>
+        await this.lnc.lnd.watchtowerClient
+            .listTowers({
+                includeSessions,
+                excludeExhaustedSessions: false
+            })
+            .then((data: any) => snakeize(data));
+
+    removeWatchtower = async (pubkey: string, address?: string) =>
+        await this.lnc.lnd.watchtowerClient
+            .removeTower({
+                pubkey,
+                address
+            })
+            .then((data: any) => snakeize(data));
+
+    deactivateWatchtower = async (pubkey: string) =>
+        await this.lnc.lnd.watchtowerClient
+            .deactivateTower({
+                pubkey
+            })
+            .then((data: any) => snakeize(data));
+
+    terminateWatchtowerSession = async (sessionId: string) =>
+        await this.lnc.lnd.watchtowerClient
+            .terminateSession({
+                sessionId
+            })
+            .then((data: any) => snakeize(data));
+
+    getWatchtowerStats = async () =>
+        await this.lnc.lnd.watchtowerClient
+            .stats({})
+            .then((data: any) => snakeize(data));
+
+    getWatchtowerPolicy = async (policyType: string) =>
+        await this.lnc.lnd.watchtowerClient
+            .policy({
+                policyType
+            })
+            .then((data: any) => snakeize(data));
+
+    supportsWatchtowerClient = () => true;
+    supportsPeers = () => true;
+    supportsMessageSigning = () => this.permSignMessage;
+    supportsMessageVerification = () => true;
+    requiresVerifyPubkey = () => false;
+    supportsAddressMessageSigning = () => true;
+    supportsLnurlAuth = () => true;
+    supportsOnchainBalance = () => true;
+    supportsOnchainSends = () => this.permSendCoins;
+    supportsOnchainReceiving = () => this.permNewAddress;
+    supportsUnconfirmedTransactionOrigin = () => true;
+    supportsLightningSends = () => this.permSendLN;
+    supportsKeysend = () => true;
+    supportsPaymentLookup = () => true;
+    supportsChannelManagement = () => this.permOpenChannel;
+    supportsCircularRebalancing = () => true;
+    supportsForceClose = () => true;
+    supportsPendingChannels = () => true;
+    supportsClosedChannels = () => true;
+    supportsMPP = () => this.supports('v0.10.0');
+    supportsAMP = () => this.supports('v0.13.0');
+    supportsCoinControl = () => this.permNewAddress;
+    supportsChannelCoinControl = () =>
+        this.permNewAddress && this.supports('v0.17.0');
+    supportsHopPicking = () => this.permOpenChannel;
+    supportsAccounts = () => this.permImportAccount;
+    supportsAccountImportRescan = () => false;
+    supportsRouting = () => this.permForwardingHistory;
+    supportsNodeInfo = () => true;
+    supportsWithdrawalRequests = () => false;
+    singleFeesEarnedTotal = () => false;
+    supportsAddressTypeSelection = () => true;
+    supportsNestedSegWit = () => true;
+    supportsTaproot = () => this.supports('v0.15.0');
+    supportsBumpFee = () => true;
+    supportsOnchainSendFeeRate = () => true;
+    supportsChannelOpenFeeRate = () => true;
+    supportsChannelOpenMinConfs = () => true;
+    supportsFlowLSP = () => false;
+    supportsNetworkInfo = () => true;
+    supportsSimpleTaprootChannels = () => this.supports('v0.17.0');
+    supportsCustomPreimages = () => true;
+    supportsSweep = () => true;
+    supportsOnchainSendMax = () => this.supports('v0.18.3');
+    supportsChannelMemo = () => this.supports('v0.17.0');
+    supportsOnchainBatching = () => true;
+    supportsChannelBatching = () => true;
+    supportsChannelFundMax = () => true;
+    supportsLSPScustomMessage = () => true;
+    supportsLSPS1rest = () => true;
+    supportsOffers = () => false;
+    supportsListingOffers = () => false;
+    supportsBolt12Address = () => false;
+    supportsBolt11BlindedRoutes = () => this.supports('v0.18.3');
+    supportsAddressesWithDerivationPaths = () => this.supports('v0.18.0');
+    supportsCustomFeeLimit = () => true;
+    isLNDBased = () => true;
+    supportsForwardingHistory = () => true;
+    supportInboundFees = () => this.supports('v0.18.0');
+    supportsCashuWallet = () => false;
+    supportsSettingInvoiceExpiration = () => true;
+    supportsNostrWalletConnectService = () => true;
+}

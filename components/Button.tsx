@@ -1,0 +1,137 @@
+import * as React from 'react';
+import { Component } from 'react';
+import { Button as ElementsButton } from '@rneui/themed';
+import { themeColor } from './../utils/ThemeUtils';
+import {
+    StyleProp,
+    TextStyle,
+    ViewStyle,
+    TouchableOpacity
+} from 'react-native';
+
+interface ButtonProps {
+    title?: string | React.ReactElement;
+    icon?: any;
+    titleStyle?: TextStyle;
+    onPress?: any;
+    secondary?: boolean;
+    tertiary?: boolean;
+    quaternary?: boolean;
+    warning?: boolean;
+    iconOnly?: boolean;
+    adaptiveWidth?: boolean;
+    containerStyle?: any;
+    buttonStyle?: StyleProp<ViewStyle>;
+    noUppercase?: boolean;
+    disabled?: boolean;
+    accessibilityLabel?: string;
+}
+
+function Button(props: ButtonProps) {
+    const {
+        title,
+        icon,
+        titleStyle,
+        onPress,
+        secondary,
+        tertiary,
+        quaternary,
+        warning,
+        iconOnly,
+        adaptiveWidth,
+        containerStyle,
+        buttonStyle,
+        noUppercase,
+        disabled,
+        accessibilityLabel
+    } = props;
+
+    const newContainerStyle: any = adaptiveWidth
+        ? {
+              ...containerStyle,
+              borderColor:
+                  (containerStyle && containerStyle.borderColor) ||
+                  themeColor('highlight'),
+              alignSelf: 'center',
+              borderRadius: 5
+          }
+        : {
+              ...containerStyle,
+              borderColor:
+                  (containerStyle && containerStyle.borderColor) ||
+                  themeColor('highlight'),
+              alignSelf: 'center',
+              borderRadius: 5,
+              width: '90%'
+          };
+
+    const textColor = themeColor('buttonText') || themeColor('text');
+
+    return (
+        <ElementsButton
+            TouchableComponent={TouchableOpacity as unknown as typeof Component}
+            icon={
+                icon
+                    ? React.isValidElement(icon)
+                        ? icon
+                        : {
+                              ...icon,
+                              // match @rneui's disabled title color:
+                              // color(theme.colors.disabled).darken(0.3)
+                              color: disabled
+                                  ? 'hsl(208, 8%, 63%)'
+                                  : icon.color
+                                  ? icon.color
+                                  : iconOnly
+                                  ? textColor
+                                  : secondary
+                                  ? themeColor('highlight')
+                                  : themeColor('background')
+                          }
+                    : null
+            }
+            title={title as string | React.ReactElement<{}>}
+            buttonStyle={{
+                backgroundColor: iconOnly
+                    ? 'transparent'
+                    : quaternary
+                    ? themeColor('buttonBackground') || themeColor('secondary')
+                    : tertiary
+                    ? themeColor('highlight')
+                    : secondary
+                    ? themeColor('secondary')
+                    : warning
+                    ? themeColor('delete')
+                    : themeColor('text'),
+                ...(buttonStyle as object)
+            }}
+            titleStyle={
+                titleStyle
+                    ? {
+                          ...(titleStyle as object),
+                          textTransform: noUppercase ? 'none' : 'uppercase',
+                          fontFamily: 'PPNeueMontreal-Book'
+                      }
+                    : {
+                          color: iconOnly
+                              ? textColor
+                              : quaternary
+                              ? textColor
+                              : warning
+                              ? themeColor('text')
+                              : secondary
+                              ? themeColor('highlight')
+                              : themeColor('background'),
+                          textTransform: noUppercase ? 'none' : 'uppercase',
+                          fontFamily: 'PPNeueMontreal-Book'
+                      }
+            }
+            onPress={onPress}
+            containerStyle={newContainerStyle}
+            disabled={disabled}
+            accessibilityLabel={accessibilityLabel}
+        />
+    );
+}
+
+export default Button;

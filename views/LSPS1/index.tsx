@@ -1,0 +1,1334 @@
+import * as React from 'react';
+import { inject, observer } from 'mobx-react';
+import { View, StyleSheet, ScrollView, TouchableOpacity } from 'react-native';
+import { ButtonGroup, Icon } from '@rneui/themed';
+import Slider from '@react-native-community/slider';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import History from '../../assets/images/SVG/History.svg';
+import OlympusSVG from '../../assets/images/SVG/Olympus.svg';
+
+import Button from '../../components/Button';
+import Accordion from '../../components/Accordion';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import LSPS1OrderResponse from './OrderResponse';
+import Screen from '../../components/Screen';
+import Switch from '../../components/Switch';
+import Text from '../../components/Text';
+import TextInput from '../../components/TextInput';
+
+import { ErrorMessage } from '../../components/SuccessErrorMessage';
+import { Row } from '../../components/layout/Row';
+
+import BackendUtils from '../../utils/BackendUtils';
+import {
+    buildPaymentAwaitParams,
+    isOrderFree,
+    LSPOrderState,
+    LSPService
+} from '../../models/LSP';
+import { themeColor } from '../../utils/ThemeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { numberWithCommas } from '../../utils/UnitsUtils';
+
+import LSPStore from '../../stores/LSPStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+import SettingsStore from '../../stores/SettingsStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+
+interface LSPS1Props {
+    LSPStore: LSPStore;
+    ChannelsStore: ChannelsStore;
+    SettingsStore: SettingsStore;
+    NodeInfoStore: NodeInfoStore;
+    navigation: NativeStackNavigationProp<any, any>;
+}
+
+interface LSPS1State {
+    lspBalanceSat: number | string;
+    clientBalanceSat: number | string;
+    requiredChannelConfirmations: any;
+    confirmsWithinBlocks: any;
+    channelExpiryBlocks: string | number;
+    expirationIndex: number;
+    token: any;
+    refundOnchainAddress: any;
+    announceChannel: boolean;
+}
+
+@inject('LSPStore', 'ChannelsStore', 'SettingsStore', 'NodeInfoStore')
+@observer
+export default class LSPS1 extends React.Component<LSPS1Props, LSPS1State> {
+    private scrollViewRef = React.createRef<ScrollView>();
+    private lastSavedOrderId: string | null = null;
+    constructor(props: LSPS1Props) {
+        super(props);
+        this.state = {
+            lspBalanceSat: 0,
+            clientBalanceSat: 0,
+            requiredChannelConfirmations: null,
+            confirmsWithinBlocks: null,
+            channelExpiryBlocks: 'N/A',
+            expirationIndex: 0,
+            token: props.SettingsStore.settings?.lsps1Token || '',
+            refundOnchainAddress: '',
+            announceChannel: false
+        };
+    }
+
+    async componentDidMount() {
+        const { LSPStore, SettingsStore, navigation } = this.props;
+        LSPStore.resetLSPS1Data();
+        if (
+            !BackendUtils.supportsLSPS1native() &&
+            !BackendUtils.supportsLSPS1rest() &&
+            BackendUtils.supportsLSPScustomMessage()
+        ) {
+            console.log('connecting');
+            await this.connectPeer();
+            console.log('connected');
+            await this.subscribeToCustomMessages();
+        }
+        this.fetchGetInfo();
+
+        navigation.addListener('focus', () => {
+            this.setState({
+                token: SettingsStore.settings?.lsps1Token || ''
+            });
+            // a stacked duplicate of this screen wipes the shared store
+            // when it unmounts; refetch if the service info is gone
+            if (
+                !LSPStore.loadingLSPS1 &&
+                Object.keys(LSPStore.getInfoData).length === 0
+            ) {
+                this.fetchGetInfo();
+            }
+            this.resumeFreeOrderPollingIfNeeded();
+        });
+    }
+
+    private fetchGetInfo = () => {
+        const { LSPStore } = this.props;
+        if (BackendUtils.supportsLSPS1native()) {
+            // Native LSPS1 - LSP is configured at node initialization
+            LSPStore.lsps1GetInfoNative();
+        } else if (BackendUtils.supportsLSPS1rest()) {
+            LSPStore.lsps1GetInfoREST();
+        } else if (BackendUtils.supportsLSPScustomMessage()) {
+            LSPStore.lsps1GetInfoCustomMessage();
+        }
+    };
+
+    private resumeFreeOrderPollingIfNeeded = () => {
+        const { LSPStore } = this.props;
+        const { createOrderResponse } = LSPStore;
+        const result = createOrderResponse?.result || createOrderResponse;
+        const orderId = result?.order_id;
+        if (
+            orderId &&
+            isOrderFree(result?.payment) &&
+            result?.order_state !== LSPOrderState.COMPLETED &&
+            result?.order_state !== LSPOrderState.FAILED
+        ) {
+            LSPStore.startFreeOrderStatusPolling(orderId, LSPService.LSPS1);
+        }
+    };
+    componentWillUnmount() {
+        this.props.LSPStore.resetLSPS1Data();
+    }
+
+    componentDidUpdate(_prevProps: LSPS1Props) {
+        const {
+            lspBalanceSat,
+            clientBalanceSat,
+            channelExpiryBlocks,
+            requiredChannelConfirmations,
+            confirmsWithinBlocks
+        } = this.state;
+        const { getInfoData } = this.props.LSPStore;
+        const info =
+            getInfoData?.result?.options ||
+            getInfoData?.options ||
+            getInfoData?.result ||
+            getInfoData;
+
+        const minLspBalance = parseInt(info?.min_initial_lsp_balance_sat);
+        if (lspBalanceSat === 0 && minLspBalance > 0) {
+            this.setState({ lspBalanceSat: minLspBalance });
+        }
+        const minClientBalance = parseInt(info?.min_initial_client_balance_sat);
+        if (clientBalanceSat === 0 && minClientBalance > 0) {
+            this.setState({ clientBalanceSat: minClientBalance });
+        }
+
+        if (channelExpiryBlocks === 'N/A' && info?.max_channel_expiry_blocks) {
+            const channelExpiryBlocks = parseInt(
+                info.max_channel_expiry_blocks
+            );
+            let expirationIndex = 5;
+            if (channelExpiryBlocks === 4380) {
+                expirationIndex = 0;
+            } else if (channelExpiryBlocks === 13140) {
+                expirationIndex = 1;
+            } else if (channelExpiryBlocks === 26280) {
+                expirationIndex = 2;
+            } else if (channelExpiryBlocks === 52560) {
+                expirationIndex = 3;
+            }
+
+            this.setState({
+                channelExpiryBlocks,
+                expirationIndex
+            });
+        }
+
+        if (
+            requiredChannelConfirmations === null &&
+            info?.min_required_channel_confirmations
+        ) {
+            this.setState({
+                requiredChannelConfirmations:
+                    info?.min_required_channel_confirmations.toString()
+            });
+        }
+
+        if (
+            confirmsWithinBlocks === null &&
+            info?.min_funding_confirms_within_blocks
+        ) {
+            this.setState({
+                confirmsWithinBlocks:
+                    (info?.min_funding_confirms_within_blocks).toString()
+            });
+        }
+
+        const { LSPStore } = this.props;
+        const { createOrderResponse } = LSPStore;
+        const result = createOrderResponse?.result || createOrderResponse;
+        const orderId = result?.order_id;
+
+        if (
+            orderId &&
+            orderId !== this.lastSavedOrderId &&
+            isOrderFree(result?.payment)
+        ) {
+            this.lastSavedOrderId = orderId;
+            this.handleFreeOrderCreated(orderId);
+        }
+    }
+
+    private handleFreeOrderCreated = (orderId: string) => {
+        const { LSPStore } = this.props;
+        LSPStore.saveOrderToHistory(LSPStore.createOrderResponse, 'LSPS1');
+        LSPStore.startFreeOrderStatusPolling(orderId, LSPService.LSPS1);
+    };
+
+    subscribeToCustomMessages() {
+        return new Promise((resolve, reject) => {
+            this.props.LSPStore.subscribeCustomMessages()
+                .then((response) => {
+                    console.log('Subscribed to custom messages:', response);
+                    resolve({});
+                })
+                .catch((error) => {
+                    console.error(
+                        'Error subscribing to custom messages:',
+                        error
+                    );
+                    reject();
+                });
+        });
+    }
+
+    connectPeer = async () => {
+        const { ChannelsStore, LSPStore } = this.props;
+        const node_pubkey_string: string = LSPStore.getLSPSPubkey();
+        const host: string = LSPStore.getLSPSHost();
+        try {
+            return await ChannelsStore.connectPeer(
+                {
+                    node_pubkey_string,
+                    host,
+                    local_funding_amount: ''
+                },
+                true,
+                true
+            );
+        } catch (err) {
+            console.log(err);
+        }
+    };
+
+    updateExpirationIndex = (expirationIndex: number) => {
+        if (expirationIndex === 0) {
+            this.setState({
+                channelExpiryBlocks: 4380,
+                expirationIndex: 0
+            });
+        } else if (expirationIndex === 1) {
+            this.setState({
+                channelExpiryBlocks: 13140,
+                expirationIndex: 1
+            });
+        } else if (expirationIndex === 2) {
+            this.setState({
+                channelExpiryBlocks: 26280,
+                expirationIndex: 2
+            });
+        } else if (expirationIndex === 3) {
+            this.setState({
+                channelExpiryBlocks: 52560,
+                expirationIndex: 3
+            });
+        }
+    };
+
+    render() {
+        const { navigation, LSPStore, NodeInfoStore, SettingsStore } =
+            this.props;
+        const {
+            lspBalanceSat,
+            clientBalanceSat,
+            channelExpiryBlocks,
+            expirationIndex
+        } = this.state;
+        const { getInfoData, createOrderResponse } = LSPStore;
+        const info =
+            getInfoData?.result?.options ||
+            getInfoData?.options ||
+            getInfoData?.result ||
+            getInfoData;
+        const result = createOrderResponse?.result || createOrderResponse;
+        const payment = result?.payment;
+        const isFreeOrder = isOrderFree(payment);
+        const isGetInfoError =
+            LSPStore.error &&
+            !!LSPStore.error_msg &&
+            Object.keys(getInfoData ?? {}).length === 0;
+
+        const HistoryBtn = () => (
+            <TouchableOpacity
+                onPress={() => {
+                    navigation.navigate('OrdersPane');
+                }}
+                accessibilityLabel={localeString('general.add')}
+            >
+                <History
+                    fill={themeColor('text')}
+                    width="30"
+                    height="30"
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        const SettingsBtn = () => (
+            <TouchableOpacity style={{ marginRight: 10 }}>
+                <Icon
+                    name="settings"
+                    onPress={() => {
+                        this.props.navigation.navigate('LSPS1Settings');
+                    }}
+                    color={themeColor('text')}
+                    underlayColor="transparent"
+                    size={30}
+                />
+            </TouchableOpacity>
+        );
+
+        const oneMoButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 0
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.1mo')}
+            </Text>
+        );
+        const threeMoButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 1
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.3mo')}
+            </Text>
+        );
+        const sixMoButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 2
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.6mo')}
+            </Text>
+        );
+        const twelveMoButton = () => (
+            <Text
+                style={{
+                    fontFamily: 'PPNeueMontreal-Book',
+                    color:
+                        expirationIndex === 3
+                            ? themeColor('background')
+                            : themeColor('text')
+                }}
+            >
+                {localeString('time.12mo')}
+            </Text>
+        );
+
+        const expirationButtons: any = [
+            { element: oneMoButton },
+            { element: threeMoButton },
+            { element: sixMoButton },
+            { element: twelveMoButton }
+        ];
+
+        const { flowLspNotConfigured } = NodeInfoStore.flowLspNotConfigured();
+
+        const flowServiceAvailable =
+            SettingsStore.settings?.enableLSP &&
+            BackendUtils.supportsFlowLSP() &&
+            !flowLspNotConfigured;
+
+        const isOlympus = LSPStore.isOlympus(LSPService.LSPS1);
+
+        const lspDisplay = isOlympus
+            ? 'Olympus by ZEUS'
+            : BackendUtils.supportsLSPS1native()
+            ? localeString('views.LSPS1.nativeLsps1Enabled')
+            : BackendUtils.supportsLSPS1rest()
+            ? LSPStore.getLSPS1Rest()
+            : LSPStore.getLSPSPubkey();
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    navigation={navigation}
+                    rightComponent={
+                        LSPStore.loadingLSPS1 ||
+                        (createOrderResponse &&
+                            Object.keys(createOrderResponse).length > 0 &&
+                            result &&
+                            payment) ? undefined : (
+                            <Row>
+                                <SettingsBtn />
+                                {!LSPStore.error && <HistoryBtn />}
+                            </Row>
+                        )
+                    }
+                />
+                <View style={{ paddingHorizontal: 18 }}>
+                    {BackendUtils.supportsLSPScustomMessage() &&
+                        !LSPStore.getLSPSPubkey() &&
+                        !LSPStore.getLSPSHost() && (
+                            <ErrorMessage
+                                message={localeString(
+                                    'views.LSPS1.pubkeyAndHostNotFound'
+                                )}
+                            />
+                        )}
+
+                    {LSPStore?.error &&
+                        LSPStore?.error_msg &&
+                        !isGetInfoError && (
+                            <ErrorMessage message={LSPStore.error_msg} />
+                        )}
+                </View>
+                {LSPStore.loadingLSPS1 ? (
+                    <LoadingIndicator />
+                ) : isGetInfoError ? (
+                    <ErrorMessage message={LSPStore.error_msg} />
+                ) : (
+                    <>
+                        <ScrollView
+                            ref={this.scrollViewRef}
+                            style={{ flex: 1 }}
+                        >
+                            {createOrderResponse &&
+                                Object.keys(createOrderResponse).length > 0 &&
+                                result &&
+                                payment && (
+                                    <LSPS1OrderResponse
+                                        orderResponse={result}
+                                        orderView={false}
+                                        navigation={navigation}
+                                    />
+                                )}
+
+                            {Object.keys(createOrderResponse).length === 0 && (
+                                <ScrollView
+                                    style={{
+                                        flex: 1,
+                                        marginTop: 10,
+                                        paddingHorizontal: 22
+                                    }}
+                                >
+                                    <>
+                                        {Object.keys(getInfoData).length >
+                                            0 && (
+                                            <Accordion
+                                                headerLayout="form"
+                                                id="lsps1-service-info"
+                                                scrollRef={this.scrollViewRef}
+                                                title={localeString(
+                                                    'views.LSPS1.serviceInfo'
+                                                )}
+                                                renderFormTitle={() => (
+                                                    <Row justify="space-between">
+                                                        {isOlympus && (
+                                                            <View
+                                                                style={{
+                                                                    width: '15%'
+                                                                }}
+                                                            >
+                                                                <OlympusSVG
+                                                                    fill={themeColor(
+                                                                        'highlight'
+                                                                    )}
+                                                                />
+                                                            </View>
+                                                        )}
+                                                        <View
+                                                            style={{
+                                                                width: '85%'
+                                                            }}
+                                                        >
+                                                            <KeyValue
+                                                                keyValue={localeString(
+                                                                    'views.LSPS1.serviceInfo'
+                                                                )}
+                                                            />
+                                                        </View>
+                                                    </Row>
+                                                )}
+                                            >
+                                                {getInfoData &&
+                                                    Object.keys(
+                                                        createOrderResponse
+                                                    ).length === 0 &&
+                                                    info && (
+                                                        <View
+                                                            style={{
+                                                                marginBottom: 20
+                                                            }}
+                                                        >
+                                                            <Text
+                                                                style={{
+                                                                    fontSize: 16,
+                                                                    color: themeColor(
+                                                                        'text'
+                                                                    ),
+                                                                    fontFamily:
+                                                                        'PPNeueMontreal-Book',
+                                                                    marginBottom: 10
+                                                                }}
+                                                            >
+                                                                {localeString(
+                                                                    'views.LSPS1.serviceInfoText1'
+                                                                )}
+                                                            </Text>
+                                                            {flowServiceAvailable && (
+                                                                <>
+                                                                    <Text
+                                                                        style={{
+                                                                            fontSize: 16,
+                                                                            color: themeColor(
+                                                                                'text'
+                                                                            ),
+                                                                            fontFamily:
+                                                                                'PPNeueMontreal-Book',
+                                                                            marginBottom: 10
+                                                                        }}
+                                                                    >
+                                                                        {localeString(
+                                                                            'views.LSPS1.serviceInfoText2'
+                                                                        )}
+                                                                    </Text>
+
+                                                                    <View
+                                                                        style={{
+                                                                            marginTop: 10,
+                                                                            marginBottom: 20
+                                                                        }}
+                                                                    >
+                                                                        <Button
+                                                                            title={localeString(
+                                                                                'views.LSPS1.useJit'
+                                                                            )}
+                                                                            onPress={() => {
+                                                                                navigation.navigate(
+                                                                                    'Receive'
+                                                                                );
+                                                                            }}
+                                                                        />
+                                                                    </View>
+                                                                </>
+                                                            )}
+
+                                                            <KeyValue
+                                                                keyValue="LSP"
+                                                                value={
+                                                                    lspDisplay
+                                                                }
+                                                                showCopyIcon
+                                                            />
+
+                                                            {info?.max_channel_balance_sat &&
+                                                                info?.min_channel_balance_sat && (
+                                                                    <KeyValue
+                                                                        keyValue={`${localeString(
+                                                                            'views.Channel.channelBalance'
+                                                                        )}`}
+                                                                        value={`${numberWithCommas(
+                                                                            info?.min_channel_balance_sat
+                                                                        )} - ${numberWithCommas(
+                                                                            info?.max_channel_balance_sat
+                                                                        )} ${localeString(
+                                                                            'general.sats'
+                                                                        )}`}
+                                                                    />
+                                                                )}
+                                                            {info?.max_initial_lsp_balance_sat &&
+                                                                info?.min_initial_lsp_balance_sat && (
+                                                                    <KeyValue
+                                                                        keyValue={`${localeString(
+                                                                            'views.LSPS1.initialLSPBalance'
+                                                                        )}`}
+                                                                        value={`${numberWithCommas(
+                                                                            info?.min_initial_lsp_balance_sat
+                                                                        )} - ${numberWithCommas(
+                                                                            info?.max_initial_lsp_balance_sat
+                                                                        )} ${localeString(
+                                                                            'general.sats'
+                                                                        )}`}
+                                                                    />
+                                                                )}
+                                                            {info?.max_initial_client_balance_sat &&
+                                                                info?.min_initial_client_balance_sat && (
+                                                                    <KeyValue
+                                                                        keyValue={`${localeString(
+                                                                            'views.LSPS1.initialClientBalance'
+                                                                        )}`}
+                                                                        value={
+                                                                            info?.max_initial_client_balance_sat ===
+                                                                            info?.min_initial_client_balance_sat
+                                                                                ? `${
+                                                                                      info?.min_initial_client_balance_sat
+                                                                                  } ${localeString(
+                                                                                      'general.sats'
+                                                                                  )}`
+                                                                                : `${
+                                                                                      info?.min_initial_client_balance_sat
+                                                                                  } - ${
+                                                                                      info?.max_initial_client_balance_sat
+                                                                                  } ${localeString(
+                                                                                      'general.sats'
+                                                                                  )}`
+                                                                        }
+                                                                    />
+                                                                )}
+                                                            {info?.max_channel_expiry_blocks && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.maxChannelExpiryBlocks'
+                                                                    )}
+                                                                    value={numberWithCommas(
+                                                                        info?.max_channel_expiry_blocks
+                                                                    )}
+                                                                />
+                                                            )}
+                                                            {info?.min_channel_confirmations !=
+                                                                null && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.minChannelConfirmations'
+                                                                    )}
+                                                                    value={
+                                                                        info?.min_channel_confirmations
+                                                                    }
+                                                                />
+                                                            )}
+                                                            {info?.min_onchain_payment_confirmations !=
+                                                                null && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.minOnchainPaymentConfirmations'
+                                                                    )}
+                                                                    value={
+                                                                        info?.min_onchain_payment_confirmations
+                                                                    }
+                                                                />
+                                                            )}
+                                                            {info?.min_onchain_payment_size_sat && (
+                                                                <KeyValue
+                                                                    keyValue={`${localeString(
+                                                                        'views.LSPS1.minOnchainPaymentSize'
+                                                                    )} (${localeString(
+                                                                        'general.sats'
+                                                                    )})`}
+                                                                    value={
+                                                                        info?.min_onchain_payment_size_sat
+                                                                    }
+                                                                />
+                                                            )}
+                                                            {info?.min_funding_confirms_within_blocks && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.minFundingConfirmWithingBlocks'
+                                                                    )}
+                                                                    value={
+                                                                        info?.min_funding_confirms_within_blocks
+                                                                    }
+                                                                />
+                                                            )}
+                                                            {info?.min_required_channel_confirmations !=
+                                                                null && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.minRequiredChannelConfirmations'
+                                                                    )}
+                                                                    value={
+                                                                        info?.min_required_channel_confirmations
+                                                                    }
+                                                                />
+                                                            )}
+                                                            {info?.supports_zero_channel_reserve !==
+                                                                null && (
+                                                                <KeyValue
+                                                                    keyValue={localeString(
+                                                                        'views.LSPS1.supportZeroChannelReserve'
+                                                                    )}
+                                                                    value={
+                                                                        info?.supports_zero_channel_reserve
+                                                                            ? 'True'
+                                                                            : 'False'
+                                                                    }
+                                                                    color={
+                                                                        info?.supports_zero_channel_reserve
+                                                                            ? 'green'
+                                                                            : '#808000'
+                                                                    }
+                                                                />
+                                                            )}
+                                                            <KeyValue
+                                                                keyValue={localeString(
+                                                                    'views.LSPS1.spec'
+                                                                )}
+                                                                value="LSPS1"
+                                                            />
+                                                        </View>
+                                                    )}
+                                            </Accordion>
+                                        )}
+                                    </>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {`${localeString(
+                                            'views.LSPS1.initialLSPBalance'
+                                        )} (${localeString('general.sats')})`}
+                                    </Text>
+                                    <TextInput
+                                        placeholder={`${localeString(
+                                            'views.LSPS1.initialLSPBalance'
+                                        )} (${localeString('general.sats')})`}
+                                        value={
+                                            lspBalanceSat === ''
+                                                ? ''
+                                                : numberWithCommas(
+                                                      lspBalanceSat
+                                                  )
+                                        }
+                                        onChangeText={(text: any) => {
+                                            const value = text.replace(
+                                                /,/g,
+                                                ''
+                                            );
+                                            this.setState({
+                                                lspBalanceSat: value
+                                            });
+                                        }}
+                                        keyboardType="numeric"
+                                    />
+                                    <Row
+                                        justify="space-between"
+                                        style={{ marginVertical: 10 }}
+                                    >
+                                        <Text
+                                            style={{
+                                                color: themeColor('text')
+                                            }}
+                                        >
+                                            {numberWithCommas(
+                                                info?.min_initial_lsp_balance_sat
+                                            )}
+                                        </Text>
+                                        <Text
+                                            style={{
+                                                color: themeColor('text')
+                                            }}
+                                        >
+                                            {numberWithCommas(
+                                                info?.max_initial_lsp_balance_sat
+                                            )}
+                                        </Text>
+                                    </Row>
+                                    {info?.min_initial_lsp_balance_sat && (
+                                        <Slider
+                                            style={{
+                                                width: '100%',
+                                                height: 40,
+                                                marginBottom: 10
+                                            }}
+                                            minimumValue={parseInt(
+                                                info?.min_initial_lsp_balance_sat
+                                            )}
+                                            maximumValue={parseInt(
+                                                info?.max_initial_lsp_balance_sat
+                                            )}
+                                            minimumTrackTintColor={themeColor(
+                                                'highlight'
+                                            )}
+                                            maximumTrackTintColor="black"
+                                            thumbTintColor={themeColor(
+                                                'highlight'
+                                            )}
+                                            value={parseInt(
+                                                lspBalanceSat.toString()
+                                            )}
+                                            onValueChange={(value: number) =>
+                                                this.setState({
+                                                    lspBalanceSat: value
+                                                })
+                                            }
+                                            step={10000}
+                                        />
+                                    )}
+
+                                    <>
+                                        <Text
+                                            style={{
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.LSPS1.channelExpiryBlocks'
+                                            )}
+                                        </Text>
+                                        <TextInput
+                                            placeholder={localeString(
+                                                'views.LSPS1.channelExpiryBlocks'
+                                            )}
+                                            value={
+                                                channelExpiryBlocks === ''
+                                                    ? ''
+                                                    : numberWithCommas(
+                                                          channelExpiryBlocks
+                                                      )
+                                            }
+                                            onChangeText={(text: any) => {
+                                                let newValue: string | number =
+                                                    parseInt(
+                                                        text.replace(/,/g, ''),
+                                                        10
+                                                    );
+                                                if (isNaN(newValue)) {
+                                                    newValue = '';
+                                                }
+
+                                                let expirationIndex = 5;
+                                                if (newValue === 4380) {
+                                                    expirationIndex = 0;
+                                                } else if (newValue === 13140) {
+                                                    expirationIndex = 1;
+                                                } else if (newValue === 26280) {
+                                                    expirationIndex = 2;
+                                                } else if (newValue === 52560) {
+                                                    expirationIndex = 3;
+                                                }
+
+                                                this.setState({
+                                                    channelExpiryBlocks:
+                                                        newValue,
+                                                    expirationIndex
+                                                });
+                                            }}
+                                            style={styles.textInput}
+                                            keyboardType="numeric"
+                                        />
+                                        <View style={{ marginBottom: 10 }}>
+                                            <ButtonGroup
+                                                onPress={
+                                                    this.updateExpirationIndex
+                                                }
+                                                selectedIndex={expirationIndex}
+                                                buttons={expirationButtons}
+                                                selectedButtonStyle={{
+                                                    backgroundColor:
+                                                        themeColor('highlight'),
+                                                    borderRadius: 12
+                                                }}
+                                                containerStyle={{
+                                                    backgroundColor:
+                                                        themeColor('secondary'),
+                                                    borderRadius: 12,
+                                                    borderWidth: 0,
+                                                    height: 30
+                                                }}
+                                                innerBorderStyle={{
+                                                    color: themeColor(
+                                                        'secondary'
+                                                    )
+                                                }}
+                                            />
+                                        </View>
+                                    </>
+                                    {Object.keys(getInfoData).length > 0 && (
+                                        <Accordion
+                                            headerLayout="form"
+                                            id="lsps1-advanced-settings"
+                                            scrollRef={this.scrollViewRef}
+                                            title={localeString(
+                                                'general.advancedSettings'
+                                            )}
+                                        >
+                                            {info?.max_initial_client_balance_sat !==
+                                                '0' && (
+                                                <>
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {`${localeString(
+                                                            'views.LSPS1.initialClientBalance'
+                                                        )} (${localeString(
+                                                            'general.sats'
+                                                        )})`}
+                                                    </Text>
+                                                    <TextInput
+                                                        placeholder={`${localeString(
+                                                            'views.LSPS1.clientBalance'
+                                                        )} (${localeString(
+                                                            'general.sats'
+                                                        )})`}
+                                                        value={
+                                                            clientBalanceSat ===
+                                                            ''
+                                                                ? ''
+                                                                : numberWithCommas(
+                                                                      clientBalanceSat
+                                                                  )
+                                                        }
+                                                        onChangeText={(
+                                                            text: any
+                                                        ) => {
+                                                            const value =
+                                                                text.replace(
+                                                                    /,/g,
+                                                                    ''
+                                                                );
+                                                            this.setState({
+                                                                clientBalanceSat:
+                                                                    value
+                                                            });
+                                                        }}
+                                                        keyboardType="numeric"
+                                                    />
+                                                    <Row
+                                                        justify="space-between"
+                                                        style={{
+                                                            marginVertical: 10
+                                                        }}
+                                                    >
+                                                        <Text
+                                                            style={{
+                                                                color: themeColor(
+                                                                    'text'
+                                                                )
+                                                            }}
+                                                        >
+                                                            {numberWithCommas(
+                                                                info?.min_initial_client_balance_sat
+                                                            )}
+                                                        </Text>
+                                                        <Text
+                                                            style={{
+                                                                color: themeColor(
+                                                                    'text'
+                                                                )
+                                                            }}
+                                                        >
+                                                            {numberWithCommas(
+                                                                info?.max_initial_client_balance_sat
+                                                            )}
+                                                        </Text>
+                                                    </Row>
+                                                    <Slider
+                                                        style={{
+                                                            width: '100%',
+                                                            height: 40
+                                                        }}
+                                                        minimumValue={parseInt(
+                                                            info?.min_initial_client_balance_sat
+                                                        )}
+                                                        maximumValue={parseInt(
+                                                            info?.max_initial_client_balance_sat
+                                                        )}
+                                                        minimumTrackTintColor={themeColor(
+                                                            'highlight'
+                                                        )}
+                                                        maximumTrackTintColor="black"
+                                                        thumbTintColor={themeColor(
+                                                            'highlight'
+                                                        )}
+                                                        value={parseInt(
+                                                            clientBalanceSat.toString()
+                                                        )}
+                                                        onValueChange={(
+                                                            value: number
+                                                        ) =>
+                                                            this.setState({
+                                                                clientBalanceSat:
+                                                                    value
+                                                            })
+                                                        }
+                                                        step={10000}
+                                                    />
+                                                </>
+                                            )}
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    ),
+                                                    marginTop: 10
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.LSPS1.requiredChannelConfirmations'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                placeholder={localeString(
+                                                    'views.LSPS1.requiredChannelConfirmations'
+                                                )}
+                                                value={
+                                                    this.state
+                                                        .requiredChannelConfirmations ??
+                                                    ''
+                                                }
+                                                onChangeText={(
+                                                    text: string
+                                                ) => {
+                                                    const numericValue =
+                                                        text.replace(
+                                                            /[^0-9]/g,
+                                                            ''
+                                                        );
+                                                    this.setState({
+                                                        requiredChannelConfirmations:
+                                                            numericValue
+                                                    });
+                                                }}
+                                                style={styles.textInput}
+                                                keyboardType="numeric"
+                                            />
+
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.LSPS1.confirmWithinBlocks'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                placeholder={localeString(
+                                                    'views.LSPS1.confirmWithinBlocks'
+                                                )}
+                                                value={
+                                                    this.state
+                                                        .confirmsWithinBlocks ??
+                                                    ''
+                                                }
+                                                onChangeText={(
+                                                    text: string
+                                                ) => {
+                                                    const numericValue =
+                                                        text.replace(
+                                                            /[^0-9]/g,
+                                                            ''
+                                                        );
+                                                    this.setState({
+                                                        confirmsWithinBlocks:
+                                                            numericValue
+                                                    });
+                                                }}
+                                                style={styles.textInput}
+                                                keyboardType="numeric"
+                                            />
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'general.discountCode'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                placeholder={localeString(
+                                                    'general.discountCode'
+                                                )}
+                                                value={this.state.token}
+                                                onChangeText={(text: string) =>
+                                                    this.setState({
+                                                        token: text
+                                                    })
+                                                }
+                                                style={styles.textInput}
+                                                autoCapitalize="none"
+                                            />
+
+                                            {info?.min_onchain_payment_confirmations !=
+                                                null && (
+                                                <>
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.LSPS1.refundOnchainAddress'
+                                                        )}
+                                                    </Text>
+                                                    <TextInput
+                                                        placeholder={localeString(
+                                                            'views.LSPS1.refundOnchainAddress'
+                                                        )}
+                                                        value={
+                                                            this.state
+                                                                .refundOnchainAddress
+                                                        }
+                                                        onChangeText={(
+                                                            text: string
+                                                        ) =>
+                                                            this.setState({
+                                                                refundOnchainAddress:
+                                                                    text
+                                                            })
+                                                        }
+                                                        style={styles.textInput}
+                                                    />
+                                                </>
+                                            )}
+                                            {!isOlympus && (
+                                                <View
+                                                    style={{
+                                                        flexDirection: 'row',
+                                                        justifyContent:
+                                                            'space-between',
+                                                        alignItems: 'center',
+                                                        marginVertical: 10
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            fontSize: 16,
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.OpenChannel.announceChannel'
+                                                        )}
+                                                    </Text>
+                                                    <Switch
+                                                        value={
+                                                            this.state
+                                                                .announceChannel
+                                                        }
+                                                        onValueChange={async () => {
+                                                            this.setState({
+                                                                announceChannel:
+                                                                    !this.state
+                                                                        .announceChannel
+                                                            });
+                                                        }}
+                                                    />
+                                                </View>
+                                            )}
+                                        </Accordion>
+                                    )}
+                                </ScrollView>
+                            )}
+                        </ScrollView>
+                        {(Object.keys(createOrderResponse).length === 0 ||
+                            !isFreeOrder) && (
+                            <View style={{ marginTop: 10 }}>
+                                <Button
+                                    title={
+                                        Object.keys(createOrderResponse)
+                                            .length === 0
+                                            ? `${localeString(
+                                                  'views.LSPS1.createOrder'
+                                              )}`
+                                            : `${localeString(
+                                                  'views.LSPS1.makePayment'
+                                              )}`
+                                    }
+                                    onPress={() => {
+                                        if (
+                                            Object.keys(createOrderResponse)
+                                                .length === 0
+                                        ) {
+                                            let finalConfirmations =
+                                                this.state
+                                                    .requiredChannelConfirmations;
+                                            let finalBlocks =
+                                                this.state.confirmsWithinBlocks;
+
+                                            if (
+                                                finalConfirmations === '' ||
+                                                finalConfirmations === null
+                                            ) {
+                                                finalConfirmations =
+                                                    info?.min_required_channel_confirmations?.toString();
+                                            }
+                                            if (
+                                                finalBlocks === '' ||
+                                                finalBlocks === null
+                                            ) {
+                                                finalBlocks =
+                                                    info?.min_funding_confirms_within_blocks?.toString();
+                                            }
+
+                                            this.setState(
+                                                {
+                                                    requiredChannelConfirmations:
+                                                        finalConfirmations,
+                                                    confirmsWithinBlocks:
+                                                        finalBlocks
+                                                },
+                                                () => {
+                                                    if (
+                                                        BackendUtils.supportsLSPS1native()
+                                                    ) {
+                                                        LSPStore.lsps1CreateOrderNative(
+                                                            this.state
+                                                        );
+                                                    } else if (
+                                                        BackendUtils.supportsLSPS1rest()
+                                                    ) {
+                                                        LSPStore.lsps1CreateOrderREST(
+                                                            this.state
+                                                        );
+                                                    } else if (
+                                                        BackendUtils.supportsLSPScustomMessage()
+                                                    ) {
+                                                        LSPStore.lsps1CreateOrderCustomMessage(
+                                                            this.state
+                                                        );
+                                                    }
+                                                }
+                                            );
+                                        } else {
+                                            LSPStore.saveOrderToHistory(
+                                                createOrderResponse,
+                                                'LSPS1'
+                                            ).then(() => {
+                                                navigation.navigate(
+                                                    'LSPS1PaymentAwait',
+                                                    buildPaymentAwaitParams(
+                                                        payment,
+                                                        result?.order_id,
+                                                        LSPService.LSPS1
+                                                    )
+                                                );
+                                            });
+                                        }
+                                    }}
+                                    containerStyle={{ paddingBottom: 10 }}
+                                    secondary
+                                />
+                            </View>
+                        )}
+                    </>
+                )}
+
+                {!LSPStore.loadingLSPS1 && isGetInfoError && (
+                    <View
+                        style={{
+                            position: 'absolute',
+                            width: '100%',
+                            bottom: 0
+                        }}
+                    >
+                        <Button
+                            title={localeString('general.retry')}
+                            onPress={async () => {
+                                if (BackendUtils.supportsLSPS1native()) {
+                                    LSPStore.lsps1GetInfoNative();
+                                } else if (BackendUtils.supportsLSPS1rest()) {
+                                    LSPStore.lsps1GetInfoREST();
+                                } else if (
+                                    BackendUtils.supportsLSPScustomMessage()
+                                ) {
+                                    await this.connectPeer();
+                                    await this.subscribeToCustomMessages();
+                                    LSPStore.lsps1GetInfoCustomMessage();
+                                }
+                            }}
+                        />
+
+                        <Button
+                            onPress={() => {
+                                this.props.navigation.navigate('LSPS1Settings');
+                            }}
+                            title={localeString('views.LSPS1.goToSettings')}
+                            containerStyle={{ paddingVertical: 20 }}
+                            secondary
+                        />
+                    </View>
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    textInput: {
+        marginBottom: 25
+    }
+});

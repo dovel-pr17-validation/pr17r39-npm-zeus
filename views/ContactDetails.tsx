@@ -1,0 +1,717 @@
+import * as React from 'react';
+import {
+    Text,
+    View,
+    Image,
+    StyleSheet,
+    TouchableOpacity,
+    ScrollView
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import {
+    SharedScreen,
+    SharedText,
+    sharedTransitionEntering
+} from '../components/SharedTransition';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { v4 as uuidv4 } from 'uuid';
+
+import Screen from '../components/Screen';
+import Button from '../components/Button';
+import LoadingIndicator from '../components/LoadingIndicator';
+import Header from '../components/Header';
+import { Row } from '../components/layout/Row';
+import { ContactAvatar } from '../components/ContactAvatar';
+
+import ContactStore, { CONTACTS_KEY } from '../stores/ContactStore';
+
+import LightningBolt from '../assets/images/SVG/Lightning Bolt.svg';
+import BitcoinIcon from '../assets/images/SVG/BitcoinIcon.svg';
+import KeySecurity from '../assets/images/SVG/Key Security.svg';
+import NostrichIcon from '../assets/images/SVG/Nostrich.svg';
+import EditContact from '../assets/images/SVG/Pen.svg';
+import Star from '../assets/images/SVG/Star.svg';
+import QR from '../assets/images/SVG/QR.svg';
+import Ecash from '../assets/images/SVG/Ecash.svg';
+
+import { themeColor } from '../utils/ThemeUtils';
+import LinkingUtils from '../utils/LinkingUtils';
+import { localeString } from '../utils/LocaleUtils';
+
+import Storage from '../storage';
+
+import Contact from '../models/Contact';
+
+const AddressRow: React.FC<{
+    address: string;
+    onPress: () => void;
+    icon: React.ReactNode;
+}> = ({ address, onPress, icon }) => (
+    <TouchableOpacity onPress={onPress}>
+        <View style={styles.contactRow}>
+            {icon}
+            <Text
+                numberOfLines={1}
+                ellipsizeMode="middle"
+                style={{
+                    ...styles.contactFields,
+                    color: themeColor('chain')
+                }}
+            >
+                {address}
+            </Text>
+        </View>
+    </TouchableOpacity>
+);
+
+interface ContactDetailsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    route: Route<
+        'ContactDetails',
+        {
+            isNostrContact: boolean;
+            contactId: string;
+            contactName?: string;
+            contactPhoto?: string;
+            contactHasOnlyCashuPubkey?: boolean;
+            nostrContact: any;
+            cashuLockData?: any;
+        }
+    >;
+    ContactStore: ContactStore;
+}
+
+interface ContactDetailsState {
+    contact: Contact | any;
+    isLoading: boolean;
+    isNostrContact: boolean;
+}
+
+@inject('ContactStore')
+@observer
+export default class ContactDetails extends React.Component<
+    ContactDetailsProps,
+    ContactDetailsState
+> {
+    private focusListener?: () => void;
+    constructor(props: ContactDetailsProps) {
+        super(props);
+
+        this.state = {
+            contact: {
+                lnAddress: [''],
+                bolt12Address: [''],
+                bolt12Offer: [''],
+                onchainAddress: [''],
+                pubkey: [''],
+                cashuPubkey: [''],
+                nip05: [''],
+                nostrNpub: [''],
+                name: '',
+                description: '',
+                photo: null,
+                isFavourite: false,
+                contactId: '',
+                banner: '',
+                id: ''
+            },
+            isLoading: true,
+            isNostrContact: false
+        };
+    }
+
+    async componentDidMount() {
+        try {
+            const isNostrContact = this.props.route.params?.isNostrContact;
+            this.setState({ isNostrContact });
+
+            await this.fetchContact();
+
+            this.focusListener = this.props.navigation.addListener(
+                'focus',
+                async () => {
+                    await this.fetchContact();
+                }
+            );
+        } catch (error) {
+            console.error(error);
+        }
+    }
+
+    componentWillUnmount() {
+        if (this.focusListener) {
+            this.focusListener();
+        }
+    }
+
+    fetchContact = async () => {
+        try {
+            const { contactId, nostrContact, isNostrContact } =
+                this.props.route.params ?? {};
+            const contactsString: any = await Storage.getItem(CONTACTS_KEY);
+
+            const storedContact =
+                contactsString && contactId
+                    ? JSON.parse(contactsString).find(
+                          (c: Contact) =>
+                              c.contactId === contactId || c.id === contactId
+                      )
+                    : undefined;
+
+            this.setState({
+                contact: storedContact ?? nostrContact,
+                isNostrContact,
+                isLoading: false
+            });
+        } catch (error) {
+            console.log('Error fetching contact:', error);
+            this.setState({ isLoading: false });
+        }
+    };
+
+    sendAddress = (address: string) => {
+        const { navigation } = this.props;
+        const { contact } = this.state;
+        navigation.navigate('Send', {
+            destination: address,
+            contactName: contact.name
+        });
+    };
+
+    selectCashuPubkeyForLocking = (cashuPubkey: string) => {
+        const { navigation, route } = this.props;
+        const { contact } = this.state;
+        const { cashuLockData } = route.params || {};
+
+        navigation.navigate('CashuLockSettings', {
+            destination: cashuPubkey,
+            contactName: contact.name,
+            ...cashuLockData
+        });
+    };
+
+    saveUpdatedContact = async (updatedContact: Contact) => {
+        const { ContactStore } = this.props;
+        try {
+            const contactsString: any = await Storage.getItem(CONTACTS_KEY);
+
+            if (contactsString) {
+                const existingContacts: Contact[] = JSON.parse(contactsString);
+
+                // Find the index of the contact with the same name
+                const contactIndex = existingContacts.findIndex(
+                    (contact) => contact.contactId === updatedContact.contactId
+                );
+
+                if (contactIndex !== -1) {
+                    // Update the contact in the array
+                    existingContacts[contactIndex] = updatedContact;
+
+                    // Save the updated contacts back to storage
+                    await Storage.setItem(CONTACTS_KEY, existingContacts);
+
+                    console.log('Contact updated successfully!');
+                    ContactStore?.loadContacts();
+                }
+            }
+        } catch (error) {
+            console.log('Error updating contact:', error);
+        }
+    };
+
+    importToContacts = async () => {
+        const { contact } = this.state;
+
+        const newContact = {
+            ...contact,
+            contactId: uuidv4()
+        };
+
+        const contactsString: any = await Storage.getItem(CONTACTS_KEY);
+
+        const existingContacts: Contact[] = contactsString
+            ? JSON.parse(contactsString)
+            : [];
+
+        const updatedContacts = [...existingContacts, newContact].sort((a, b) =>
+            a.name.localeCompare(b.name)
+        );
+
+        await Storage.setItem(CONTACTS_KEY, updatedContacts);
+
+        console.log('Contact imported successfully!');
+        this.props.navigation.popTo('Contacts');
+    };
+
+    toggleFavorite = () => {
+        const { contact } = this.state;
+
+        // Toggle the isFavourite field
+        const updatedContact = {
+            ...contact,
+            isFavourite: !contact.isFavourite
+        };
+
+        // Save the updated contact
+        this.saveUpdatedContact(updatedContact);
+
+        // Update the state to reflect the changes
+        this.setState({ contact: updatedContact });
+    };
+
+    handleNostr = (value: string) => {
+        const deepLink = `nostr:${value}`;
+        LinkingUtils.handleDeepLink(deepLink, this.props.navigation);
+    };
+
+    render() {
+        const { isLoading, isNostrContact } = this.state;
+        const { navigation, ContactStore, route } = this.props;
+        const { setPrefillContact } = ContactStore;
+        const { cashuLockData } = route.params || {};
+        const fromCashuLockSettings = cashuLockData?.fromCashuLockSettings;
+
+        const contact = new Contact(this.state.contact);
+        const nostrContact = this.props.route.params?.nostrContact;
+        const StarButton = () => (
+            <TouchableOpacity onPress={this.toggleFavorite}>
+                <Star
+                    fill={contact.isFavourite ? themeColor('text') : 'none'}
+                    stroke={contact.isFavourite ? 'none' : themeColor('text')}
+                    strokeWidth={2}
+                    style={{ alignSelf: 'center', marginRight: 16 }}
+                />
+            </TouchableOpacity>
+        );
+
+        const EditContactButton = () => (
+            <TouchableOpacity
+                onPress={() => {
+                    setPrefillContact(contact);
+                    navigation.navigate('AddContact', {
+                        isEdit: true
+                    });
+                }}
+            >
+                <EditContact
+                    fill={themeColor('text')}
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        // Function to add prefixes to addresses based on their types
+        const addPrefixToAddresses = (
+            addresses: string[] | undefined,
+            prefix: string
+        ) =>
+            (addresses || [])
+                .filter(Boolean)
+                .map((address) => `${prefix}${address}`);
+
+        const QRButton = () => {
+            const {
+                lnAddress,
+                onchainAddress,
+                pubkey,
+                nostrNpub,
+                nip05,
+                cashuPubkey
+            } = contact;
+            return (
+                <TouchableOpacity
+                    onPress={() => {
+                        const contactDataWithoutPhoto = {
+                            ...this.state.contact
+                        };
+
+                        // Check if 'photo' exists and doesn't start with 'http'
+                        if (
+                            contactDataWithoutPhoto.photo &&
+                            !contactDataWithoutPhoto.photo.startsWith('http')
+                        ) {
+                            delete contactDataWithoutPhoto.photo;
+                        }
+
+                        // Add the 'zeuscontact:' prefix to the contactData parameter
+                        const zeusContactData = `zeuscontact:${JSON.stringify(
+                            contactDataWithoutPhoto
+                        )}`;
+                        navigation.navigate('MultiQR', {
+                            fromContactDetailsView: true,
+                            contactData: zeusContactData,
+                            addressData: [
+                                ...addPrefixToAddresses(
+                                    lnAddress,
+                                    'lightning:'
+                                ),
+                                ...addPrefixToAddresses(pubkey, 'lightning:'),
+                                ...addPrefixToAddresses(
+                                    cashuPubkey,
+                                    'lightning:'
+                                ),
+                                ...addPrefixToAddresses(
+                                    onchainAddress,
+                                    'bitcoin:'
+                                ),
+                                ...addPrefixToAddresses(nostrNpub, 'nostr:'),
+                                ...addPrefixToAddresses(nip05, 'nostr:')
+                            ]
+                        });
+                    }}
+                >
+                    <QR
+                        fill={themeColor('text')}
+                        style={{ alignSelf: 'center' }}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        // Get params for shared element transition during loading
+        const contactId = this.props.route.params?.contactId;
+        const contactName = this.props.route.params?.contactName;
+        const contactPhoto = this.props.route.params?.contactPhoto;
+        const contactHasOnlyCashuPubkey =
+            this.props.route.params?.contactHasOnlyCashuPubkey;
+
+        return (
+            <SharedScreen>
+                {isLoading ? (
+                    <Screen>
+                        <Header
+                            leftComponent="Back"
+                            containerStyle={{
+                                borderBottomWidth: 0
+                            }}
+                            navigation={navigation}
+                        />
+                        <View style={{ alignItems: 'center', marginTop: 20 }}>
+                            <ContactAvatar
+                                contactId={contactId}
+                                imageUrl={contactPhoto}
+                                name={contactName}
+                                size="large"
+                                contactHasOnlyCashuPubkey={
+                                    contactHasOnlyCashuPubkey
+                                }
+                            />
+                            {contactName && (
+                                <SharedText
+                                    tag={`contact-name-${contactId}`}
+                                    style={{
+                                        fontSize: 40,
+                                        fontWeight: 'bold',
+                                        marginBottom: 10,
+                                        color: 'white'
+                                    }}
+                                >
+                                    {contactName}
+                                </SharedText>
+                            )}
+                            <View style={{ marginTop: 40 }}>
+                                <LoadingIndicator />
+                            </View>
+                        </View>
+                    </Screen>
+                ) : (
+                    <Screen>
+                        <Header
+                            leftComponent="Back"
+                            centerComponent={
+                                isNostrContact ? <></> : <EditContactButton />
+                            }
+                            rightComponent={
+                                <Row>
+                                    {!isNostrContact && <StarButton />}
+                                    <QRButton />
+                                </Row>
+                            }
+                            placement="right"
+                            containerStyle={{
+                                borderBottomWidth: 0
+                            }}
+                            navigation={navigation}
+                        />
+                        <ScrollView
+                            contentContainerStyle={styles.scrollContent}
+                        >
+                            {contact.banner && (
+                                <Image
+                                    source={{ uri: contact.getBanner }}
+                                    style={{
+                                        width: '100%',
+                                        height: 150,
+                                        marginBottom: 20
+                                    }}
+                                />
+                            )}
+                            <ContactAvatar
+                                size="large"
+                                sharedTransitionEntering={
+                                    sharedTransitionEntering
+                                }
+                                // eslint-disable-next-line zeus/no-negative-layout-offset -- intentional: avatar overlaps the banner
+                                style={{ marginTop: contact.banner ? -100 : 0 }}
+                                contactId={contactId}
+                                contactHasOnlyCashuPubkey={
+                                    contactHasOnlyCashuPubkey
+                                }
+                                name={contactName || contact.name}
+                                imageUrl={contactPhoto || contact.getPhoto}
+                            />
+                            <SharedText
+                                tag={`contact-name-${
+                                    contactId || contact.contactId || contact.id
+                                }`}
+                                style={{
+                                    fontSize: 40,
+                                    fontWeight: 'bold',
+                                    marginBottom: 10,
+                                    color: themeColor('text')
+                                }}
+                                entering={sharedTransitionEntering}
+                            >
+                                {contact.name}
+                            </SharedText>
+                            <Text
+                                style={{
+                                    ...styles.contactDescription,
+                                    color: themeColor('secondaryText')
+                                }}
+                            >
+                                {contact.description
+                                    .trim()
+                                    .replace(/\s+/g, ' ')}
+                            </Text>
+
+                            {!fromCashuLockSettings &&
+                                contact.hasLnAddress &&
+                                contact.lnAddress.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`ln-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<LightningBolt />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasBolt12Address &&
+                                contact.bolt12Address.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`bolt12addr-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<LightningBolt />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasBolt12Offer &&
+                                contact.bolt12Offer.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`bolt12offer-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<LightningBolt />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasNoffer &&
+                                contact.noffer.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`noffer-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<LightningBolt />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasPubkey &&
+                                contact.pubkey.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`pubkey-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<LightningBolt />}
+                                        />
+                                    )
+                                )}
+
+                            {contact.hasCashuPubkey &&
+                                contact.cashuPubkey.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`cashu-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                fromCashuLockSettings
+                                                    ? this.selectCashuPubkeyForLocking(
+                                                          address
+                                                      )
+                                                    : this.sendAddress(address)
+                                            }
+                                            icon={<Ecash fill={'#FACC15'} />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasOnchainAddress &&
+                                contact.onchainAddress.map(
+                                    (address: string, index: number) => (
+                                        <AddressRow
+                                            key={`onchain-${index}`}
+                                            address={address}
+                                            onPress={() =>
+                                                this.sendAddress(address)
+                                            }
+                                            icon={<BitcoinIcon />}
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasNip05 &&
+                                contact.nip05.map(
+                                    (value: string, index: number) => (
+                                        <AddressRow
+                                            key={`nip05-${index}`}
+                                            address={value}
+                                            onPress={() =>
+                                                this.handleNostr(value)
+                                            }
+                                            icon={
+                                                <NostrichIcon
+                                                    fill={'#FFD93F'}
+                                                    width={22}
+                                                    height={22}
+                                                />
+                                            }
+                                        />
+                                    )
+                                )}
+
+                            {!fromCashuLockSettings &&
+                                contact.hasNpub &&
+                                contact.nostrNpub.map(
+                                    (value: string, index: number) => (
+                                        <AddressRow
+                                            key={`npub-${index}`}
+                                            address={value}
+                                            onPress={() =>
+                                                this.handleNostr(value)
+                                            }
+                                            icon={<KeySecurity />}
+                                        />
+                                    )
+                                )}
+                        </ScrollView>
+                        {isNostrContact && (
+                            <>
+                                <Button
+                                    onPress={() => this.importToContacts()}
+                                    title={localeString(
+                                        'views.ContactDetails.saveToContacts'
+                                    )}
+                                    containerStyle={{ paddingBottom: 12 }}
+                                />
+                                <Button
+                                    onPress={() => {
+                                        navigation.goBack();
+                                        setPrefillContact(nostrContact);
+                                        navigation.navigate('AddContact', {
+                                            isEdit: true,
+                                            isNostrContact
+                                        });
+                                    }}
+                                    title={localeString(
+                                        'views.ContactDetails.editAndSaveContact'
+                                    )}
+                                    containerStyle={{ paddingBottom: 12 }}
+                                    secondary
+                                />
+                            </>
+                        )}
+                    </Screen>
+                )}
+            </SharedScreen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    contactRow: {
+        flexDirection: 'row',
+        marginLeft: 20,
+        marginRight: 20,
+        alignItems: 'center'
+    },
+    contactFields: {
+        fontSize: 24,
+        marginBottom: 4,
+        marginLeft: 5,
+        marginRight: 5,
+        flexShrink: 1
+    },
+    avatarContainer: {
+        width: 150,
+        height: 150,
+        borderRadius: 75
+    },
+    avatarView: {
+        alignItems: 'center',
+        justifyContent: 'center'
+    },
+    avatarInitials: {
+        fontSize: 48,
+        fontWeight: 'bold'
+    },
+    scrollContent: {
+        backgroundColor: 'none',
+        alignItems: 'center',
+        paddingBottom: 10
+    },
+    bannerContainer: {
+        width: '100%',
+        height: 150,
+        marginBottom: 95
+    },
+    bannerImage: {
+        width: '100%',
+        height: 150
+    },
+    bannerAvatarOverlay: {
+        position: 'absolute',
+        top: 75,
+        alignSelf: 'center'
+    },
+    contactDescription: {
+        fontSize: 20,
+        marginBottom: 6,
+        marginHorizontal: 20
+    }
+});

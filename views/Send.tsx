@@ -1,0 +1,1839 @@
+import * as React from 'react';
+import {
+    AppState,
+    FlatList,
+    Image,
+    StyleSheet,
+    Text,
+    View,
+    ScrollView,
+    TouchableOpacity,
+    BackHandler,
+    NativeEventSubscription
+} from 'react-native';
+import { Chip, Icon } from '@rneui/themed';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { inject, observer } from 'mobx-react';
+import NfcManager from 'react-native-nfc-manager';
+import { ParamListBase, Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import handleAnything, { isClipboardValue } from '../utils/handleAnything';
+
+import BalanceStore from '../stores/BalanceStore';
+import ContactStore from '../stores/ContactStore';
+import InvoicesStore from '../stores/InvoicesStore';
+import ModalStore from '../stores/ModalStore';
+import NodeInfoStore from '../stores/NodeInfoStore';
+import SettingsStore, {
+    DEFAULT_SLIDE_TO_PAY_THRESHOLD
+} from '../stores/SettingsStore';
+import TransactionsStore from '../stores/TransactionsStore';
+import UTXOsStore from '../stores/UTXOsStore';
+
+import AmountInput from '../components/AmountInput';
+import Button from '../components/Button';
+import PaymentInFlightNotice from '../components/PaymentInFlightNotice';
+import FeeLimit from '../components/FeeLimit';
+import LoadingIndicator from '../components/LoadingIndicator';
+import {
+    WarningMessage,
+    ErrorMessage
+} from '../components/SuccessErrorMessage';
+import Header from '../components/Header';
+import OnchainFeeInput from '../components/OnchainFeeInput';
+import Screen from '../components/Screen';
+import SwipeButton from '../components/SwipeButton';
+import Switch from '../components/Switch';
+import TextInput from '../components/TextInput';
+import UTXOPicker from '../components/UTXOPicker';
+
+import AddressUtils from '../utils/AddressUtils';
+import BackendUtils from '../utils/BackendUtils';
+import { errorToUserFriendly } from '../utils/ErrorUtils';
+import { scanNfcTag } from '../utils/NFCUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { themeColor } from '../utils/ThemeUtils';
+import { getRawAmountFromSats, isWholeSatAmount } from '../utils/AmountUtils';
+import { clearPendingPaymentData } from '../utils/GraphSyncUtils';
+
+import NFC from '../assets/images/SVG/NFC-alt.svg';
+import ContactIcon from '../assets/images/SVG/PeersContact.svg';
+import Scan from '../assets/images/SVG/Scan.svg';
+
+import Contact from '../models/Contact';
+import { AdditionalOutput } from '../models/TransactionRequest';
+
+interface SendProps {
+    exitSetup: any;
+    navigation: NativeStackNavigationProp<ParamListBase>;
+    BalanceStore: BalanceStore;
+    ContactStore: ContactStore;
+    InvoicesStore: InvoicesStore;
+    ModalStore: ModalStore;
+    NodeInfoStore: NodeInfoStore;
+    SettingsStore: SettingsStore;
+    TransactionsStore: TransactionsStore;
+    UTXOsStore: UTXOsStore;
+    route: Route<
+        'Send',
+        {
+            destination: string;
+            satAmount: string;
+            fee: string;
+            transactionType: string | null;
+            bolt12: string | null;
+            isValid: boolean;
+            contactName: string;
+            clearOnBackPress: boolean;
+            fromGraphSync: boolean;
+        }
+    >;
+}
+
+interface SendState {
+    isValid: boolean;
+    transactionType: string | null;
+    bolt12: string | null;
+    destination: string;
+    amount: string;
+    satAmount: string | number;
+    // Set once a preset amount could not be converted to fiat. The amount
+    // inputs then stay pinned to sats until the screen is closed.
+    fiatError?: string;
+    fee: string;
+    error_msg: string;
+    utxos: Array<string>;
+    utxoBalance: number;
+    maxParts: string;
+    maxShardAmt: string;
+    feeLimitSat: string;
+    maxFeePercent: string;
+    feeOption: string;
+    timeoutSeconds: string;
+    message: string;
+    enableAtomicMultiPathPayment: boolean;
+    clipboard: string;
+    loading: boolean;
+    contactName: string;
+    clearOnBackPress: boolean;
+    account: string;
+    additionalOutputs: Array<AdditionalOutput>;
+    fundMax: boolean;
+    nfcSupported: boolean;
+    swipeButtonKey: number;
+}
+
+@inject(
+    'BalanceStore',
+    'ContactStore',
+    'InvoicesStore',
+    'ModalStore',
+    'NodeInfoStore',
+    'SettingsStore',
+    'TransactionsStore',
+    'UTXOsStore'
+)
+@observer
+export default class Send extends React.Component<SendProps, SendState> {
+    private focusListener: any;
+    private backPressSubscription: NativeEventSubscription;
+    private appStateSubscription: NativeEventSubscription | null = null;
+    private previousAmount: string = '';
+    private previousSatAmount: string | number = '0';
+
+    constructor(props: SendProps) {
+        super(props);
+        const { route } = props;
+        const {
+            destination,
+            satAmount,
+            fee,
+            transactionType,
+            isValid,
+            contactName,
+            bolt12
+        } = route.params ?? {};
+        const clearOnBackPress = route.params?.clearOnBackPress ?? !destination;
+
+        if (transactionType === 'Lightning') {
+            this.props.InvoicesStore.getPayReq(destination);
+        }
+
+        let rawAmount;
+        if (satAmount) {
+            rawAmount = getRawAmountFromSats(satAmount);
+        }
+
+        this.state = {
+            isValid: isValid || false,
+            transactionType,
+            bolt12,
+            destination: destination || '',
+            amount: rawAmount?.amount || '',
+            satAmount: satAmount || '0',
+            fiatError: rawAmount?.error,
+            fee: fee || '',
+            utxos: [],
+            utxoBalance: 0,
+            error_msg: '',
+            maxParts: '16',
+            maxShardAmt: '',
+            feeLimitSat: '100',
+            maxFeePercent: '5.0',
+            feeOption: 'fixed',
+            timeoutSeconds: '60',
+            message: '',
+            enableAtomicMultiPathPayment: false,
+            clipboard: '',
+            loading: false,
+            contactName,
+            clearOnBackPress,
+            account: 'default',
+            additionalOutputs: [],
+            fundMax: false,
+            nfcSupported: false,
+            swipeButtonKey: 0
+        };
+    }
+
+    async componentDidUpdate(prevProps: SendProps) {
+        const { route, InvoicesStore } = this.props;
+        const { route: prevRoute } = prevProps;
+
+        if (JSON.stringify(route.params) !== JSON.stringify(prevRoute.params)) {
+            const {
+                destination,
+                bolt12,
+                satAmount,
+                fee,
+                transactionType,
+                contactName
+            } = route.params ?? {};
+
+            if (transactionType === 'Lightning') {
+                InvoicesStore.getPayReq(destination);
+            }
+
+            const stateUpdate: Partial<SendState> = {
+                transactionType,
+                destination,
+                bolt12,
+                isValid: true,
+                contactName
+            };
+
+            if (satAmount) {
+                // must be the raw, unformatted value in the input's unit -
+                // AmountInput's `amount` prop is parsed back into sats, so a
+                // display-formatted string (eg '12,618 sats') yields NaN.
+                // Once the inputs are pinned to sats they stay pinned, so
+                // keep converting to sats even if a fiat rate arrived since.
+                const { amount, error } = getRawAmountFromSats(
+                    satAmount,
+                    this.state.fiatError ? 'sats' : undefined
+                );
+                stateUpdate.amount = amount;
+                stateUpdate.satAmount = satAmount;
+                if (error) {
+                    stateUpdate.fiatError = error;
+                }
+            }
+            if (fee) {
+                stateUpdate.fee = fee;
+            }
+            this.setState(stateUpdate as SendState);
+        }
+    }
+
+    async componentDidMount() {
+        const { SettingsStore, BalanceStore, route } = this.props;
+        // balance is not refreshed elsewhere after channel changes, so
+        // the no-lightning-balance warning could otherwise be stale
+        BalanceStore.getLightningBalance(true);
+        const { getSettings } = SettingsStore;
+        const settings = await getSettings();
+
+        this.setState({
+            maxFeePercent: settings?.payments?.defaultFeePercentage || '5.0',
+            timeoutSeconds: settings?.payments?.timeoutSeconds || '60'
+        });
+
+        if (route.params?.fromGraphSync) {
+            clearPendingPaymentData().catch((error) => {
+                console.error(
+                    'Failed to clear pending payment data on Send:',
+                    error
+                );
+            });
+        }
+
+        await this.readClipboard();
+
+        if (this.state.destination) {
+            this.validateAddress(this.state.destination);
+        }
+
+        this.backPressSubscription = BackHandler.addEventListener(
+            'hardwareBackPress',
+            this.backPressed.bind(this)
+        );
+
+        this.appStateSubscription = AppState.addEventListener(
+            'change',
+            (nextAppState) => {
+                if (nextAppState === 'active') {
+                    this.readClipboard();
+                }
+            }
+        );
+
+        const nfcSupported = await NfcManager.isSupported();
+        this.setState({ nfcSupported });
+
+        // Reset the slide-to-pay slider position when the screen regains
+        // focus, e.g. after backing out of a failed payment to retry
+        this.focusListener = this.props.navigation.addListener('focus', () => {
+            this.setState({
+                swipeButtonKey: this.state.swipeButtonKey + 1
+            });
+        });
+    }
+
+    componentWillUnmount(): void {
+        this.backPressSubscription?.remove();
+        this.appStateSubscription?.remove();
+        if (this.focusListener) this.focusListener();
+    }
+
+    readClipboard = async () => {
+        const { SettingsStore } = this.props;
+        const settings = SettingsStore.settings;
+        let clipboard = '';
+
+        if (settings.privacy?.clipboard) {
+            const value = await Clipboard.getString();
+            if (value && (await isClipboardValue(value))) {
+                clipboard = value;
+            }
+        }
+
+        this.setState({ clipboard });
+    };
+
+    scanNfc = async () => {
+        const str = await scanNfcTag(this.props.ModalStore, 'pay');
+        if (str) this.validateAddress(str);
+    };
+
+    selectUTXOs = (
+        utxos: Array<string>,
+        utxoBalance: number,
+        account: string
+    ) => {
+        const { confirmedBlockchainBalance } = this.props.BalanceStore;
+
+        this.setState((prevState) => {
+            // send max is only offered on the default account
+            const fundMax = account === 'default' ? prevState.fundMax : false;
+
+            let amount = prevState.amount;
+            let satAmount = prevState.satAmount;
+
+            if (fundMax) {
+                // send max is bound to the selection, so the amount it will
+                // send has to follow the selection as it changes
+                satAmount =
+                    utxoBalance > 0 ? utxoBalance : confirmedBlockchainBalance;
+            } else if (prevState.fundMax) {
+                // send max was just turned off, so put back the amount that
+                // was entered before it was enabled
+                amount = this.previousAmount || '';
+                satAmount = this.previousSatAmount || '0';
+            }
+
+            return { utxos, utxoBalance, account, fundMax, amount, satAmount };
+        });
+    };
+
+    validateAdditionalOutputFields = (
+        output: AdditionalOutput
+    ): { hasAddress: boolean; hasAmount: boolean } => {
+        const hasAddress = Boolean(
+            output?.address && output.address.trim() !== ''
+        );
+        const satAmountNum = Number(output?.satAmount);
+        const hasAmount = Boolean(
+            output?.satAmount && !isNaN(satAmountNum) && satAmountNum > 0
+        );
+        return { hasAddress, hasAmount };
+    };
+
+    isValidAdditionalOutput = (output: AdditionalOutput): boolean => {
+        const { hasAddress, hasAmount } =
+            this.validateAdditionalOutputFields(output);
+        return hasAddress && hasAmount;
+    };
+
+    hasInvalidAdditionalOutputs = () => {
+        const { additionalOutputs } = this.state;
+        if (!additionalOutputs || additionalOutputs.length === 0) {
+            return false;
+        }
+        return additionalOutputs.some((output) => {
+            const { hasAddress, hasAmount } =
+                this.validateAdditionalOutputFields(output);
+            return (
+                ((hasAddress || hasAmount) && !(hasAddress && hasAmount)) ||
+                (hasAmount && !isWholeSatAmount(output.satAmount))
+            );
+        });
+    };
+
+    getValidAdditionalOutputs = () => {
+        const { additionalOutputs } = this.state;
+        if (!additionalOutputs || additionalOutputs.length === 0) {
+            return [];
+        }
+        return additionalOutputs.filter((output) =>
+            this.isValidAdditionalOutput(output)
+        );
+    };
+
+    validateAddress = (text: string) => {
+        const { navigation } = this.props;
+        this.setState({
+            loading: true,
+            isValid: true,
+            error_msg: ''
+        });
+        handleAnything(text, this.state.satAmount.toString())
+            .then((response) => {
+                try {
+                    this.setState({
+                        loading: false
+                    });
+                    if (response) {
+                        const [route, props] = response;
+                        navigation.navigate(route, props);
+                    }
+                } catch {
+                    this.setState({
+                        loading: false,
+                        transactionType: null,
+                        isValid: false
+                    });
+                }
+            })
+            .catch((err) => {
+                this.setState({
+                    loading: false,
+                    transactionType: null,
+                    isValid: false,
+                    error_msg: err.message
+                });
+            });
+    };
+
+    payBolt12 = async () => {
+        const { satAmount, bolt12, timeoutSeconds, feeLimitSat } = this.state;
+        // Bail if another payment is already in flight, matching every
+        // other send path.
+        if (this.props.TransactionsStore.paymentInFlight) return;
+        if (!bolt12) {
+            this.setState({
+                loading: false,
+                error_msg: localeString(
+                    'views.Send.payBolt12.offerFetchFailure'
+                )
+            });
+            return;
+        }
+        if (!satAmount || satAmount === '0') {
+            this.setState({
+                loading: false,
+                error_msg: localeString('views.Send.payBolt12.specifyAmount')
+            });
+            return;
+        }
+        try {
+            // The offer may arrive as a bare lno1... or wrapped in a Bitcoin
+            // URI, eg. bitcoin:?lno=lno1qgsyxjtl6... Pull the lno parameter
+            // out properly rather than splitting on '=', which mangles URIs
+            // carrying more than one parameter (BIP 353 records commonly
+            // pair an offer with a silent payment address, eg.
+            // bitcoin:?sp=sp1q...&lno=lno1...). Anything that isn't a valid
+            // offer stops here instead of reaching the backend.
+            const offer = AddressUtils.extractBolt12Offer(bolt12);
+            if (!offer) {
+                this.setState({
+                    loading: false,
+                    error_msg: localeString('views.Send.payBolt12.invalidOffer')
+                });
+                return;
+            }
+            this.setState({
+                loading: true,
+                error_msg: ''
+            });
+            if (BackendUtils.supportsOffersDirectPay()) {
+                // Paying an offer on this backend dispatches the payment
+                // directly, so nothing may be sent from here: decode the
+                // offer and hand it to the review screen, which owns the
+                // payment dispatch (with the slide-to-pay gate applied)
+                const decodedOffer = await BackendUtils.decodeOffer({
+                    offer
+                });
+                this.setState({ loading: false, error_msg: '' });
+                this.props.navigation.navigate('Bolt12OfferReview', {
+                    offer,
+                    decodedOffer,
+                    satAmount: satAmount.toString(),
+                    timeoutSeconds,
+                    feeLimitSat
+                });
+                return;
+            }
+            const res = await BackendUtils.fetchInvoiceFromOffer(
+                offer,
+                satAmount,
+                timeoutSeconds,
+                feeLimitSat
+            );
+            if (!res.invoice) {
+                this.setState({
+                    loading: false,
+                    error_msg: localeString(
+                        'views.Send.payBolt12.invoiceFetchFailure'
+                    )
+                });
+                return;
+            }
+            this.props.InvoicesStore.getPayReq(res.invoice);
+            this.props.navigation.navigate('PaymentRequest');
+            this.setState({
+                loading: false,
+                error_msg: ''
+            });
+        } catch (e: any) {
+            this.setState({
+                loading: false,
+                error_msg: errorToUserFriendly(e)
+            });
+            return;
+        }
+    };
+
+    sendKeySendPayment = (satAmount: string | number) => {
+        const { TransactionsStore, navigation } = this.props;
+        const {
+            destination,
+            maxParts,
+            maxShardAmt,
+            message,
+            enableAtomicMultiPathPayment,
+            feeLimitSat,
+            maxFeePercent,
+            feeOption,
+            timeoutSeconds
+        } = this.state;
+
+        // Guard against double-submission: bail if a payment is already in
+        // flight so a rapid double-tap can't dispatch a second keysend.
+        if (TransactionsStore.paymentInFlight) return;
+
+        if (enableAtomicMultiPathPayment) {
+            TransactionsStore.sendPayment({
+                amount: satAmount.toString(),
+                pubkey: destination,
+                message,
+                max_parts: maxParts,
+                max_shard_amt: maxShardAmt,
+                fee_limit_sat: feeLimitSat,
+                timeout_seconds: timeoutSeconds,
+                amp: true
+            });
+        } else {
+            TransactionsStore.sendPayment({
+                amount: satAmount.toString(),
+                pubkey: destination,
+                fee_limit_sat: feeLimitSat,
+                // CLN takes either a percent cap or the fixed fee_limit_sat
+                // cap, so only send the percent when that mode is selected
+                max_fee_percent:
+                    feeOption === 'percent' ? maxFeePercent : undefined,
+                timeout_seconds: timeoutSeconds,
+                message
+            });
+        }
+
+        navigation.navigate('SendingLightning');
+    };
+
+    displayAddress = (item: any) => {
+        const contact = new Contact(item);
+        const {
+            hasLnAddress,
+            hasBolt12Address,
+            hasBolt12Offer,
+            hasNoffer,
+            hasOnchainAddress,
+            hasPubkey,
+            hasMultiplePayableAddresses
+        } = contact;
+
+        if (hasMultiplePayableAddresses) {
+            return localeString('views.Settings.Contacts.multipleAddresses');
+        }
+
+        if (hasLnAddress) return item.lnAddress[0];
+        if (hasBolt12Address) return item.bolt12Address[0];
+        if (hasBolt12Offer) return item.bolt12Offer[0];
+        if (hasNoffer) return item.noffer[0];
+        if (hasOnchainAddress) return item.onchainAddress[0];
+        if (hasPubkey) return item.pubkey[0];
+
+        return localeString('views.Settings.Contacts.noAddress');
+    };
+
+    renderContactItem = ({ item }: { item: Contact }) => {
+        const { navigation } = this.props;
+        const contact = new Contact(item);
+        return (
+            <TouchableOpacity
+                onPress={() => {
+                    if (contact.isSingleLnAddress) {
+                        this.validateAddress(item.lnAddress[0]);
+                    } else if (contact.isSingleBolt12Address) {
+                        this.validateAddress(item.bolt12Address[0]);
+                    } else if (contact.isSingleBolt12Offer) {
+                        this.validateAddress(item.bolt12Offer[0]);
+                    } else if (contact.isSingleNoffer) {
+                        this.validateAddress(item.noffer[0]);
+                    } else if (contact.isSingleOnchainAddress) {
+                        this.validateAddress(item.onchainAddress[0]);
+                    } else if (contact.isSinglePubkey) {
+                        this.validateAddress(item.pubkey[0]);
+                    } else {
+                        navigation.navigate('ContactDetails', {
+                            contactId: contact.getContactId,
+                            isNostrContact: false
+                        });
+                    }
+                }}
+            >
+                <View
+                    style={{
+                        marginHorizontal: 28,
+                        paddingBottom: 20,
+                        flexDirection: 'row',
+                        alignItems: 'center'
+                    }}
+                >
+                    {contact.photo && (
+                        <Image
+                            source={{ uri: contact.getPhoto }}
+                            style={{
+                                width: 40,
+                                height: 40,
+                                borderRadius: 20,
+                                marginRight: 10
+                            }}
+                        />
+                    )}
+                    <View style={{ flex: 1 }}>
+                        <Text
+                            style={{ fontSize: 16, color: themeColor('text') }}
+                        >
+                            {item.name}
+                        </Text>
+                        <Text
+                            numberOfLines={1}
+                            ellipsizeMode="middle"
+                            style={{
+                                fontSize: 16,
+                                color: themeColor('secondaryText')
+                            }}
+                        >
+                            {this.displayAddress(item)}
+                        </Text>
+                    </View>
+                </View>
+            </TouchableOpacity>
+        );
+    };
+
+    backPressed = () => {
+        if (this.state.clearOnBackPress && this.state.transactionType) {
+            this.setState({
+                contactName: '',
+                destination: '',
+                transactionType: ''
+            });
+            this.props.navigation.setParams({
+                contactName: '',
+                destination: '',
+                transactionType: ''
+            });
+        } else {
+            this.props.navigation.pop();
+        }
+        return true;
+    };
+
+    render() {
+        const {
+            SettingsStore,
+            BalanceStore,
+            UTXOsStore,
+            ContactStore,
+            NodeInfoStore,
+            TransactionsStore,
+            navigation
+        } = this.props;
+        const {
+            isValid,
+            transactionType,
+            destination,
+            amount,
+            satAmount,
+            fee,
+            utxoBalance,
+            error_msg,
+            maxParts,
+            maxShardAmt,
+            message,
+            enableAtomicMultiPathPayment,
+            clipboard,
+            loading,
+            contactName,
+            additionalOutputs,
+            fundMax,
+            account,
+            utxos,
+            nfcSupported,
+            timeoutSeconds,
+            fiatError
+        } = this.state;
+        const {
+            confirmedBlockchainBalance,
+            totalBlockchainBalanceAccounts,
+            lightningBalance
+        } = BalanceStore;
+        const { implementation } = SettingsStore;
+        const { contacts } = ContactStore;
+
+        const paymentOptions = [localeString('views.Send.lnPayment')];
+
+        if (NodeInfoStore.supportsOffers) {
+            paymentOptions.push(
+                localeString('views.Settings.Bolt12Address'),
+                localeString('views.Settings.Bolt12Offer')
+            );
+        }
+
+        if (BackendUtils.supportsOnchainSends()) {
+            paymentOptions.push(localeString('views.Send.btcAddress'));
+        }
+        if (BackendUtils.supportsKeysend()) {
+            paymentOptions.push(localeString('views.Send.keysendAddress'));
+        }
+
+        const favoriteContacts = contacts.filter(
+            (contact: Contact) => contact.isFavourite
+        );
+        const isSendDisabled: boolean =
+            TransactionsStore.paymentInFlight ||
+            lightningBalance === 0 ||
+            !satAmount ||
+            satAmount === '0' ||
+            Number(satAmount) <= 0 ||
+            !amount ||
+            amount === '0';
+
+        const supportsOnchainSendFeeRate =
+            BackendUtils.supportsOnchainSendFeeRate();
+        const isInvalidFee =
+            supportsOnchainSendFeeRate && (fee === '0' || !fee);
+        // on-chain outputs cannot carry millisats, and VerifyOnChain shows the
+        // amount rounded, so stop here rather than fail after the slide
+        const isFractionalOnchainAmount =
+            !fundMax && !isWholeSatAmount(satAmount);
+
+        const slideToPayThreshold =
+            SettingsStore.settings?.payments?.slideToPayThreshold ??
+            DEFAULT_SLIDE_TO_PAY_THRESHOLD;
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    onBack={this.backPressed.bind(this)}
+                    navigateBackOnBackPress={false}
+                    centerComponent={{
+                        text: localeString('views.Send.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <View
+                            style={{
+                                flex: 1,
+                                flexDirection: 'row',
+                                alignItems: 'center',
+                                marginTop: 3
+                            }}
+                        >
+                            {loading && (
+                                <View style={{ marginRight: 15 }}>
+                                    <LoadingIndicator size={30} />
+                                </View>
+                            )}
+                            {nfcSupported && (
+                                <View style={{ marginRight: 15 }}>
+                                    <TouchableOpacity
+                                        onPress={() => this.scanNfc()}
+                                    >
+                                        <NFC
+                                            stroke={themeColor('text')}
+                                            width={30}
+                                            height={30}
+                                        />
+                                    </TouchableOpacity>
+                                </View>
+                            )}
+                            <View>
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        navigation.navigate(
+                                            'HandleAnythingQRScanner'
+                                        )
+                                    }
+                                >
+                                    <Scan
+                                        fill={themeColor('text')}
+                                        width={30}
+                                        height={30}
+                                    />
+                                </TouchableOpacity>
+                            </View>
+                        </View>
+                    }
+                    navigation={navigation}
+                />
+                <ScrollView
+                    contentContainerStyle={styles.content}
+                    keyboardShouldPersistTaps="handled"
+                >
+                    {!!error_msg && !!destination && (
+                        <View style={{ marginVertical: 10 }}>
+                            <ErrorMessage
+                                message={error_msg}
+                                mainStyle={{ marginVertical: 10 }}
+                            />
+                        </View>
+                    )}
+
+                    {!!destination &&
+                        transactionType === 'On-chain' &&
+                        BackendUtils.supportsOnchainSends() &&
+                        totalBlockchainBalanceAccounts === 0 && (
+                            <View style={{ marginBottom: 10 }}>
+                                <WarningMessage
+                                    message={localeString(
+                                        'views.Send.noOnchainBalance'
+                                    )}
+                                />
+                            </View>
+                        )}
+                    {!!destination &&
+                        (transactionType === 'Lightning' ||
+                            transactionType === 'Keysend' ||
+                            transactionType === 'BOLT 12') &&
+                        lightningBalance === 0 && (
+                            <View style={{ marginBottom: 10 }}>
+                                <WarningMessage
+                                    message={localeString(
+                                        'views.Send.noLightningBalance'
+                                    )}
+                                />
+                            </View>
+                        )}
+                    {transactionType ? (
+                        <>
+                            <Text
+                                style={{
+                                    ...styles.text,
+                                    color: themeColor('secondaryText')
+                                }}
+                            >
+                                {localeString('general.destination')}
+                            </Text>
+                            <TextInput
+                                value={destination}
+                                locked={true}
+                                multiline={true}
+                                textInputStyle={{
+                                    fontSize: 100,
+                                    marginTop: 10,
+                                    marginBottom: 10
+                                }}
+                            />
+                        </>
+                    ) : (
+                        <>
+                            <Text
+                                style={{
+                                    ...styles.text,
+                                    color: themeColor('secondaryText')
+                                }}
+                            >
+                                {paymentOptions.join(', ')}
+                            </Text>
+                            <View
+                                style={{
+                                    flexDirection: 'row',
+                                    alignItems: 'center'
+                                }}
+                            >
+                                <TextInput
+                                    placeholder={'lnbc1...'}
+                                    value={contactName ? '' : destination}
+                                    onChangeText={(text: string) => {
+                                        this.setState({
+                                            destination: text.replace(/\s/, ''),
+                                            error_msg: ''
+                                        });
+                                    }}
+                                    style={{
+                                        flex: 1,
+                                        paddingHorizontal: 15,
+                                        paddingRight: 40
+                                    }}
+                                    autoCorrect={false}
+                                    autoCapitalize="none"
+                                />
+                                {contactName && (
+                                    <View
+                                        style={{
+                                            flexDirection: 'row',
+                                            alignItems: 'center',
+                                            position: 'absolute',
+                                            left: 10,
+                                            top: 22
+                                        }}
+                                    >
+                                        <Chip
+                                            title={contactName}
+                                            titleStyle={{
+                                                ...styles.text,
+                                                color: themeColor('background'),
+                                                backgroundColor:
+                                                    themeColor('chain')
+                                            }}
+                                            // @ts-ignore:next-line
+                                            type="inline"
+                                            containerStyle={{
+                                                backgroundColor:
+                                                    themeColor('chain'),
+                                                borderRadius: 8,
+                                                paddingRight: 24
+                                            }}
+                                        />
+                                        <TouchableOpacity
+                                            onPress={() => {
+                                                this.setState({
+                                                    contactName: '',
+                                                    destination: '',
+                                                    transactionType: ''
+                                                });
+                                                navigation.setParams({
+                                                    contactName: '',
+                                                    destination: '',
+                                                    transactionType: ''
+                                                });
+                                            }}
+                                            style={{
+                                                position: 'absolute',
+                                                right: 8,
+                                                top: 8
+                                            }}
+                                        >
+                                            <Icon
+                                                name="close-circle"
+                                                type="material-design"
+                                                size={18}
+                                                color={themeColor('background')}
+                                            />
+                                        </TouchableOpacity>
+                                    </View>
+                                )}
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        navigation.navigate('Contacts', {
+                                            SendScreen: true
+                                        })
+                                    }
+                                    style={{ position: 'absolute', right: 10 }}
+                                >
+                                    <ContactIcon fill={themeColor('text')} />
+                                </TouchableOpacity>
+                            </View>
+                        </>
+                    )}
+
+                    {!isValid && !!destination && error_msg && (
+                        <Text
+                            style={{
+                                ...styles.text,
+                                color: themeColor('text'),
+                                paddingBottom: 5
+                            }}
+                        >
+                            {localeString('views.Send.mustBeValid')}{' '}
+                            {paymentOptions.join(', ')}
+                        </Text>
+                    )}
+                    {transactionType && (
+                        <Text
+                            style={{
+                                ...styles.text,
+                                color: themeColor('text'),
+                                marginBottom: 10,
+                                paddingBottom: 5
+                            }}
+                        >{`${transactionType} Transaction`}</Text>
+                    )}
+                    {transactionType === 'On-chain' &&
+                        !BackendUtils.supportsOnchainSends() && (
+                            <Text
+                                style={{
+                                    ...styles.text,
+                                    color: themeColor('secondaryText')
+                                }}
+                            >
+                                {localeString('views.Send.onChainNotSupported')}{' '}
+                                {implementation}
+                            </Text>
+                        )}
+                    {transactionType === 'On-chain' &&
+                        BackendUtils.supportsOnchainSends() && (
+                            <React.Fragment>
+                                <AmountInput
+                                    amount={
+                                        fundMax
+                                            ? utxoBalance > 0
+                                                ? utxoBalance.toString()
+                                                : confirmedBlockchainBalance.toString()
+                                            : amount
+                                    }
+                                    title={localeString('general.amount')}
+                                    onAmountChange={(
+                                        amount: string,
+                                        satAmount: string | number
+                                    ) => {
+                                        this.setState({
+                                            amount,
+                                            satAmount
+                                        });
+                                    }}
+                                    hideConversion={amount === 'all'}
+                                    locked={fundMax}
+                                    forceUnit={
+                                        fundMax || fiatError
+                                            ? 'sats'
+                                            : undefined
+                                    }
+                                    hideUnitChangeButton={!!fiatError}
+                                    fiatError={fiatError}
+                                />
+
+                                {BackendUtils.supportsCoinControl() && (
+                                    <View style={{ marginBottom: 20 }}>
+                                        <UTXOPicker
+                                            onValueChange={this.selectUTXOs}
+                                            UTXOsStore={UTXOsStore}
+                                        />
+                                    </View>
+                                )}
+
+                                {BackendUtils.supportsOnchainSendMax() &&
+                                    additionalOutputs.length === 0 &&
+                                    account === 'default' && (
+                                        <View
+                                            style={{
+                                                flexDirection: 'row',
+                                                alignItems: 'center',
+                                                justifyContent: 'space-between',
+                                                marginBottom: 18
+                                            }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    flex: 1,
+                                                    marginRight: 12,
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    utxos.length > 0
+                                                        ? 'views.Send.fundMaxUtxos'
+                                                        : 'views.OpenChannel.fundMax'
+                                                )}
+                                            </Text>
+                                            <Switch
+                                                value={fundMax}
+                                                onValueChange={() => {
+                                                    const newValue: boolean =
+                                                        !fundMax;
+                                                    if (newValue) {
+                                                        // keep the entered amount, also an
+                                                        // empty one, to put it back when
+                                                        // send max is turned off
+                                                        this.previousAmount =
+                                                            amount;
+                                                        this.previousSatAmount =
+                                                            satAmount;
+                                                        this.setState({
+                                                            fundMax: newValue,
+                                                            amount:
+                                                                implementation ===
+                                                                'cln-rest'
+                                                                    ? 'all'
+                                                                    : '',
+                                                            satAmount:
+                                                                utxoBalance > 0
+                                                                    ? utxoBalance
+                                                                    : confirmedBlockchainBalance
+                                                        });
+                                                    } else {
+                                                        this.setState({
+                                                            fundMax: newValue,
+                                                            amount:
+                                                                this
+                                                                    .previousAmount ||
+                                                                '',
+                                                            satAmount:
+                                                                this
+                                                                    .previousSatAmount ||
+                                                                '0'
+                                                        });
+                                                    }
+                                                }}
+                                            />
+                                        </View>
+                                    )}
+
+                                {additionalOutputs.map((output, index) => {
+                                    return (
+                                        <View key={`additionalOutput-${index}`}>
+                                            <Text
+                                                style={{
+                                                    ...styles.text,
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'general.destination'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                value={output?.address}
+                                                multiline={true}
+                                                textInputStyle={{
+                                                    fontSize: 100,
+                                                    marginTop: 10,
+                                                    marginBottom: 10
+                                                }}
+                                                onChangeText={(
+                                                    text: string
+                                                ) => {
+                                                    let newOutputs =
+                                                        additionalOutputs;
+
+                                                    newOutputs[index].address =
+                                                        text;
+
+                                                    this.setState({
+                                                        additionalOutputs:
+                                                            newOutputs
+                                                    });
+                                                }}
+                                            />
+                                            <AmountInput
+                                                amount={output?.amount.toString()}
+                                                title={localeString(
+                                                    'general.amount'
+                                                )}
+                                                onAmountChange={(
+                                                    amount: string,
+                                                    satAmount: string | number
+                                                ) => {
+                                                    let newOutputs =
+                                                        additionalOutputs;
+
+                                                    newOutputs[index].amount =
+                                                        amount;
+                                                    newOutputs[
+                                                        index
+                                                    ].satAmount = satAmount;
+
+                                                    this.setState({
+                                                        additionalOutputs:
+                                                            newOutputs
+                                                    });
+                                                }}
+                                                forceUnit={
+                                                    fiatError
+                                                        ? 'sats'
+                                                        : undefined
+                                                }
+                                                hideUnitChangeButton={
+                                                    !!fiatError
+                                                }
+                                                fiatError={fiatError}
+                                            />
+                                            <View
+                                                style={{
+                                                    marginTop: 10,
+                                                    marginBottom: 20
+                                                }}
+                                            >
+                                                <Button
+                                                    title={localeString(
+                                                        'views.Send.removeOutput'
+                                                    )}
+                                                    icon={{
+                                                        name: 'remove',
+                                                        size: 25,
+                                                        color: themeColor(
+                                                            'background'
+                                                        )
+                                                    }}
+                                                    onPress={() => {
+                                                        let newOutputs =
+                                                            additionalOutputs;
+
+                                                        newOutputs =
+                                                            newOutputs.filter(
+                                                                (item) =>
+                                                                    item !==
+                                                                    output
+                                                            );
+
+                                                        this.setState({
+                                                            additionalOutputs:
+                                                                newOutputs
+                                                        });
+                                                    }}
+                                                    tertiary
+                                                />
+                                            </View>
+                                        </View>
+                                    );
+                                })}
+
+                                {transactionType === 'On-chain' &&
+                                    BackendUtils.supportsOnchainBatching() &&
+                                    !fundMax && (
+                                        <View
+                                            style={{
+                                                marginTop: 0,
+                                                marginBottom: 20
+                                            }}
+                                        >
+                                            <Button
+                                                title={localeString(
+                                                    'views.Send.addOutput'
+                                                )}
+                                                icon={{
+                                                    name: 'add',
+                                                    size: 25,
+                                                    color: themeColor(
+                                                        'background'
+                                                    )
+                                                }}
+                                                onPress={() => {
+                                                    const additionalOutputs =
+                                                        this.state
+                                                            .additionalOutputs;
+
+                                                    additionalOutputs.push({
+                                                        address: '',
+                                                        amount: '',
+                                                        satAmount: ''
+                                                    });
+
+                                                    this.setState({
+                                                        additionalOutputs
+                                                    });
+                                                }}
+                                            />
+                                        </View>
+                                    )}
+
+                                {supportsOnchainSendFeeRate ? (
+                                    <>
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.Send.feeSatsVbyte'
+                                            )}
+                                        </Text>
+
+                                        <OnchainFeeInput
+                                            fee={fee}
+                                            onChangeFee={(text: string) =>
+                                                this.setState({ fee: text })
+                                            }
+                                            navigation={navigation}
+                                        />
+                                    </>
+                                ) : (
+                                    <Text
+                                        style={{
+                                            ...styles.text,
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Send.feeRateSetAutomatically'
+                                        )}
+                                    </Text>
+                                )}
+
+                                <View
+                                    style={{
+                                        ...styles.button,
+                                        paddingBottom: 130
+                                    }}
+                                >
+                                    <Button
+                                        title={localeString('general.proceed')}
+                                        icon={{
+                                            name: 'send',
+                                            size: 25,
+                                            color:
+                                                totalBlockchainBalanceAccounts ===
+                                                    0 ||
+                                                isInvalidFee ||
+                                                isFractionalOnchainAmount ||
+                                                this.hasInvalidAdditionalOutputs() ||
+                                                (fundMax &&
+                                                    (!satAmount ||
+                                                        Number(satAmount) <=
+                                                            0)) ||
+                                                (!fundMax &&
+                                                    (!satAmount ||
+                                                        Number(satAmount) <=
+                                                            0 ||
+                                                        !amount ||
+                                                        amount === '0'))
+                                                    ? themeColor(
+                                                          'secondaryText'
+                                                      )
+                                                    : themeColor('background')
+                                        }}
+                                        onPress={() =>
+                                            navigation.navigate(
+                                                'VerifyOnChain',
+                                                {
+                                                    destination,
+                                                    fee,
+                                                    satAmount,
+                                                    amount,
+                                                    utxos,
+                                                    account,
+                                                    additionalOutputs:
+                                                        this.getValidAdditionalOutputs(),
+                                                    fundMax
+                                                }
+                                            )
+                                        }
+                                        disabled={
+                                            totalBlockchainBalanceAccounts ===
+                                                0 ||
+                                            isInvalidFee ||
+                                            isFractionalOnchainAmount ||
+                                            this.hasInvalidAdditionalOutputs() ||
+                                            (fundMax &&
+                                                (!satAmount ||
+                                                    Number(satAmount) <= 0)) ||
+                                            (!fundMax &&
+                                                (!satAmount ||
+                                                    Number(satAmount) <= 0 ||
+                                                    !amount ||
+                                                    amount === '0'))
+                                        }
+                                    />
+                                </View>
+                            </React.Fragment>
+                        )}
+                    {transactionType === 'BOLT 12' &&
+                        NodeInfoStore.supportsOffers && (
+                            <React.Fragment>
+                                <AmountInput
+                                    amount={amount}
+                                    title={localeString('general.amount')}
+                                    onAmountChange={(
+                                        amount: string,
+                                        satAmount: string | number
+                                    ) => {
+                                        this.setState({
+                                            amount,
+                                            satAmount
+                                        });
+                                    }}
+                                    forceUnit={fiatError ? 'sats' : undefined}
+                                    hideUnitChangeButton={!!fiatError}
+                                    fiatError={fiatError}
+                                />
+                                {/* Only shown where the fee limit applies to
+                                    this screen's offer call (ldk-node pays
+                                    inside it). On CLN only the invoice is
+                                    fetched here - fetchInvoiceFromOffer
+                                    discards the value - and the fee limit is
+                                    set on PaymentRequest, where the payment
+                                    actually happens */}
+                                {BackendUtils.supportsOffersDirectPay() && (
+                                    <FeeLimit
+                                        satAmount={satAmount}
+                                        onFeeLimitSatChange={(value: string) =>
+                                            this.setState({
+                                                feeLimitSat: value
+                                            })
+                                        }
+                                        onMaxFeePercentChange={(
+                                            value: string
+                                        ) =>
+                                            this.setState({
+                                                maxFeePercent: value
+                                            })
+                                        }
+                                        SettingsStore={SettingsStore}
+                                    />
+                                )}
+                                <Text
+                                    style={{
+                                        ...styles.label,
+                                        color: themeColor('text')
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.Payments.timeoutSeconds'
+                                    )}
+                                </Text>
+                                <TextInput
+                                    keyboardType="numeric"
+                                    value={timeoutSeconds}
+                                    onChangeText={(text: string) =>
+                                        this.setState({
+                                            timeoutSeconds: text
+                                        })
+                                    }
+                                />
+                            </React.Fragment>
+                        )}
+                    {transactionType === 'BOLT 12' &&
+                        !NodeInfoStore.supportsOffers && (
+                            <Text
+                                style={{
+                                    ...styles.text,
+                                    marginTop: 10,
+                                    color: themeColor('error')
+                                }}
+                            >
+                                {localeString(
+                                    'views.Send.payBolt12.offersNotSupported'
+                                )}
+                            </Text>
+                        )}
+                    {transactionType === 'Keysend' &&
+                        BackendUtils.supportsKeysend() && (
+                            <React.Fragment>
+                                <AmountInput
+                                    amount={amount}
+                                    title={localeString('general.amount')}
+                                    onAmountChange={(
+                                        amount: string,
+                                        satAmount: string | number
+                                    ) => {
+                                        this.setState({
+                                            amount,
+                                            satAmount
+                                        });
+                                    }}
+                                    forceUnit={fiatError ? 'sats' : undefined}
+                                    hideUnitChangeButton={!!fiatError}
+                                    fiatError={fiatError}
+                                />
+
+                                {implementation !== 'cln-rest' && (
+                                    <>
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                marginTop: 10,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {`${localeString(
+                                                'views.Send.message'
+                                            )} (${localeString(
+                                                'general.optional'
+                                            )})`}
+                                        </Text>
+                                        <TextInput
+                                            keyboardType="default"
+                                            value={message}
+                                            onChangeText={(text: string) =>
+                                                this.setState({
+                                                    message: text
+                                                })
+                                            }
+                                        />
+                                    </>
+                                )}
+
+                                <FeeLimit
+                                    satAmount={satAmount}
+                                    onFeeLimitSatChange={(value: string) =>
+                                        this.setState({
+                                            feeLimitSat: value
+                                        })
+                                    }
+                                    onMaxFeePercentChange={(value: string) =>
+                                        this.setState({
+                                            maxFeePercent: value
+                                        })
+                                    }
+                                    onFeeOptionChange={(value: string) =>
+                                        this.setState({
+                                            feeOption: value
+                                        })
+                                    }
+                                    SettingsStore={SettingsStore}
+                                />
+
+                                {BackendUtils.supportsAMP() && (
+                                    <React.Fragment>
+                                        <Text
+                                            style={{
+                                                ...styles.label,
+                                                color: themeColor('text'),
+                                                top: 25
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.PaymentRequest.amp'
+                                            )}
+                                        </Text>
+                                        <View
+                                            style={{
+                                                flex: 1,
+                                                flexDirection: 'row',
+                                                justifyContent: 'flex-end'
+                                            }}
+                                        >
+                                            <View
+                                                style={{
+                                                    flex: 1,
+                                                    flexDirection: 'row',
+                                                    justifyContent: 'flex-end'
+                                                }}
+                                            >
+                                                <Switch
+                                                    value={
+                                                        enableAtomicMultiPathPayment
+                                                    }
+                                                    onValueChange={() =>
+                                                        this.setState({
+                                                            enableAtomicMultiPathPayment:
+                                                                !enableAtomicMultiPathPayment
+                                                        })
+                                                    }
+                                                />
+                                            </View>
+                                        </View>
+                                    </React.Fragment>
+                                )}
+                                {BackendUtils.supportsAMP() &&
+                                    enableAtomicMultiPathPayment && (
+                                        <React.Fragment>
+                                            <Text
+                                                style={{
+                                                    ...styles.text,
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {`${localeString(
+                                                    'views.PaymentRequest.maxParts'
+                                                )} (${localeString(
+                                                    'general.optional'
+                                                )})`}
+                                            </Text>
+                                            <TextInput
+                                                keyboardType="numeric"
+                                                value={maxParts}
+                                                onChangeText={(text: string) =>
+                                                    this.setState({
+                                                        maxParts: text
+                                                    })
+                                                }
+                                            />
+                                            <Text
+                                                style={{
+                                                    ...styles.text,
+                                                    color: themeColor('text'),
+                                                    paddingBottom: 15
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.PaymentRequest.maxPartsDescription'
+                                                )}
+                                            </Text>
+                                            <Text
+                                                style={{
+                                                    ...styles.text,
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {`${localeString(
+                                                    'views.PaymentRequest.maxShardAmt'
+                                                )} (${localeString(
+                                                    'general.sats'
+                                                )}) (${localeString(
+                                                    'general.optional'
+                                                )})`}
+                                            </Text>
+                                            <TextInput
+                                                keyboardType="numeric"
+                                                value={maxShardAmt}
+                                                onChangeText={(text: string) =>
+                                                    this.setState({
+                                                        maxShardAmt: text
+                                                    })
+                                                }
+                                            />
+                                        </React.Fragment>
+                                    )}
+                                <View style={styles.button}>
+                                    <PaymentInFlightNotice
+                                        TransactionsStore={TransactionsStore}
+                                    />
+                                    {Number(satAmount) >=
+                                    slideToPayThreshold ? (
+                                        <SwipeButton
+                                            key={this.state.swipeButtonKey}
+                                            onSwipeSuccess={() =>
+                                                this.sendKeySendPayment(
+                                                    satAmount
+                                                )
+                                            }
+                                            disabled={isSendDisabled}
+                                            instructionText={localeString(
+                                                'views.PaymentRequest.slideToPay'
+                                            )}
+                                            containerStyle={{
+                                                backgroundColor:
+                                                    themeColor('secondaryText')
+                                            }}
+                                            swipeButtonStyle={{
+                                                backgroundColor:
+                                                    themeColor('text')
+                                            }}
+                                        />
+                                    ) : (
+                                        <Button
+                                            title={localeString('general.send')}
+                                            icon={{
+                                                name: 'send',
+                                                size: 25,
+                                                color: isSendDisabled
+                                                    ? themeColor(
+                                                          'secondaryText'
+                                                      )
+                                                    : themeColor('background')
+                                            }}
+                                            onPress={() =>
+                                                this.sendKeySendPayment(
+                                                    satAmount
+                                                )
+                                            }
+                                            disabled={isSendDisabled}
+                                        />
+                                    )}
+                                </View>
+                            </React.Fragment>
+                        )}
+                    {transactionType === 'Keysend' &&
+                        !BackendUtils.supportsKeysend() && (
+                            <React.Fragment>
+                                <Text
+                                    style={{
+                                        ...styles.text,
+                                        color: themeColor('secondaryText')
+                                    }}
+                                >
+                                    {localeString('views.Send.sorry')},{' '}
+                                    {implementation}{' '}
+                                    {localeString(
+                                        'views.Send.keysendNotSupported'
+                                    )}
+                                </Text>
+                            </React.Fragment>
+                        )}
+                    {transactionType === 'Lightning' && (
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString('views.Send.lookup')}
+                                icon={{
+                                    name: 'send',
+                                    size: 25,
+                                    color:
+                                        lightningBalance === 0
+                                            ? themeColor('secondaryText')
+                                            : themeColor('background')
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('PaymentRequest')
+                                }
+                                disabled={lightningBalance === 0}
+                            />
+                        </View>
+                    )}
+                    {destination && transactionType === 'BOLT 12' && (
+                        <View style={styles.button}>
+                            <PaymentInFlightNotice
+                                TransactionsStore={TransactionsStore}
+                            />
+                            <Button
+                                title={localeString('general.proceed')}
+                                onPress={async () => await this.payBolt12()}
+                                // loading: block a second tap while the
+                                // offer is decoded or the invoice fetched.
+                                // paymentInFlight: match every other send
+                                // button
+                                disabled={
+                                    !NodeInfoStore.supportsOffers ||
+                                    loading ||
+                                    TransactionsStore.paymentInFlight
+                                }
+                            />
+                        </View>
+                    )}
+
+                    {(!!clipboard ||
+                        !SettingsStore.settings.privacy?.clipboard) &&
+                        !destination && (
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString('general.paste')}
+                                    onPress={async () => {
+                                        if (clipboard) {
+                                            this.validateAddress(clipboard);
+                                        } else {
+                                            const value =
+                                                await Clipboard.getString();
+                                            if (value)
+                                                this.validateAddress(value);
+                                        }
+                                    }}
+                                    secondary
+                                />
+                            </View>
+                        )}
+
+                    {destination && !transactionType && (
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString('general.proceed')}
+                                onPress={() =>
+                                    this.validateAddress(destination)
+                                }
+                            />
+                        </View>
+                    )}
+
+                    {!transactionType && favoriteContacts.length > 0 && (
+                        <>
+                            <View style={{ marginTop: 18 }}>
+                                <Text
+                                    style={{
+                                        fontSize: 16,
+                                        color: themeColor('secondaryText')
+                                    }}
+                                >
+                                    {`${localeString(
+                                        'views.Settings.Contacts.favorites'
+                                    ).toUpperCase()} (${
+                                        favoriteContacts.length
+                                    })`}
+                                </Text>
+                            </View>
+                            {/* eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794 */}
+                            <View style={{ marginTop: 20, marginLeft: -24 }}>
+                                <FlatList
+                                    data={favoriteContacts}
+                                    renderItem={this.renderContactItem}
+                                    keyExtractor={(_, index) =>
+                                        index.toString()
+                                    }
+                                    scrollEnabled={false}
+                                />
+                            </View>
+                        </>
+                    )}
+                </ScrollView>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    secondaryText: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    content: {
+        padding: 20,
+        paddingTop: 10
+    },
+    button: {
+        alignItems: 'center',
+        paddingTop: 30
+    },
+    feeTableButton: {
+        paddingTop: 15,
+        alignItems: 'center',
+        minHeight: 75
+    },
+    editFeeButton: {
+        paddingTop: 15,
+        alignItems: 'center'
+    },
+    label: {
+        fontFamily: 'PPNeueMontreal-Book',
+        paddingTop: 5
+    }
+});

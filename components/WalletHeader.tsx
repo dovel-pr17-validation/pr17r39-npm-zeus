@@ -1,0 +1,891 @@
+import React from 'react';
+import { Badge } from '@rneui/themed';
+import { initialWindowMetrics } from 'react-native-safe-area-context';
+
+const insets = initialWindowMetrics?.insets ?? {
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0
+};
+import {
+    Animated,
+    AppState,
+    Dimensions,
+    Easing,
+    Image,
+    NativeEventSubscription,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import AlertStore from '../stores/AlertStore';
+import CashuStore from '../stores/CashuStore';
+import ChannelsStore, { ChannelsView } from '../stores/ChannelsStore';
+import ConnectivityStore from '../stores/ConnectivityStore';
+import LightningAddressStore from '../stores/LightningAddressStore';
+import ModalStore from '../stores/ModalStore';
+import SettingsStore, { PosEnabled } from '../stores/SettingsStore';
+import NodeInfoStore from '../stores/NodeInfoStore';
+import PosStore from '../stores/PosStore';
+import SyncStore from '../stores/SyncStore';
+import NostrWalletConnectStore from '../stores/NostrWalletConnectStore';
+
+import Header from './Header';
+import LoadingIndicator from '../components/LoadingIndicator';
+import NodeIdenticon from '../components/NodeIdenticon';
+
+import handleAnything, { isClipboardValue } from '../utils/handleAnything';
+import BackendUtils from '../utils/BackendUtils';
+import { getPhoto } from '../utils/PhotoUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { protectedNavigation } from '../utils/NavigationUtils';
+import PrivacyUtils from '../utils/PrivacyUtils';
+import { themeColor } from '../utils/ThemeUtils';
+
+import Add from '../assets/images/SVG/Add.svg';
+import Alert from '../assets/images/SVG/Alert.svg';
+import CaretUp from '../assets/images/SVG/Caret Up.svg';
+import NWCLogo from '../assets/images/SVG/nwc-logo.svg';
+import ClipboardSVG from '../assets/images/SVG/Clipboard.svg';
+import Ecash from '../assets/images/SVG/Ecash.svg';
+import Menu from '../assets/images/SVG/Menu.svg';
+import Hourglass from '../assets/images/SVG/Hourglass.svg';
+import POS from '../assets/images/SVG/POS.svg';
+import Search from '../assets/images/SVG/Search.svg';
+import Temple from '../assets/images/SVG/Temple.svg';
+import Sync from '../assets/images/SVG/Sync.svg';
+import ZeusPaySVG from '../assets/images/SVG/zeus-pay.svg';
+
+import { Body } from './text/Body';
+import { Row } from '../components/layout/Row';
+import ToggleButton from './ToggleButton';
+
+const TorIcon = require('../assets/images/tor.png');
+
+const ZeusPay = () => (
+    <ZeusPaySVG fill={themeColor('highlight')} width={34.29} height={30} />
+);
+
+const ZeusPayAnimated = () => {
+    const state = React.useRef(new Animated.Value(1)).current;
+    React.useEffect(() => {
+        const anim = Animated.loop(
+            Animated.sequence([
+                Animated.timing(state, {
+                    toValue: 0,
+                    duration: 500,
+                    delay: 1000,
+                    useNativeDriver: true
+                }),
+                Animated.timing(state, {
+                    toValue: 1,
+                    duration: 500,
+                    useNativeDriver: true
+                })
+            ])
+        );
+        anim.start();
+        return () => anim.stop();
+    }, []);
+
+    return (
+        <Animated.View
+            style={{
+                alignSelf: 'center',
+                opacity: state
+            }}
+        >
+            <ZeusPay />
+        </Animated.View>
+    );
+};
+
+const NWCAnimated = () => {
+    const state = React.useRef(new Animated.Value(1)).current;
+    React.useEffect(() => {
+        const anim = Animated.loop(
+            Animated.sequence([
+                Animated.timing(state, {
+                    toValue: 0,
+                    duration: 300,
+                    delay: 500,
+                    useNativeDriver: true
+                }),
+                Animated.timing(state, {
+                    toValue: 1,
+                    duration: 300,
+                    useNativeDriver: true
+                })
+            ])
+        );
+        anim.start();
+        return () => anim.stop();
+    }, []);
+
+    return (
+        <Animated.View
+            style={{
+                alignSelf: 'center',
+                opacity: state
+            }}
+        >
+            <NWCLogo fill={themeColor('highlight')} width={30} height={30} />
+        </Animated.View>
+    );
+};
+
+const ActivityButton = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+}) => (
+    <TouchableOpacity
+        onPress={() =>
+            navigation.navigate('Activity', { animation: 'slide_from_bottom' })
+        }
+    >
+        <CaretUp
+            fill={themeColor('text')}
+            width={45}
+            style={{ marginRight: 15, alignSelf: 'center' }}
+        />
+    </TouchableOpacity>
+);
+
+const TempleButton = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+}) => (
+    <TouchableOpacity
+        onPress={() => protectedNavigation(navigation, 'Wallet', true)}
+    >
+        <Temple
+            fill={themeColor('text')}
+            width={30}
+            height={35}
+            style={{ alignSelf: 'center' }}
+        />
+    </TouchableOpacity>
+);
+
+const MenuBadge = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+}) => (
+    <TouchableOpacity
+        onPress={() =>
+            protectedNavigation(navigation, 'Menu', undefined, {
+                animation: 'fade'
+            })
+        }
+        accessibilityLabel={localeString('views.Settings.title')}
+        style={{ marginLeft: 4 }}
+    >
+        <Menu fill={themeColor('text')} width={38} height={38} />
+    </TouchableOpacity>
+);
+
+const ClipboardBadge = ({
+    navigation,
+    clipboard
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+    clipboard: string;
+}) => (
+    <TouchableOpacity
+        onPress={async () => {
+            const response = await handleAnything(clipboard);
+            const [route, props] = response;
+            navigation.navigate(route, props);
+        }}
+    >
+        <ClipboardSVG fill={themeColor('text')} width="24" height="30" />
+    </TouchableOpacity>
+);
+
+const PendingHtlcBadge = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+    clipboard: string;
+}) => (
+    <TouchableOpacity
+        onPress={() =>
+            navigation.navigate('PendingHTLCs', {
+                animation: 'slide_from_bottom'
+            })
+        }
+    >
+        <Hourglass fill={themeColor('highlight')} width="30" height="30" />
+    </TouchableOpacity>
+);
+
+const UnredeemedTokensBadge = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+    clipboard: string;
+}) => (
+    <TouchableOpacity
+        onPress={() =>
+            navigation.navigate('UnspentTokens', {
+                animation: 'slide_from_bottom'
+            })
+        }
+    >
+        <Ecash fill={themeColor('text')} width="30" height="30" />
+    </TouchableOpacity>
+);
+
+const POSBadge = ({
+    setPosStatus,
+    getOrders,
+    disabled
+}: {
+    setPosStatus: (status: string) => void;
+    getOrders: () => void;
+    disabled?: boolean;
+}) => (
+    <TouchableOpacity
+        disabled={disabled}
+        onPress={async () => {
+            getOrders();
+            setPosStatus('active');
+        }}
+    >
+        <POS stroke={themeColor('text')} width="30" height="35" />
+    </TouchableOpacity>
+);
+
+const SyncBadge = ({
+    navigation
+}: {
+    navigation: NativeStackNavigationProp<any, any>;
+}) => {
+    const spinAnim = React.useRef(new Animated.Value(0)).current;
+
+    const interpolateRotation = spinAnim.interpolate({
+        inputRange: [0, 1],
+        outputRange: ['0deg', '360deg']
+    });
+
+    React.useEffect(() => {
+        const anim = Animated.loop(
+            Animated.timing(spinAnim, {
+                toValue: 1,
+                duration: 3000,
+                easing: Easing.linear,
+                useNativeDriver: true
+            })
+        );
+        anim.start();
+        return () => anim.stop();
+    }, []);
+
+    return (
+        <Animated.View style={{ transform: [{ rotate: interpolateRotation }] }}>
+            <TouchableOpacity onPress={() => navigation.navigate('Sync')}>
+                <Sync fill={themeColor('text')} width="35" height="25.66" />
+            </TouchableOpacity>
+        </Animated.View>
+    );
+};
+
+// Network badge text, or undefined on mainnet. testnet4 nodes also have
+// isTestNet set, so check it first
+export const networkBadgeLabel = (nodeInfo: {
+    isMutinynet?: boolean;
+    isTestNet?: boolean;
+    isTestNet4?: boolean;
+    isRegTest?: boolean;
+    isSigNet?: boolean;
+}): string | undefined => {
+    if (nodeInfo.isMutinynet) return localeString('network.mutinynet');
+    if (nodeInfo.isTestNet4) return localeString('network.testnet4');
+    if (nodeInfo.isTestNet)
+        return localeString('views.Wallet.MainPane.testnet');
+    if (nodeInfo.isRegTest) return localeString('views.Wallet.MainPane.regnet');
+    if (nodeInfo.isSigNet) return localeString('views.Wallet.MainPane.signet');
+    return undefined;
+};
+
+interface WalletHeaderProps {
+    AlertStore?: AlertStore;
+    CashuStore?: CashuStore;
+    ChannelsStore?: ChannelsStore;
+    ConnectivityStore?: ConnectivityStore;
+    SettingsStore?: SettingsStore;
+    ModalStore?: ModalStore;
+    NodeInfoStore?: NodeInfoStore;
+    LightningAddressStore?: LightningAddressStore;
+    PosStore?: PosStore;
+    SyncStore?: SyncStore;
+    NostrWalletConnectStore?: NostrWalletConnectStore;
+    navigation: NativeStackNavigationProp<any, any>;
+    connecting?: boolean;
+    loading?: boolean;
+    title?: string;
+    channels?: boolean;
+    peers?: boolean;
+}
+
+interface WalletHeaderState {
+    clipboard: string;
+}
+
+@inject(
+    'AlertStore',
+    'CashuStore',
+    'ChannelsStore',
+    'ConnectivityStore',
+    'LightningAddressStore',
+    'ModalStore',
+    'SettingsStore',
+    'NodeInfoStore',
+    'PosStore',
+    'SyncStore',
+    'NostrWalletConnectStore'
+)
+@observer
+export default class WalletHeader extends React.Component<
+    WalletHeaderProps,
+    WalletHeaderState
+> {
+    state: WalletHeaderState = {
+        clipboard: ''
+    };
+
+    focusListener: any = null;
+    appStateListener: NativeEventSubscription | null = null;
+
+    componentDidMount() {
+        this.readClipboard();
+
+        this.focusListener = this.props.navigation.addListener(
+            'focus',
+            this.readClipboard
+        );
+
+        this.appStateListener = AppState.addEventListener(
+            'change',
+            (nextAppState) => {
+                if (nextAppState === 'active') {
+                    this.readClipboard();
+                }
+            }
+        );
+    }
+
+    componentWillUnmount(): void {
+        if (this.focusListener) {
+            this.focusListener();
+        }
+        this.appStateListener?.remove();
+    }
+
+    readClipboard = async () => {
+        const { SettingsStore, connecting } = this.props;
+        const { settings, settingsLoaded } = SettingsStore!;
+        let clipboard = '';
+
+        // Until the stored settings load, settings holds the in-memory
+        // defaults (clipboard: true), and reading then would ignore a user's
+        // opt-out. If loading fails the wallet still opens with the
+        // defaults, so this checks settingsLoaded rather than connecting.
+        // The badge is hidden while connecting, so skip the read there too;
+        // the header that replaces this one reads on mount.
+        if (!connecting && settingsLoaded && settings.privacy?.clipboard) {
+            const value = await Clipboard.getString();
+            if (value && (await isClipboardValue(value))) {
+                clipboard = value;
+            }
+        }
+
+        this.setState({ clipboard });
+    };
+
+    render() {
+        const { clipboard } = this.state;
+        const {
+            navigation,
+            connecting,
+            loading,
+            title,
+            channels,
+            AlertStore,
+            CashuStore,
+            ConnectivityStore,
+            SettingsStore,
+            NodeInfoStore,
+            ChannelsStore,
+            LightningAddressStore,
+            ModalStore,
+            PosStore,
+            SyncStore,
+            NostrWalletConnectStore
+        } = this.props;
+
+        // On a cold start this header is drawn before the stored PIN and
+        // POS mode have been acted on, so its controls take no touches until
+        // then. They are still drawn: returning a bare header here instead
+        // made the first render light enough that, on Android release
+        // builds, Fabric dropped a screen from the root stack and the
+        // Lockscreen's pop after login crashed in react-native-screens.
+        const sessionStarted = SettingsStore!.sessionStarted();
+
+        const { sentTokens } = CashuStore!!;
+        const { pendingHTLCs } = ChannelsStore!;
+        const {
+            settings,
+            posStatus,
+            setPosStatus,
+            implementation,
+            isChannelMigrating
+        } = SettingsStore!;
+        const { loading: nwcloading } = NostrWalletConnectStore!;
+        const { paid, redeemingAll } = LightningAddressStore!;
+        const { isSyncing } = SyncStore!;
+        const { getOrders } = PosStore!;
+        const isOffline = ConnectivityStore?.isOffline ?? false;
+        const selectedNode: any =
+            (settings &&
+                settings.nodes?.length &&
+                settings.nodes[settings.selectedNode || 0]) ||
+            null;
+
+        const unredeemedTokens = sentTokens
+            ? sentTokens.filter((token: any) => !token.spent)
+            : [];
+
+        const posEnabled: PosEnabled =
+            (settings && settings.pos && settings.pos.posEnabled) ||
+            PosEnabled.Disabled;
+
+        const NodeButton = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    protectedNavigation(navigation, 'Wallets', undefined, {
+                        animation: 'slide_from_right'
+                    })
+                }
+                accessibilityLabel={localeString('views.Settings.title')}
+            >
+                {selectedNode && selectedNode.photo ? (
+                    <Image
+                        source={{
+                            uri: getPhoto(selectedNode.photo)
+                        }}
+                        style={styles.photo}
+                    />
+                ) : (
+                    <NodeIdenticon
+                        selectedNode={selectedNode}
+                        width={38}
+                        rounded
+                    />
+                )}
+            </TouchableOpacity>
+        );
+
+        const displayName = selectedNode && selectedNode.nickname;
+        const nodeAddress = SettingsStore!.host || SettingsStore!.url;
+
+        const infoValue = networkBadgeLabel(NodeInfoStore!.nodeInfo);
+
+        const { fontScale } = Dimensions.get('window');
+
+        const NetworkBadge = () => {
+            return infoValue ? (
+                <Badge
+                    pressableProps={{ disabled: !sessionStarted }}
+                    onPress={() => navigation.navigate('NodeInfo')}
+                    value={infoValue}
+                    badgeStyle={{
+                        ...styles.badgeStyle,
+                        backgroundColor: 'gray',
+                        minHeight: 18 * fontScale,
+                        borderRadius: 9 * fontScale
+                    }}
+                    textStyle={styles.badgeTextStyle}
+                />
+            ) : null;
+        };
+
+        const CustodialBadge = () => {
+            return implementation === 'lndhub' &&
+                !selectedNode.dismissCustodialWarning ? (
+                <Badge
+                    pressableProps={{ disabled: !sessionStarted }}
+                    onPress={() =>
+                        navigation.navigate('CustodialWalletWarning')
+                    }
+                    value={`⚠ ${localeString('general.custodialWallet')}`}
+                    badgeStyle={{
+                        ...styles.badgeStyle,
+                        backgroundColor: themeColor('error'),
+                        minHeight: 18 * fontScale,
+                        borderRadius: 9 * fontScale
+                    }}
+                    textStyle={styles.badgeTextStyle}
+                />
+            ) : null;
+        };
+
+        const TorBadge = () => (
+            <>
+                {nodeAddress && nodeAddress.includes('.onion') ? (
+                    <TouchableOpacity
+                        disabled={!sessionStarted}
+                        onPress={() => navigation.navigate('NodeInfo')}
+                    >
+                        <Image
+                            style={{
+                                marginLeft: 5,
+                                marginRight: 5,
+                                width: 25,
+                                height: 25
+                            }}
+                            source={TorIcon}
+                            accessibilityLabel={localeString(
+                                'general.torEnabled'
+                            )}
+                        />
+                    </TouchableOpacity>
+                ) : null}
+            </>
+        );
+
+        const ReadOnlyBadge = () => {
+            return !BackendUtils.supportsLightningSends() ? (
+                <Badge
+                    value={localeString('general.readOnlyWallet')}
+                    badgeStyle={{
+                        ...styles.badgeStyle,
+                        backgroundColor: themeColor('error'),
+                        minHeight: 18 * fontScale,
+                        borderRadius: 9 * fontScale
+                    }}
+                    textStyle={styles.badgeTextStyle}
+                />
+            ) : null;
+        };
+
+        const OfflineBadge = () => {
+            return isOffline ? (
+                <TouchableOpacity
+                    disabled={!sessionStarted}
+                    onPress={() => navigation.navigate('Networking')}
+                >
+                    <Badge
+                        value={localeString('general.offline')}
+                        badgeStyle={{
+                            ...styles.badgeStyle,
+                            backgroundColor: themeColor('error'),
+                            minHeight: 18 * fontScale,
+                            borderRadius: 9 * fontScale
+                        }}
+                        textStyle={styles.badgeTextStyle}
+                    />
+                </TouchableOpacity>
+            ) : null;
+        };
+
+        const StatusBadges = () => (
+            <>
+                <CustodialBadge />
+                <NetworkBadge />
+                <ReadOnlyBadge />
+                <OfflineBadge />
+                <TorBadge />
+            </>
+        );
+
+        const AlertButton = () => (
+            <TouchableOpacity
+                onPress={() => ModalStore?.toggleAlertModal(true)}
+                accessibilityLabel={localeString('general.search')}
+            >
+                <Alert
+                    fill={themeColor('error')}
+                    width="31"
+                    height="31"
+                    style={{ alignSelf: 'center', marginRight: 15 }}
+                />
+            </TouchableOpacity>
+        );
+
+        const SearchButton = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    ChannelsStore!.toggleSearch(
+                        ChannelsStore?.channelsView || ChannelsView.Channels
+                    )
+                }
+                accessibilityLabel={localeString('general.search')}
+            >
+                <Search
+                    fill={themeColor('text')}
+                    width="30"
+                    height="30"
+                    style={{ alignSelf: 'center', marginRight: 15 }}
+                />
+            </TouchableOpacity>
+        );
+
+        const OpenChannelButton = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    ChannelsStore?.channelsView === ChannelsView.Channels
+                        ? ModalStore?.toggleNewChannelModal()
+                        : navigation.navigate('OpenChannel')
+                }
+                accessibilityLabel={localeString('views.Wallet.Channels.open')}
+            >
+                <Add
+                    fill={themeColor('text')}
+                    width="30"
+                    height="30"
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        return (
+            <View
+                // keeps the header's views in this View when the session
+                // starts, instead of Fabric flattening them into the parent
+                collapsable={false}
+                pointerEvents={sessionStarted ? 'auto' : 'none'}
+                // pointerEvents only stops touches: a screen reader's
+                // activation calls onPress without a hit test, and so does
+                // a hardware keyboard. Only the controls drawn while
+                // connecting are also disabled before the session starts;
+                // the rest render only once connected, which happens before
+                // the session starts only under the Lockscreen. A startup
+                // path that connects before pushing the Lockscreen must
+                // disable them too.
+                accessibilityElementsHidden={!sessionStarted}
+                importantForAccessibility={
+                    sessionStarted ? 'auto' : 'no-hide-descendants'
+                }
+                testID="wallet-header"
+            >
+                <Header
+                    containerStyle={{ marginTop: insets.top }}
+                    leftComponent={
+                        <Row style={{ flex: 1 }}>
+                            <MenuBadge navigation={navigation} />
+                            {!isChannelMigrating &&
+                                !connecting &&
+                                BackendUtils.supportsLightningAddress() &&
+                                paid &&
+                                paid.length > 0 && (
+                                    <TouchableOpacity
+                                        onPress={() =>
+                                            navigation.navigate(
+                                                'LightningAddress',
+                                                { skipStatus: true }
+                                            )
+                                        }
+                                        style={{ marginLeft: 20 }}
+                                    >
+                                        {redeemingAll ? (
+                                            <ZeusPayAnimated />
+                                        ) : (
+                                            <ZeusPay />
+                                        )}
+                                    </TouchableOpacity>
+                                )}
+                        </Row>
+                    }
+                    centerComponent={
+                        title ? (
+                            <View
+                                style={{
+                                    flex: 1,
+                                    alignItems: 'center',
+                                    justifyContent: 'center'
+                                }}
+                            >
+                                <Body>{title}</Body>
+                            </View>
+                        ) : settings.display &&
+                          settings.display.displayNickname ? (
+                            <View style={{ top: 0 }}>
+                                <Row>
+                                    <Text
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            fontSize: 16
+                                        }}
+                                        disabled={!sessionStarted}
+                                        onPress={() => {
+                                            navigation.navigate('Wallets');
+                                        }}
+                                    >
+                                        {PrivacyUtils.sensitiveValue({
+                                            input: displayName
+                                        })?.toString()}
+                                    </Text>
+                                    <StatusBadges />
+                                </Row>
+                            </View>
+                        ) : (
+                            <Row style={{ alignItems: 'center', flexGrow: 1 }}>
+                                {!connecting && <StatusBadges />}
+                            </Row>
+                        )
+                    }
+                    rightComponent={
+                        isChannelMigrating ? (
+                            <View>
+                                <NodeButton />
+                            </View>
+                        ) : posStatus === 'active' ? (
+                            <Row>
+                                {!connecting && (
+                                    <>
+                                        <ActivityButton
+                                            navigation={navigation}
+                                        />
+                                        <TempleButton navigation={navigation} />
+                                    </>
+                                )}
+                            </Row>
+                        ) : channels ? (
+                            <Row style={{ marginTop: 1 }}>
+                                <SearchButton />
+                                <OpenChannelButton />
+                            </Row>
+                        ) : (
+                            <View
+                                style={{
+                                    flexDirection: 'row',
+                                    alignItems: 'center'
+                                }}
+                            >
+                                {!connecting && loading && (
+                                    <View style={{ paddingRight: 15 }}>
+                                        <LoadingIndicator size={31} />
+                                    </View>
+                                )}
+                                {!connecting && nwcloading && (
+                                    <View style={{ paddingRight: 15 }}>
+                                        <NWCAnimated />
+                                    </View>
+                                )}
+
+                                {!connecting && !!clipboard && (
+                                    <View style={{ marginRight: 15 }}>
+                                        <ClipboardBadge
+                                            navigation={navigation}
+                                            clipboard={clipboard}
+                                        />
+                                    </View>
+                                )}
+                                {!connecting && unredeemedTokens?.length > 0 && (
+                                    <View style={{ marginRight: 15 }}>
+                                        <UnredeemedTokensBadge
+                                            navigation={navigation}
+                                            clipboard={clipboard}
+                                        />
+                                    </View>
+                                )}
+                                {!connecting && pendingHTLCs?.length > 0 && (
+                                    <View style={{ marginRight: 15 }}>
+                                        <PendingHtlcBadge
+                                            navigation={navigation}
+                                            clipboard={clipboard}
+                                        />
+                                    </View>
+                                )}
+                                {!connecting && isSyncing && !isOffline && (
+                                    <View style={{ marginRight: 15 }}>
+                                        <SyncBadge navigation={navigation} />
+                                    </View>
+                                )}
+                                {!connecting && AlertStore?.hasError && (
+                                    <AlertButton />
+                                )}
+                                {posEnabled === PosEnabled.Disabled ? (
+                                    <View>
+                                        <NodeButton />
+                                    </View>
+                                ) : (
+                                    <View style={{ marginLeft: 15 }}>
+                                        <POSBadge
+                                            setPosStatus={setPosStatus}
+                                            getOrders={getOrders}
+                                            disabled={!sessionStarted}
+                                        />
+                                    </View>
+                                )}
+                            </View>
+                        )
+                    }
+                />
+
+                {this.props.peers && !isChannelMigrating && (
+                    <View style={{ paddingTop: 10 }}>
+                        <ToggleButton
+                            options={[
+                                {
+                                    key: 'channels',
+                                    label: `${localeString(
+                                        'views.Wallet.Wallet.channels'
+                                    )} (${
+                                        ChannelsStore?.filteredChannels
+                                            ?.length || 0
+                                    })`
+                                },
+                                {
+                                    key: 'peers',
+                                    label: `${localeString('general.peers')} (${
+                                        ChannelsStore?.filteredPeers?.length ||
+                                        0
+                                    })`
+                                }
+                            ]}
+                            value={
+                                this.props.ChannelsStore?.channelsView ||
+                                'channels'
+                            }
+                            onToggle={(view: string) => {
+                                this.props.ChannelsStore?.setChannelsView(
+                                    view as ChannelsView
+                                );
+                            }}
+                        />
+                    </View>
+                )}
+            </View>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    badgeStyle: {
+        borderWidth: 0,
+        marginHorizontal: 8,
+        height: undefined
+    },
+    badgeTextStyle: {
+        fontWeight: 'normal',
+        textAlign: 'center'
+    },
+    photo: {
+        alignSelf: 'center',
+        width: 38,
+        height: 38,
+        borderRadius: 68
+    }
+});

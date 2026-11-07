@@ -1,0 +1,519 @@
+import * as React from 'react';
+import { Platform, ScrollView, Text, View } from 'react-native';
+import { Icon, ListItem } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Header from '../../../components/Header';
+import Screen from '../../../components/Screen';
+import Switch from '../../../components/Switch';
+
+import SettingsStore from '../../../stores/SettingsStore';
+
+import { localeString } from '../../../utils/LocaleUtils';
+import { themeColor } from '../../../utils/ThemeUtils';
+
+import LdkNode from '../../../ldknode/LdkNodeInjection';
+
+const PERSISTENT_LDK_KEY = 'persistentLdkNodeServicesEnabled';
+
+interface EmbeddedNodeProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+}
+
+interface EmbeddedNodeState {
+    persistentMode: boolean;
+}
+
+@inject('SettingsStore')
+@observer
+export default class EmbeddedNode extends React.Component<
+    EmbeddedNodeProps,
+    EmbeddedNodeState
+> {
+    state = {
+        persistentMode: false
+    };
+
+    async componentDidMount() {
+        const stored = await AsyncStorage.getItem(PERSISTENT_LDK_KEY);
+        if (stored === 'true') {
+            this.setState({ persistentMode: true });
+        }
+    }
+
+    render() {
+        const { navigation, SettingsStore } = this.props;
+        const { embeddedLndNetwork, implementation, settings }: any =
+            SettingsStore;
+        const { automaticDisasterRecoveryBackup, expressGraphSync } = settings;
+
+        const isEmbeddedLnd = implementation === 'embedded-lnd';
+        const isLdkNode = implementation === 'ldk-node';
+
+        return (
+            <Screen>
+                <View style={{ flex: 1 }}>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString(
+                                'views.Settings.EmbeddedNode.title'
+                            ),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        navigation={navigation}
+                    />
+                    <ScrollView>
+                        {/* LDK Node: Esplora Server */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('EsploraServer')
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.EsploraServer.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* LDK Node: VSS Server */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() => navigation.navigate('VssServer')}
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.VssServer.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* LDK Node: RGS Settings */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('RapidGossipSync')
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.RapidGossipSync.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* LDK Node: Pathfinding Scorer */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('PathfindingScorer')
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.PathfindingScorer.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LND: Disaster Recovery */}
+                        {isEmbeddedLnd && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('DisasterRecovery')
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.DisasterRecovery.title'
+                                        )}
+                                    </ListItem.Title>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('secondaryText'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.DisasterRecovery.automaticBackups'
+                                        )}
+                                        :{' '}
+                                        {automaticDisasterRecoveryBackup
+                                            ? localeString('general.enabled')
+                                            : localeString('general.disabled')}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LND: Express Graph Sync (Mainnet only) */}
+                        {isEmbeddedLnd && embeddedLndNetwork === 'Mainnet' && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate('ExpressGraphSync')
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.ExpressGraphSync.title'
+                                        )}
+                                    </ListItem.Title>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('secondaryText'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {expressGraphSync
+                                            ? localeString('general.enabled')
+                                            : localeString('general.disabled')}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LND: Peers */}
+                        {isEmbeddedLnd && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() => navigation.navigate('Peers')}
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'general.peers'
+                                        )[0].toUpperCase() +
+                                            localeString('general.peers').slice(
+                                                1
+                                            )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LND: LND Logs */}
+                        {isEmbeddedLnd && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() => navigation.navigate('LNDLogs')}
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.LNDLogs.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LDK: LDK Logs */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() => navigation.navigate('LDKLogs')}
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.LDKLogs.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Embedded LND: Advanced */}
+                        {isEmbeddedLnd && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate(
+                                        'EmbeddedNodeSettingsAdvanced'
+                                    )
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString('general.advanced')}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Channel tools (LDK Node) */}
+                        {isLdkNode && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() => navigation.navigate('Chantools')}
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.Chantools.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+
+                        {/* Persistent Mode (LDK Node, Android only) */}
+                        {isLdkNode && Platform.OS === 'android' && (
+                            <>
+                                <ListItem
+                                    containerStyle={{
+                                        borderBottomWidth: 0,
+                                        backgroundColor: 'transparent'
+                                    }}
+                                >
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.persistentModeLdk'
+                                        )}
+                                    </ListItem.Title>
+                                    <View
+                                        style={{
+                                            flex: 1,
+                                            flexDirection: 'row',
+                                            justifyContent: 'flex-end'
+                                        }}
+                                    >
+                                        <Switch
+                                            value={this.state.persistentMode}
+                                            onValueChange={async () => {
+                                                const previousValue =
+                                                    this.state.persistentMode;
+                                                const newValue = !previousValue;
+                                                this.setState({
+                                                    persistentMode: newValue
+                                                });
+                                                await AsyncStorage.setItem(
+                                                    PERSISTENT_LDK_KEY,
+                                                    newValue.toString()
+                                                );
+                                                try {
+                                                    await LdkNode.node.setPersistentMode(
+                                                        newValue
+                                                    );
+                                                } catch (e) {
+                                                    console.error(
+                                                        'Failed to toggle LDK persistent mode:',
+                                                        e
+                                                    );
+                                                    this.setState({
+                                                        persistentMode:
+                                                            previousValue
+                                                    });
+                                                    await AsyncStorage.setItem(
+                                                        PERSISTENT_LDK_KEY,
+                                                        previousValue.toString()
+                                                    );
+                                                }
+                                            }}
+                                        />
+                                    </View>
+                                </ListItem>
+                                <View style={{ margin: 10 }}>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.persistentModeLdk.subtitle'
+                                        )}
+                                    </Text>
+                                </View>
+                            </>
+                        )}
+
+                        {/* Troubleshooting */}
+                        {(isEmbeddedLnd || isLdkNode) && (
+                            <ListItem
+                                containerStyle={{
+                                    backgroundColor: 'transparent'
+                                }}
+                                onPress={() =>
+                                    navigation.navigate(
+                                        'EmbeddedNodeTroubleshooting'
+                                    )
+                                }
+                            >
+                                <ListItem.Content>
+                                    <ListItem.Title
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontFamily: 'PPNeueMontreal-Book'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.EmbeddedNode.Troubleshooting.title'
+                                        )}
+                                    </ListItem.Title>
+                                </ListItem.Content>
+                                <Icon
+                                    name="keyboard-arrow-right"
+                                    color={themeColor('secondaryText')}
+                                />
+                            </ListItem>
+                        )}
+                    </ScrollView>
+                </View>
+            </Screen>
+        );
+    }
+}

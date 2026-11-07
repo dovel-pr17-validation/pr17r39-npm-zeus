@@ -1,0 +1,109 @@
+# Config
+android/local.properties
+
+# OSX
+#
+.DS_Store
+__MACOSX/
+
+# Xcode
+#
+build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
+*.xcuserstate
+ios/.xcode.env.local
+
+# Android/IntelliJ
+#
+build/
+.idea
+.gradle
+.gradle-cache/
+local.properties
+*.iml
+android/app/.cxx/
+
+# Visual Studio Code
+#
+.vscode/
+
+# node.js
+#
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+
+# BUCK
+buck-out/
+\.buckd/
+*.keystore
+!debug.keystore
+
+# fastlane
+#
+# It is recommended to not store the screenshots in the git repo. Instead, use fastlane to re-generate the
+# screenshots whenever they are needed.
+# For more information about the recommended setup visit:
+# https://docs.fastlane.tools/best-practices/source-control/
+
+*/fastlane/report.xml
+*/fastlane/Preview.html
+*/fastlane/screenshots
+
+# Bundle artifact
+*.jsbundle
+
+# jest
+.jest/
+coverage/
+
+# CocoaPods
+ios/Pods
+**.swp
+
+# Bundler: the Gemfile is a convenience path for installing CocoaPods, the
+# resolved set is not something we pin (see the Gemfile and ios/Podfile)
+Gemfile.lock
+
+# Lnd binaries
+android/lndmobile/Lndmobile.aar
+ios/LncMobile/Lndmobile.xcframework
+ios/LndMobileLibZipFile
+
+# Cashu CDK binaries
+android/cdk/cashudevkit.aar
+android/cdk/cdk-jvm.jar
+ios/Cdk/CashuDevKitFFI.xcframework
+ios/CashuDevKitLibZipFile
+ios/CashuDevKit/CashuDevKit.swift
+
+# Zeus Cashu Restore binaries and generated bindings
+android/zeus-restore/zeus-cashu-restore.aar
+android/app/src/main/java/uniffi/zeus_cashu_restore/
+ios/ZeusRestore/zeusRestoreFFI.xcframework
+ios/ZeusRestoreLibZipFile
+ios/CashuDevKit/zeus_cashu_restore.swift
+
+# LDK Node binaries
+android/ldk-node/ldk-node-android-jniLibs.zip
+android/app/src/main/jniLibs/
+ios/LdkNodeMobile/LDKNodeFFI.xcframework
+ios/LdkNodeLibZipFile
+ios/LdkNodeMobile/__MACOSX/
+# Claude Code: share skills, keep everything else local
+.claude/*
+!.claude/skills/

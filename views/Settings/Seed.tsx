@@ -1,0 +1,848 @@
+import React, { useState } from 'react';
+import {
+    Alert,
+    AppState,
+    Modal,
+    NativeEventSubscription,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View
+} from 'react-native';
+import { errorCodes, isErrorWithCode } from '@react-native-documents/picker';
+import { Icon } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { Route } from '@react-navigation/native';
+
+import { Row } from '../../components/layout/Row';
+import { ErrorMessage } from '../../components/SuccessErrorMessage';
+
+import Button from '../../components/Button';
+import CopyButton from '../../components/CopyButton';
+import Screen from '../../components/Screen';
+import Header from '../../components/Header';
+import ModalBox from '../../components/ModalBox';
+import ChannelBackupLoadingModal from '../../components/Modals/ChannelBackupLoadingModal';
+
+import SettingsStore from '../../stores/SettingsStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import SyncStore from '../../stores/SyncStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+
+import {
+    SWAPS_KEY,
+    REVERSE_SWAPS_KEY,
+    SWAPS_LAST_USED_KEY,
+    SWAPS_RESCUE_KEY,
+    purgeLegacyRescueKeyFiles,
+    saveRescueKeyFile,
+    unlinkRescueKeyStagingFile
+} from '../../utils/SwapUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { IS_BACKED_UP_KEY } from '../../utils/MigrationUtils';
+import {
+    graphDataExists,
+    handleExportChannels
+} from '../../utils/ChannelMigrationUtils';
+
+import Storage from '../../storage';
+
+import Skull from '../../assets/images/SVG/Skull.svg';
+import QR from '../../assets/images/SVG/QR.svg';
+
+interface SeedProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+    NodeInfoStore: NodeInfoStore;
+    SyncStore: SyncStore;
+    ChannelsStore: ChannelsStore;
+    route: Route<
+        'Seed',
+        {
+            // Swap rescue-key flow only. Presence also drives rescue-key UI.
+            seedPhrase?: string[];
+            // Seed for the wallet being viewed (may differ from the active node).
+            walletSeedPhrase?: string[];
+            // Implementation of the wallet being viewed (QR export, etc.).
+            implementation?: string;
+            // Network of the wallet being viewed (inactive wallets only).
+            isTestNet?: boolean;
+            skipWarning?: boolean;
+        }
+    >;
+}
+
+interface SeedState {
+    understood: boolean;
+    showModal: boolean;
+    isDeleteModalVisible: boolean;
+    isChannelExporting: boolean;
+    channelExportMessage: string;
+    revealResetKey: number;
+    graphDataOnDisk: boolean;
+}
+
+const MnemonicWord = ({ index, word }: { index: any; word: any }) => {
+    const [isRevealed, setRevealed] = useState(false);
+    return (
+        <TouchableOpacity
+            key={index}
+            onPress={() => setRevealed(!isRevealed)}
+            style={{
+                padding: 8,
+                backgroundColor: themeColor('secondary'),
+                borderRadius: 5,
+                margin: 6,
+                marginTop: 4,
+                marginBottom: 4,
+                flexDirection: 'row',
+                alignSelf: 'center'
+            }}
+        >
+            <View style={{ width: 35 }}>
+                <Text
+                    style={{
+                        flex: 1,
+                        fontFamily: 'PPNeueMontreal-Book',
+                        color: themeColor('secondaryText'),
+                        fontSize: 18,
+                        alignSelf: 'flex-start'
+                    }}
+                >
+                    {index + 1}
+                </Text>
+            </View>
+            <Text
+                style={{
+                    flex: 1,
+                    fontFamily: 'PPNeueMontreal-Medium',
+                    color: themeColor('text'),
+                    fontSize: 18,
+                    alignSelf: 'flex-end',
+                    margin: 0,
+                    marginLeft: 10,
+                    padding: 0
+                }}
+            >
+                {isRevealed ? word : '********'}
+            </Text>
+        </TouchableOpacity>
+    );
+};
+
+@inject('SettingsStore', 'NodeInfoStore', 'SyncStore', 'ChannelsStore')
+@observer
+export default class Seed extends React.PureComponent<SeedProps, SeedState> {
+    state = {
+        understood: this.props.route.params?.skipWarning ?? false,
+        showModal: false,
+        isDeleteModalVisible: false,
+        isChannelExporting: false,
+        channelExportMessage: '',
+        revealResetKey: 0,
+        graphDataOnDisk: false
+    };
+
+    private appStateSubscription: NativeEventSubscription | undefined;
+
+    componentDidMount() {
+        // make sure we have latest settings and the seed phrase is accessible
+        this.props.SettingsStore.getSettings();
+
+        // The background lock pushes Lockscreen over this view without
+        // unmounting it, so revealed words must not survive backgrounding
+        this.appStateSubscription = AppState.addEventListener(
+            'change',
+            this.handleAppStateChange
+        );
+
+        this.checkGraphDataOnDisk();
+    }
+
+    componentWillUnmount() {
+        this.appStateSubscription?.remove();
+    }
+
+    handleAppStateChange = (nextAppState: string) => {
+        if (nextAppState === 'background') {
+            this.setState((prevState) => ({
+                understood: this.props.route.params?.skipWarning ?? false,
+                showModal: false,
+                revealResetKey: prevState.revealResetKey + 1
+            }));
+        }
+    };
+
+    // Fallback for offering channel export when the node isn't running
+    // and channels can't be queried
+    checkGraphDataOnDisk = async () => {
+        const { SettingsStore } = this.props;
+        if (SettingsStore.implementation !== 'embedded-lnd') return;
+
+        const graphDataOnDisk = await graphDataExists(
+            SettingsStore.lndDir || 'lnd',
+            SettingsStore.embeddedLndNetwork === 'Testnet'
+        );
+        this.setState({ graphDataOnDisk });
+    };
+
+    renderDeleteModal = () => {
+        const { navigation } = this.props;
+        return (
+            <ModalBox
+                isOpen={this.state.isDeleteModalVisible}
+                onClosed={() => this.setState({ isDeleteModalVisible: false })}
+                style={{
+                    backgroundColor: 'transparent'
+                }}
+                position="center"
+                backdropOpacity={0.6}
+            >
+                <View
+                    style={{
+                        flex: 1,
+                        justifyContent: 'center',
+                        alignItems: 'center'
+                    }}
+                >
+                    <View
+                        style={{
+                            backgroundColor: themeColor('background'),
+                            borderRadius: 20,
+                            padding: 20,
+                            alignItems: 'center',
+                            width: '90%'
+                        }}
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                fontSize: 18,
+                                textAlign: 'center',
+                                marginBottom: 20
+                            }}
+                        >
+                            {localeString(
+                                'views.Swaps.rescueKey.deleteConfirmation'
+                            )}
+                        </Text>
+
+                        <Button
+                            title={localeString('general.confirm')}
+                            onPress={async () => {
+                                await Storage.removeItem(SWAPS_RESCUE_KEY);
+                                await Storage.removeItem(SWAPS_KEY);
+                                await Storage.removeItem(REVERSE_SWAPS_KEY);
+                                await Storage.removeItem(SWAPS_LAST_USED_KEY);
+                                await purgeLegacyRescueKeyFiles();
+                                await unlinkRescueKeyStagingFile();
+                                this.setState({ isDeleteModalVisible: false });
+                                navigation.popTo('Swaps');
+                            }}
+                            containerStyle={{ marginBottom: 10 }}
+                            warning
+                        />
+                        <Button
+                            title={localeString('general.cancel')}
+                            onPress={() =>
+                                this.setState({ isDeleteModalVisible: false })
+                            }
+                            secondary
+                        />
+                    </View>
+                </View>
+            </ModalBox>
+        );
+    };
+
+    handleExportChannels = () => {
+        const { SettingsStore, NodeInfoStore, SyncStore } = this.props;
+        const { isSyncing } = SyncStore;
+
+        if (isSyncing) {
+            Alert.alert(
+                localeString('general.error'),
+                localeString('views.Tools.migration.export.syncInProgress')
+            );
+            return;
+        }
+
+        handleExportChannels({
+            // Configs saved before v0.12.3 have no isSqlite and run on
+            // Bolt (see writeLndConfig)
+            isSqlite: SettingsStore.isSqlite ?? false,
+            lndDir: SettingsStore.lndDir || 'lnd',
+            // nodeInfo is empty when the node isn't running, so read the
+            // network from the persisted wallet config instead
+            isTestnet: SettingsStore.embeddedLndNetwork === 'Testnet',
+            pubkey: NodeInfoStore.nodeInfo.identity_pubkey,
+            seedPhrase: (SettingsStore.seedPhrase || []).join(' '),
+            canUploadToOlympus: !!NodeInfoStore.nodeInfo.identity_pubkey,
+            setStatus: (msg: string | null) =>
+                this.setState({
+                    isChannelExporting: msg !== null,
+                    channelExportMessage: msg ?? ''
+                })
+        });
+    };
+
+    render() {
+        const {
+            navigation,
+            SettingsStore,
+            NodeInfoStore,
+            ChannelsStore,
+            route
+        } = this.props;
+        const {
+            understood,
+            showModal,
+            isChannelExporting,
+            channelExportMessage,
+            revealResetKey
+        } = this.state;
+        // Prefer an explicit seed for the wallet being viewed. SettingsStore
+        // only mirrors the active node, so inactive wallets must pass
+        // walletSeedPhrase from WalletConfiguration.
+        //
+        // walletSeedPhrase is only set for inactive wallets — when present,
+        // do not offer active-node channel export (wrong lndDir / channels).
+        const isViewingInactiveWalletSeed =
+            !!route.params?.walletSeedPhrase?.length;
+        let seedPhrase: string[] | undefined;
+        if (route.params?.seedPhrase) {
+            seedPhrase = route.params.seedPhrase;
+        } else if (isViewingInactiveWalletSeed) {
+            seedPhrase = route.params!.walletSeedPhrase;
+        } else if (SettingsStore.implementation === 'ldk-node') {
+            // LDK Node stores mnemonic as a string, convert to array
+            seedPhrase = SettingsStore.ldkMnemonic?.split(' ');
+        } else {
+            seedPhrase = SettingsStore.seedPhrase;
+        }
+        const isRefundRescueKey = !!route.params?.seedPhrase;
+        const seedImplementation =
+            route.params?.implementation || SettingsStore.implementation;
+        const isTwelveWords = seedPhrase?.length === 12;
+        const hasChannels =
+            ChannelsStore.channels.length > 0 ||
+            ChannelsStore.pendingChannels.length > 0 ||
+            ChannelsStore.closedChannels.length > 0;
+
+        // If the node is up, trust its channel list; if it won't start,
+        // fall back to graph data found on disk so migration remains
+        // reachable before disaster recovery
+        const nodeConnected = !!NodeInfoStore.nodeInfo.identity_pubkey;
+        const canExportChannels = nodeConnected
+            ? hasChannels
+            : this.state.graphDataOnDisk;
+
+        const DangerouslyCopySeed = () => (
+            <TouchableOpacity
+                onPress={() => this.setState({ showModal: true })}
+                style={{ marginLeft: 10 }}
+            >
+                <Skull fill={themeColor('text')} />
+            </TouchableOpacity>
+        );
+
+        const QRExport = () => (
+            <TouchableOpacity
+                onPress={() =>
+                    navigation.navigate(
+                        'SeedQRExport',
+                        // Only override when viewing an inactive wallet's seed.
+                        // Active-wallet path keeps the existing pubkey cache.
+                        isViewingInactiveWalletSeed
+                            ? {
+                                  seedPhrase,
+                                  isTestNet: route.params?.isTestNet
+                              }
+                            : undefined
+                    )
+                }
+                style={{ marginLeft: isRefundRescueKey ? 20 : 14 }}
+            >
+                <QR fill={themeColor('text')} />
+            </TouchableOpacity>
+        );
+
+        const SaveRescueKey = ({ seedPhrase }: { seedPhrase: string[] }) => {
+            // Stage the rescue file in app-private cache and hand it to the
+            // system save dialog so the user explicitly picks the
+            // destination. Never write it to shared storage directly: files
+            // dropped in Downloads/Documents are readable by other tooling
+            // and outlive the app.
+            const saveRescueKey = async () => {
+                try {
+                    await saveRescueKeyFile(seedPhrase.join(' '));
+                    Alert.alert(
+                        localeString('general.success'),
+                        localeString('views.Swaps.rescueKey.saveSuccess')
+                    );
+                } catch (error) {
+                    if (
+                        isErrorWithCode(error) &&
+                        error.code === errorCodes.OPERATION_CANCELED
+                    ) {
+                        return;
+                    }
+                    console.error('Rescue key save failed:', error);
+                    Alert.alert(
+                        localeString('general.error'),
+                        localeString('views.Swaps.rescueKey.saveError')
+                    );
+                }
+            };
+
+            const handleSave = () => {
+                Alert.alert(
+                    localeString('general.warning'),
+                    localeString('views.Swaps.rescueKey.saveWarning'),
+                    [
+                        {
+                            text: localeString('general.cancel'),
+                            style: 'cancel'
+                        },
+                        {
+                            text: localeString('general.proceed'),
+                            onPress: () => saveRescueKey()
+                        }
+                    ]
+                );
+            };
+
+            return (
+                <TouchableOpacity onPress={handleSave}>
+                    <Icon
+                        name="save"
+                        type="feather"
+                        color={themeColor('text')}
+                        underlayColor="transparent"
+                        size={26}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        return (
+            <Screen>
+                {this.renderDeleteModal()}
+                <ChannelBackupLoadingModal
+                    isOpen={isChannelExporting}
+                    message={channelExportMessage}
+                />
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: isRefundRescueKey
+                            ? localeString('views.Swaps.rescueKey')
+                            : localeString('views.Settings.Seed.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        understood && seedPhrase ? (
+                            <Row>
+                                {isRefundRescueKey ? (
+                                    <SaveRescueKey seedPhrase={seedPhrase} />
+                                ) : (
+                                    <></>
+                                )}
+                                <DangerouslyCopySeed />
+                                {isRefundRescueKey ||
+                                seedImplementation === 'ldk-node' ? (
+                                    <></>
+                                ) : (
+                                    <QRExport />
+                                )}
+                            </Row>
+                        ) : undefined
+                    }
+                    navigation={navigation}
+                />
+                <Modal
+                    animationType="slide"
+                    transparent={true}
+                    visible={showModal}
+                >
+                    <View style={styles.centeredView}>
+                        <View style={styles.modal}>
+                            {showModal && (
+                                <View>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            fontSize: 40,
+                                            alignSelf: 'center',
+                                            marginBottom: 20
+                                        }}
+                                    >
+                                        {localeString('general.danger')}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            color: 'black',
+                                            margin: 10
+                                        }}
+                                    >
+                                        {(() => {
+                                            const text = isRefundRescueKey
+                                                ? localeString(
+                                                      'views.Swaps.rescueKey.dangerousText'
+                                                  )
+                                                : localeString(
+                                                      'views.Settings.Seed.dangerousText1'
+                                                  );
+                                            // Show correct word count based on seed length
+                                            if (isTwelveWords) {
+                                                return text.replace('24', '12');
+                                            }
+                                            return text;
+                                        })()}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            color: 'black',
+                                            margin: 10
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.Seed.dangerousText2'
+                                        )}
+                                    </Text>
+                                    <View style={styles.button}>
+                                        <CopyButton
+                                            title={localeString(
+                                                'views.Settings.Seed.dangerousButton'
+                                            )}
+                                            copyValue={
+                                                seedPhrase?.join(' ') || ''
+                                            }
+                                            icon={{
+                                                name: 'warning',
+                                                size: 25
+                                            }}
+                                        />
+                                    </View>
+                                    <View style={styles.button}>
+                                        <Button
+                                            title={localeString(
+                                                'general.cancel'
+                                            )}
+                                            onPress={() =>
+                                                this.setState({
+                                                    showModal: false
+                                                })
+                                            }
+                                        />
+                                    </View>
+                                </View>
+                            )}
+                        </View>
+                    </View>
+                </Modal>
+                {!understood && (
+                    <>
+                        <View style={{ marginLeft: 10, marginRight: 10 }}>
+                            <ErrorMessage
+                                message={localeString(
+                                    'general.warning'
+                                ).toUpperCase()}
+                            />
+                        </View>
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                textAlign: 'center',
+                                margin: 10,
+                                fontSize: 20
+                            }}
+                        >
+                            {(() => {
+                                const text = localeString(
+                                    isRefundRescueKey
+                                        ? 'views.Swaps.rescueKey.text1'
+                                        : 'views.Settings.Seed.text1'
+                                );
+                                // Show correct word count based on seed length
+                                if (isTwelveWords) {
+                                    return text.replace('24', '12');
+                                }
+                                return text;
+                            })()}
+                        </Text>
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                textAlign: 'center',
+                                margin: 10,
+                                fontSize: 20
+                            }}
+                        >
+                            {localeString(
+                                isRefundRescueKey
+                                    ? 'views.Swaps.rescueKey.text2'
+                                    : 'views.Settings.Seed.text2'
+                            )}
+                        </Text>
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                textAlign: 'center',
+                                margin: 10,
+                                fontSize: 20
+                            }}
+                        >
+                            {localeString('views.Settings.Seed.text3').replace(
+                                'Zeus',
+                                'ZEUS'
+                            )}
+                        </Text>
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                textAlign: 'center',
+                                margin: 10,
+                                fontSize: 20
+                            }}
+                        >
+                            {localeString('views.Settings.Seed.text4')}
+                        </Text>
+                        <View
+                            style={{
+                                alignSelf: 'center',
+                                position: 'absolute',
+                                bottom: 35,
+                                width: '100%'
+                            }}
+                        >
+                            <Button
+                                onPress={() =>
+                                    this.setState({ understood: true })
+                                }
+                                title={localeString('general.iUnderstand')}
+                            />
+                        </View>
+                    </>
+                )}
+                {understood && (
+                    <View style={{ flex: 1, justifyContent: 'center' }}>
+                        <ScrollView
+                            contentContainerStyle={{
+                                flexGrow: 1,
+                                flexDirection: 'row'
+                            }}
+                        >
+                            <View style={styles.column}>
+                                {seedPhrase &&
+                                    seedPhrase
+                                        .slice(
+                                            0,
+                                            Math.ceil(seedPhrase.length / 2)
+                                        )
+                                        .map((word: string, index: number) => (
+                                            <MnemonicWord
+                                                index={index}
+                                                word={word}
+                                                key={`mnemonic-${revealResetKey}-${index}`}
+                                            />
+                                        ))}
+                            </View>
+                            <View style={styles.column}>
+                                {seedPhrase &&
+                                    seedPhrase
+                                        .slice(Math.ceil(seedPhrase.length / 2))
+                                        .map((word: string, index: number) => (
+                                            <MnemonicWord
+                                                index={
+                                                    index +
+                                                    Math.ceil(
+                                                        seedPhrase.length / 2
+                                                    )
+                                                }
+                                                word={word}
+                                                key={`mnemonic-${revealResetKey}-${
+                                                    index +
+                                                    Math.ceil(
+                                                        seedPhrase.length / 2
+                                                    )
+                                                }`}
+                                            />
+                                        ))}
+                            </View>
+                        </ScrollView>
+                        <View
+                            style={{
+                                alignSelf: 'center',
+                                marginTop: 45,
+                                bottom: 35,
+                                backgroundColor: themeColor('background'),
+                                width: '100%'
+                            }}
+                        >
+                            <Button
+                                onPress={async () => {
+                                    if (isRefundRescueKey) {
+                                        navigation.goBack();
+                                    } else if (isViewingInactiveWalletSeed) {
+                                        // Inactive-wallet backup must not touch
+                                        // the global flag or jump to the active
+                                        // wallet's home screen.
+                                        navigation.goBack();
+                                    } else if (
+                                        SettingsStore.implementation ===
+                                            'embedded-lnd' &&
+                                        canExportChannels
+                                    ) {
+                                        Alert.alert(
+                                            localeString(
+                                                'views.Settings.Seed.channelBackupReminder.title'
+                                            ),
+                                            localeString(
+                                                'views.Settings.Seed.channelBackupReminder.message'
+                                            ),
+                                            [
+                                                {
+                                                    text: localeString(
+                                                        'views.Settings.WalletConfiguration.deleteWallet.exportChannels'
+                                                    ),
+                                                    onPress: () => {
+                                                        this.handleExportChannels();
+                                                    }
+                                                },
+                                                {
+                                                    text: localeString(
+                                                        'views.Settings.Seed.channelBackupReminder.later'
+                                                    ),
+                                                    style: 'cancel',
+                                                    onPress: async () => {
+                                                        await Storage.setItem(
+                                                            IS_BACKED_UP_KEY,
+                                                            true
+                                                        );
+                                                        navigation.popTo(
+                                                            'Wallet'
+                                                        );
+                                                    }
+                                                }
+                                            ]
+                                        );
+                                    } else {
+                                        await Storage.setItem(
+                                            IS_BACKED_UP_KEY,
+                                            true
+                                        );
+                                        navigation.popTo('Wallet');
+                                    }
+                                }}
+                                title={(() => {
+                                    const text = isRefundRescueKey
+                                        ? localeString(
+                                              'views.Swaps.rescueKey.backupComplete'
+                                          )
+                                        : localeString(
+                                              'views.Settings.Seed.backupComplete'
+                                          );
+                                    // Show correct word count based on seed length
+                                    if (isTwelveWords) {
+                                        return text.replace('24', '12');
+                                    }
+                                    return text;
+                                })()}
+                                containerStyle={{ marginBottom: 10 }}
+                            />
+                            {!isRefundRescueKey &&
+                                !isViewingInactiveWalletSeed &&
+                                canExportChannels &&
+                                SettingsStore.implementation ==
+                                    'embedded-lnd' && (
+                                    <Button
+                                        onPress={this.handleExportChannels}
+                                        title={localeString(
+                                            'views.Tools.migration.export'
+                                        )}
+                                        secondary
+                                        containerStyle={{ marginBottom: 15 }}
+                                    />
+                                )}
+                            {isRefundRescueKey && (
+                                <Button
+                                    onPress={() =>
+                                        this.setState({
+                                            isDeleteModalVisible: true
+                                        })
+                                    }
+                                    title={localeString(
+                                        'views.Swaps.rescueKey.delete'
+                                    )}
+                                    warning
+                                />
+                            )}
+                        </View>
+                    </View>
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    whiteText: {
+        color: 'white',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    blackText: {
+        color: 'black',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    button: {
+        paddingTop: 10,
+        paddingBottom: 10,
+        width: 350,
+        alignSelf: 'center'
+    },
+    modal: {
+        margin: 20,
+        backgroundColor: 'white',
+        borderRadius: 35,
+        padding: 35,
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: {
+            width: 0,
+            height: 2
+        },
+        shadowOpacity: 0.25,
+        shadowRadius: 3.84,
+        elevation: 5
+    },
+    centeredView: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginTop: 22
+    },
+    column: {
+        marginTop: 8,
+        flexWrap: 'wrap',
+        alignItems: 'flex-start',
+        alignSelf: 'center',
+        flexDirection: 'column',
+        width: '50%'
+    }
+});

@@ -1,0 +1,1400 @@
+import * as React from 'react';
+import { ScrollView, StyleSheet, TouchableOpacity, View } from 'react-native';
+
+import { Button as ElementButton, Divider } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import LinearGradient from '../../components/LinearGradient';
+import { duration } from 'moment';
+
+import Channel from '../../models/Channel';
+import ClosedChannel from '../../models/ClosedChannel';
+import Contact from '../../models/Contact';
+
+import Amount from '../../components/Amount';
+import BalanceSlider from '../../components/BalanceSlider';
+import Button from '../../components/Button';
+import FeeBreakdown from '../../components/FeeBreakdown';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import OnchainFeeInput from '../../components/OnchainFeeInput';
+import { Row } from '../../components/layout/Row';
+import Screen from '../../components/Screen';
+import {
+    ErrorMessage,
+    WarningMessage
+} from '../../components/SuccessErrorMessage';
+import Switch from '../../components/Switch';
+import Text from '../../components/Text';
+import TextInput from '../../components/TextInput';
+import { ContactAvatar } from '../../components/ContactAvatar';
+import { SharedScreen, SharedText } from '../../components/SharedTransition';
+
+import PrivacyUtils from '../../utils/PrivacyUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import {
+    formatLeaseDuration,
+    getLeaseDisplay,
+    getRenewalInfo
+} from '../../utils/LeaseUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+import { numberWithCommas } from '../../utils/UnitsUtils';
+import { getPhoto } from '../../utils/PhotoUtils';
+
+import ChannelsStore from '../../stores/ChannelsStore';
+import ContactStore from '../../stores/ContactStore';
+import LSPStore from '../../stores/LSPStore';
+import ModalStore from '../../stores/ModalStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import SettingsStore from '../../stores/SettingsStore';
+
+import CaretDown from '../../assets/images/SVG/Caret Down.svg';
+import CaretRight from '../../assets/images/SVG/Caret Right.svg';
+import Edit from '../../assets/images/SVG/Edit.svg';
+import HourglassIcon from '../../assets/images/SVG/Hourglass.svg';
+
+interface ChannelProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    ChannelsStore: ChannelsStore;
+    ContactStore: ContactStore;
+    LSPStore: LSPStore;
+    ModalStore: ModalStore;
+    NodeInfoStore: NodeInfoStore;
+    SettingsStore: SettingsStore;
+    route: Route<'Channel', { channel: Channel | ClosedChannel }>;
+}
+
+interface ChannelState {
+    confirmCloseChannel: boolean;
+    satPerByte: string;
+    forceCloseChannel: boolean;
+    deliveryAddress: string;
+    aliasToggle: boolean;
+    channel: Channel;
+}
+
+@inject(
+    'ChannelsStore',
+    'ContactStore',
+    'LSPStore',
+    'ModalStore',
+    'NodeInfoStore',
+    'SettingsStore'
+)
+@observer
+export default class ChannelView extends React.Component<
+    ChannelProps,
+    ChannelState
+> {
+    constructor(props: ChannelProps) {
+        super(props);
+        const { route, ChannelsStore } = props;
+        const channel = route.params?.channel;
+
+        this.state = {
+            confirmCloseChannel: false,
+            satPerByte: '',
+            forceCloseChannel: false,
+            deliveryAddress: '',
+            aliasToggle: false,
+            channel
+        };
+
+        if (BackendUtils.isLNDBased() && channel.channelId != null) {
+            ChannelsStore.loadChannelInfo(channel.channelId);
+        }
+    }
+
+    componentDidMount() {
+        const { channel } = this.state;
+
+        const closeAddress: string | undefined = channel?.close_address;
+
+        if (closeAddress) {
+            this.setState({ deliveryAddress: closeAddress });
+        }
+    }
+
+    findContactByPubkey = (pubkey: string) => {
+        const { ContactStore } = this.props;
+        const { contacts } = ContactStore;
+        return contacts.find((contact: Contact) =>
+            contact.pubkey.includes(pubkey)
+        );
+    };
+
+    renderContactLink = (remotePubkey: string) => {
+        const contact = this.findContactByPubkey(remotePubkey);
+        if (contact) {
+            return (
+                <TouchableOpacity
+                    style={{
+                        ...styles.container,
+                        backgroundColor: themeColor('secondary')
+                    }}
+                    onPress={() => {
+                        this.props.navigation.navigate('ContactDetails', {
+                            contactId: contact.contactId || contact.id,
+                            contactPhoto: getPhoto(contact.photo),
+                            contactName: contact.name,
+                            isNostrContact: false
+                        });
+                    }}
+                >
+                    <ContactAvatar
+                        size="small"
+                        name={contact.name}
+                        contactId={contact.contactId}
+                        imageUrl={getPhoto(contact.photo)}
+                        style={{ marginRight: 10 }}
+                    />
+                    <SharedText
+                        tag={`contact-name-${contact.contactId}`}
+                        style={{
+                            fontSize: 18,
+                            color: themeColor('highlight'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }}
+                    >
+                        {contact.name}
+                    </SharedText>
+                </TouchableOpacity>
+            );
+        }
+        return null;
+    };
+
+    closeChannel = async (
+        channelPoint?: string,
+        channelId?: string,
+        satPerVbyte?: string | null,
+        forceClose?: boolean | null,
+        deliveryAddress?: string | null
+    ) => {
+        const { ChannelsStore, navigation } = this.props;
+
+        let funding_txid_str, output_index;
+        if (channelPoint) {
+            const [fundingTxidStr, outputIndex] = channelPoint.split(':');
+            funding_txid_str = fundingTxidStr;
+            output_index = outputIndex;
+        }
+
+        await ChannelsStore.closeChannel(
+            funding_txid_str && output_index
+                ? { funding_txid_str, output_index }
+                : undefined,
+            channelId ? channelId : undefined,
+            satPerVbyte ? satPerVbyte : undefined,
+            forceClose || false,
+            deliveryAddress ? deliveryAddress : undefined
+        );
+
+        if (!ChannelsStore.closeChannelErr) navigation.popTo('Wallet');
+    };
+
+    handleOnNavigateBack = (satPerByte: string) => {
+        this.setState({
+            satPerByte
+        });
+    };
+
+    render() {
+        const {
+            navigation,
+            SettingsStore,
+            LSPStore,
+            ModalStore,
+            NodeInfoStore,
+            ChannelsStore
+        } = this.props;
+        const {
+            channel,
+            confirmCloseChannel,
+            satPerByte,
+            forceCloseChannel,
+            deliveryAddress,
+            aliasToggle
+        } = this.state;
+        const { settings } = SettingsStore;
+        const { privacy } = settings;
+        const lurkerMode = privacy && privacy.lurkerMode;
+        const { testnet } = NodeInfoStore;
+        const { closeChannelErr, closingChannel } = ChannelsStore;
+
+        const closeAddress: string | undefined = channel?.close_address;
+
+        const {
+            channel_point,
+            commit_weight,
+            localBalance,
+            remoteBalance,
+            sendingCapacity,
+            receivingCapacity,
+            localReserveBalance,
+            remoteReserveBalance,
+            isBelowReserve,
+            commit_fee,
+            csv_delay,
+            total_satoshis_received,
+            isActive,
+            unsettled_balance,
+            total_satoshis_sent,
+            remotePubkey,
+            capacity,
+            channelId,
+            shortChannelId,
+            initiator,
+            aliasScids,
+            peerScidAlias,
+            zeroConfConfirmedScid,
+            local_chan_reserve_sat,
+            remote_chan_reserve_sat,
+            displayName,
+            // closed
+            to_us_msat,
+            closeHeight,
+            closeType,
+            getOpenInitiator,
+            getCloseInitiator,
+            closing_tx_hash,
+            chain_hash,
+            settled_balance,
+            time_locked_balance,
+            closing_txid,
+            pendingClose,
+            forceClose,
+            pendingOpen,
+            closing,
+            zero_conf,
+            getCommitmentType,
+            pending_htlcs,
+            blocks_til_maturity
+        } = channel as ClosedChannel;
+
+        // computed per render so lease data and the block height that
+        // arrive after the view opens are shown
+        const renewalInfo = getRenewalInfo(
+            LSPStore.getExtendableChannelsData,
+            channel,
+            NodeInfoStore.nodeInfo.currentBlockHeight
+        );
+        const expiresApprox = formatLeaseDuration(renewalInfo.expiresInBlocks);
+        const leaseDisplay = getLeaseDisplay({
+            ...renewalInfo,
+            fetchError: LSPStore.getExtendableChannelsError,
+            isLspChannel: remotePubkey === LSPStore.getLSPSPubkey()
+        });
+
+        const privateChannel = channel.private;
+        const confs = channel.getConfirmations(
+            NodeInfoStore.nodeInfo.currentBlockHeight
+        );
+        const waitingForPeer = channel.isWaitingForPeer;
+
+        const editableFees: boolean = !(
+            pendingOpen ||
+            pendingClose ||
+            forceClose ||
+            closeHeight ||
+            closing
+        );
+
+        const peerDisplay = PrivacyUtils.sensitiveValue({
+            input: displayName,
+            fixedLength: 8
+        });
+
+        const showAliasScids =
+            !!aliasScids &&
+            aliasScids.length > 0 &&
+            !(aliasScids.length === 1 && aliasScids[0] === shortChannelId);
+        const showPeerAliasScid = !!peerScidAlias;
+        const showZeroConfConfirmedScid = !!zeroConfConfirmedScid;
+
+        const EditFees = () => (
+            <TouchableOpacity
+                onPress={() => navigation.navigate('SetFees', { channel })}
+            >
+                <Edit
+                    fill={themeColor('text')}
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        return (
+            <SharedScreen>
+                <Screen>
+                    <Header
+                        leftComponent="Back"
+                        onBack={() => {
+                            ChannelsStore.clearCloseChannelErr();
+                        }}
+                        rightComponent={
+                            editableFees && !BackendUtils.isLocalWallet() ? (
+                                <EditFees />
+                            ) : (
+                                <></>
+                            )
+                        }
+                        placement="right"
+                        navigation={navigation}
+                    />
+                    <ScrollView
+                        style={styles.content}
+                        keyboardShouldPersistTaps="handled"
+                        showsVerticalScrollIndicator={false}
+                    >
+                        <View style={styles.center}>
+                            <Text
+                                style={{
+                                    color: themeColor('text'),
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    ...styles.alias
+                                }}
+                            >
+                                {`${peerDisplay}`}
+                            </Text>
+                            {remotePubkey && (
+                                <TouchableOpacity
+                                    onPress={() =>
+                                        UrlUtils.goToBlockExplorerPubkey(
+                                            remotePubkey,
+                                            testnet
+                                        )
+                                    }
+                                >
+                                    <Text
+                                        style={{
+                                            color: themeColor('highlight'),
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            ...styles.pubkey
+                                        }}
+                                    >
+                                        {remotePubkey
+                                            ? (() => {
+                                                  const maskedPubkey:
+                                                      | string
+                                                      | any = PrivacyUtils.sensitiveValue(
+                                                      {
+                                                          input: remotePubkey
+                                                      }
+                                                  );
+                                                  return (
+                                                      maskedPubkey.slice(0, 6) +
+                                                      '...' +
+                                                      maskedPubkey.slice(-6)
+                                                  );
+                                              })()
+                                            : ''}
+                                    </Text>
+                                </TouchableOpacity>
+                            )}
+                            {remotePubkey &&
+                                this.renderContactLink(remotePubkey)}
+                        </View>
+                        <View style={{ height: 40 }}>
+                            <BalanceSlider
+                                sendingCapacity={
+                                    lurkerMode ? 50 : sendingCapacity
+                                }
+                                receivingCapacity={
+                                    lurkerMode ? 50 : receivingCapacity
+                                }
+                                localBalance={lurkerMode ? 50 : localBalance}
+                                remoteBalance={lurkerMode ? 50 : remoteBalance}
+                                localReserveBalance={
+                                    lurkerMode ? 50 : localReserveBalance
+                                }
+                                remoteReserveBalance={
+                                    lurkerMode ? 50 : remoteReserveBalance
+                                }
+                            />
+                        </View>
+                        <Text
+                            style={{
+                                ...styles.status,
+                                color: themeColor('text'),
+                                marginBottom: confs ? 6 : 18
+                            }}
+                        >
+                            {pendingOpen
+                                ? localeString('views.Channel.pendingOpen')
+                                : pendingClose || closing
+                                ? localeString('views.Channel.pendingClose')
+                                : forceClose
+                                ? localeString('views.Channel.forceClose')
+                                : closeHeight || to_us_msat
+                                ? localeString('views.Channel.closed')
+                                : isActive
+                                ? localeString('general.active')
+                                : localeString('views.Channel.inactive')}
+                        </Text>
+                        {confs && (
+                            <Text
+                                style={{
+                                    ...styles.status,
+                                    color: themeColor('text'),
+                                    marginTop: 0,
+                                    marginBottom: waitingForPeer ? 6 : 18
+                                }}
+                            >
+                                {`${localeString(
+                                    'views.OpenChannel.numConf'
+                                )}: ${confs.current} / ${confs.total}`}
+                            </Text>
+                        )}
+                        {waitingForPeer && (
+                            <Text
+                                style={{
+                                    ...styles.status,
+                                    color: themeColor('text'),
+                                    marginTop: 0
+                                }}
+                            >
+                                {localeString('views.Channel.waitingForPeer')}
+                            </Text>
+                        )}
+                        {leaseDisplay.showFetchError && (
+                            <WarningMessage
+                                message={localeString(
+                                    'views.Channel.lease.fetchError'
+                                )}
+                            />
+                        )}
+                        {leaseDisplay.showLease && (
+                            <>
+                                <Row
+                                    justify="space-between"
+                                    style={{ marginTop: 10, marginBottom: 10 }}
+                                >
+                                    {renewalInfo.expiresInBlocks !==
+                                    undefined ? (
+                                        <View style={{ width: '50%' }}>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {renewalInfo.expiresInBlocks > 0
+                                                    ? localeString(
+                                                          'views.Channel.lease.expiresIn'
+                                                      )
+                                                    : localeString(
+                                                          'views.Activity.expired'
+                                                      )}
+                                            </Text>
+                                            <Text
+                                                style={{
+                                                    color: themeColor('text')
+                                                }}
+                                            >{`${numberWithCommas(
+                                                renewalInfo.expiresInBlocks
+                                            )} ${localeString(
+                                                'general.blocks'
+                                            )}${
+                                                expiresApprox
+                                                    ? `\n ~${expiresApprox}`
+                                                    : ''
+                                            }`}</Text>
+                                        </View>
+                                    ) : leaseDisplay.hasLease ? (
+                                        // block height not loaded yet
+                                        <View style={{ width: '50%' }} />
+                                    ) : (
+                                        <TouchableOpacity
+                                            style={{ width: '50%' }}
+                                            onPress={() => {
+                                                ModalStore.toggleInfoModal({
+                                                    text: [
+                                                        localeString(
+                                                            'views.Channel.lease.lspDiscretion.explainer1'
+                                                        ),
+                                                        localeString(
+                                                            'views.Channel.lease.lspDiscretion.explainer2'
+                                                        )
+                                                    ]
+                                                });
+                                            }}
+                                        >
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Channel.lease.outboundChannel'
+                                                )}
+                                            </Text>
+                                            <Text
+                                                style={{
+                                                    color: themeColor('text')
+                                                }}
+                                            >
+                                                {`${localeString(
+                                                    'views.Channel.lease.lspDiscretion'
+                                                )} ⓘ`}
+                                            </Text>
+                                        </TouchableOpacity>
+                                    )}
+                                    {leaseDisplay.showExtendButton && (
+                                        <ElementButton
+                                            title={
+                                                leaseDisplay.hasLease
+                                                    ? localeString(
+                                                          'views.Channel.lease.extendLease'
+                                                      )
+                                                    : localeString(
+                                                          'views.Channel.lease.purchaseLease'
+                                                      )
+                                            }
+                                            onPress={() => {
+                                                navigation.navigate('LSPS7', {
+                                                    chanId: renewalInfo.scid,
+                                                    maxExtensionInBlocks:
+                                                        renewalInfo.maxExtensionInBlocks,
+                                                    expirationBlock:
+                                                        renewalInfo.expirationBlock
+                                                });
+                                            }}
+                                            ViewComponent={
+                                                LinearGradient as any
+                                            }
+                                            linearGradientProps={{
+                                                colors: [
+                                                    'rgb(180, 26, 20)',
+                                                    'rgb(255, 169, 0)'
+                                                ],
+                                                start: { x: 0, y: 0.5 },
+                                                end: { x: 1, y: 0.5 }
+                                            }}
+                                            buttonStyle={{
+                                                borderRadius: 5
+                                            }}
+                                            titleStyle={{
+                                                ...styles.text,
+                                                fontSize: 15
+                                            }}
+                                        />
+                                    )}
+                                </Row>
+
+                                <Divider
+                                    orientation="horizontal"
+                                    style={{ margin: 20 }}
+                                />
+                            </>
+                        )}
+                        {channelId && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.channelId'
+                                )}
+                                value={channelId}
+                                showCopyIcon
+                            />
+                        )}
+                        {shortChannelId && (
+                            <KeyValue
+                                keyValue={localeString('views.Channel.scid')}
+                                value={shortChannelId}
+                                showCopyIcon
+                            />
+                        )}
+
+                        {(showPeerAliasScid ||
+                            showAliasScids ||
+                            showZeroConfConfirmedScid) && (
+                            <TouchableOpacity
+                                onPress={() => {
+                                    this.setState({
+                                        aliasToggle: !aliasToggle
+                                    });
+                                }}
+                            >
+                                <View>
+                                    <Row justify="space-between">
+                                        <View style={{ flex: 1 }}>
+                                            <KeyValue
+                                                keyValue={localeString(
+                                                    'views.Channel.aliases'
+                                                )}
+                                            />
+                                        </View>
+                                        {aliasToggle ? (
+                                            <CaretDown
+                                                fill={themeColor('text')}
+                                                width="20"
+                                                height="20"
+                                            />
+                                        ) : (
+                                            <CaretRight
+                                                fill={themeColor('text')}
+                                                width="20"
+                                                height="20"
+                                            />
+                                        )}
+                                    </Row>
+                                </View>
+                            </TouchableOpacity>
+                        )}
+
+                        {aliasToggle && (
+                            <>
+                                {showAliasScids && (
+                                    <KeyValue
+                                        keyValue={
+                                            aliasScids.length > 1
+                                                ? localeString(
+                                                      'views.Channel.aliasScids'
+                                                  )
+                                                : localeString(
+                                                      'views.Channel.aliasScid'
+                                                  )
+                                        }
+                                        value={aliasScids.join(', ')}
+                                        sensitive
+                                        showCopyIcon
+                                    />
+                                )}
+                                {showPeerAliasScid && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Channel.peerAliasScid'
+                                        )}
+                                        value={peerScidAlias}
+                                        sensitive
+                                        showCopyIcon
+                                    />
+                                )}
+                                {showZeroConfConfirmedScid && (
+                                    <KeyValue
+                                        keyValue={localeString(
+                                            'views.Channel.zeroConfConfirmedScid'
+                                        )}
+                                        value={zeroConfConfirmedScid}
+                                        sensitive
+                                        showCopyIcon
+                                    />
+                                )}
+                            </>
+                        )}
+                        {zero_conf && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.zeroConf'
+                                )}
+                                value={localeString('general.true')}
+                            />
+                        )}
+                        {!(closeHeight || closeType) && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.unannounced'
+                                )}
+                                value={
+                                    privateChannel
+                                        ? localeString('general.true')
+                                        : localeString('general.false')
+                                }
+                                color={privateChannel ? 'green' : '#808000'}
+                            />
+                        )}
+                        {getCommitmentType && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.commitmentType'
+                                )}
+                                value={getCommitmentType}
+                            />
+                        )}
+                        {chain_hash && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.chainHash'
+                                )}
+                                value={chain_hash}
+                                sensitive
+                                showCopyIcon
+                            />
+                        )}
+                        {!!closeHeight && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.closeHeight'
+                                )}
+                                value={closeHeight}
+                                color={themeColor('highlight')}
+                                sensitive
+                                showCopyIcon
+                                mempoolLink={() =>
+                                    UrlUtils.goToBlockExplorerBlockHeight(
+                                        closeHeight,
+                                        testnet
+                                    )
+                                }
+                            />
+                        )}
+                        {closeType && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.closeType'
+                                )}
+                                value={closeType}
+                                sensitive
+                            />
+                        )}
+                        {getOpenInitiator && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.openInitiator'
+                                )}
+                                value={getOpenInitiator}
+                                sensitive
+                            />
+                        )}
+                        {getCloseInitiator && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.closeInitiator'
+                                )}
+                                value={getCloseInitiator}
+                                sensitive
+                            />
+                        )}
+                        {closing_txid && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.closingTxId'
+                                )}
+                                value={closing_txid}
+                                sensitive
+                                color={themeColor('highlight')}
+                                showCopyIcon
+                                mempoolLink={() =>
+                                    UrlUtils.goToBlockExplorerTXID(
+                                        closing_txid,
+                                        testnet
+                                    )
+                                }
+                            />
+                        )}
+                        {closing_tx_hash && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.closingTxHash'
+                                )}
+                                value={closing_tx_hash}
+                                sensitive
+                                color={themeColor('highlight')}
+                                showCopyIcon
+                                mempoolLink={() =>
+                                    UrlUtils.goToBlockExplorerTXID(
+                                        closing_tx_hash,
+                                        testnet
+                                    )
+                                }
+                            />
+                        )}
+                        {(pendingOpen ||
+                            pendingClose ||
+                            closing ||
+                            !BackendUtils.isLNDBased()) &&
+                            channel_point && (
+                                <KeyValue
+                                    keyValue={localeString(
+                                        'views.Channel.channelPoint'
+                                    )}
+                                    value={channel_point}
+                                    sensitive
+                                    color={themeColor('highlight')}
+                                    showCopyIcon
+                                    mempoolLink={() =>
+                                        UrlUtils.goToBlockExplorerTXID(
+                                            channel_point,
+                                            testnet
+                                        )
+                                    }
+                                />
+                            )}
+                        {!!pending_htlcs && pending_htlcs.length > 0 && (
+                            <TouchableOpacity
+                                onPress={() =>
+                                    navigation.navigate('PendingHTLCs', {
+                                        pending_htlcs
+                                    })
+                                }
+                            >
+                                <View style={styles.tappableRow}>
+                                    <Row justify="space-between">
+                                        <Row>
+                                            <HourglassIcon
+                                                fill={themeColor('highlight')}
+                                                width={17}
+                                                height={17}
+                                                style={{ marginRight: 5 }}
+                                            />
+                                            <Text
+                                                style={{
+                                                    ...styles.tappableRowText,
+                                                    color: themeColor(
+                                                        'highlight'
+                                                    )
+                                                }}
+                                            >
+                                                {`${localeString(
+                                                    'views.PendingHTLCs.title'
+                                                )} (${pending_htlcs.length})`}
+                                            </Text>
+                                        </Row>
+                                        <CaretRight
+                                            fill={themeColor('secondaryText')}
+                                            width="20"
+                                            height="20"
+                                        />
+                                    </Row>
+                                </View>
+                            </TouchableOpacity>
+                        )}
+
+                        {blocks_til_maturity > 0 && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.blocksTilMaturity'
+                                )}
+                                value={`${blocks_til_maturity} ${localeString(
+                                    'general.blocks'
+                                )} (~${duration(
+                                    blocks_til_maturity * 10,
+                                    'minutes'
+                                ).humanize()})`}
+                            />
+                        )}
+
+                        <Divider
+                            orientation="horizontal"
+                            style={{ margin: 20 }}
+                        />
+
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.channelBalance'
+                            )}
+                        />
+                        {settled_balance && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.settledBalance'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={settled_balance}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                                sensitive
+                            />
+                        )}
+                        {time_locked_balance && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.timeLockedBalance'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={time_locked_balance}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                                sensitive
+                            />
+                        )}
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.localBalance'
+                            )}
+                            value={
+                                <Amount
+                                    sats={localBalance}
+                                    sensitive
+                                    toggleable
+                                    color={
+                                        isBelowReserve
+                                            ? 'warningReserve'
+                                            : undefined
+                                    }
+                                />
+                            }
+                        />
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.remoteBalance'
+                            )}
+                            value={
+                                <Amount
+                                    sats={remoteBalance}
+                                    sensitive
+                                    toggleable
+                                />
+                            }
+                        />
+                        {unsettled_balance !== '0' && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.unsettledBalance'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={unsettled_balance}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                            />
+                        )}
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.Total.outbound'
+                            )}
+                            value={
+                                <Amount
+                                    sats={sendingCapacity}
+                                    sensitive
+                                    toggleable
+                                />
+                            }
+                            indicatorColor={themeColor('outbound')}
+                        />
+                        <KeyValue
+                            keyValue={localeString(
+                                'views.Channel.Total.inbound'
+                            )}
+                            value={
+                                <Amount
+                                    sats={receivingCapacity}
+                                    sensitive
+                                    toggleable
+                                />
+                            }
+                            indicatorColor={themeColor('inbound')}
+                        />
+                        {!!local_chan_reserve_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.localReserve'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={local_chan_reserve_sat}
+                                        sensitive
+                                        toggleable
+                                        color={
+                                            isBelowReserve
+                                                ? 'warningReserve'
+                                                : undefined
+                                        }
+                                    />
+                                }
+                                infoModalText={localeString(
+                                    'views.Channel.localReserve.info'
+                                )}
+                                infoModalLink="https://bitcoin.design/guide/how-it-works/liquidity/#what-is-a-channel-reserve"
+                                indicatorColor={themeColor('outboundReserve')}
+                            />
+                        )}
+                        {!!remote_chan_reserve_sat && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.remoteReserve'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={remote_chan_reserve_sat}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                                infoModalText={localeString(
+                                    'views.Channel.remoteReserve.info'
+                                )}
+                                infoModalLink="https://bitcoin.design/guide/how-it-works/liquidity/#what-is-a-channel-reserve"
+                                indicatorColor={themeColor('inboundReserve')}
+                            />
+                        )}
+                        {capacity && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.capacity'
+                                )}
+                                value={
+                                    <Amount
+                                        sats={capacity}
+                                        sensitive
+                                        toggleable
+                                    />
+                                }
+                            />
+                        )}
+                        {!!csv_delay && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Channel.csvDelay'
+                                )}
+                                value={`${csv_delay} ${localeString(
+                                    'general.blocks'
+                                )}`}
+                                infoModalText={[
+                                    localeString(
+                                        'views.Channel.csvDelay.info1'
+                                    ),
+                                    localeString('views.Channel.csvDelay.info2')
+                                ]}
+                            />
+                        )}
+
+                        <Divider
+                            orientation="horizontal"
+                            style={{ margin: 20 }}
+                        />
+
+                        {BackendUtils.isLNDBased() && editableFees && (
+                            <FeeBreakdown
+                                isActive={isActive}
+                                isClosed={!!closeHeight || !!closeType}
+                                channelId={channelId}
+                                peerDisplay={peerDisplay}
+                                channelPoint={channel_point}
+                                initiator={initiator}
+                                total_satoshis_received={
+                                    total_satoshis_received
+                                }
+                                total_satoshis_sent={total_satoshis_sent}
+                                commit_fee={commit_fee}
+                                commit_weight={commit_weight}
+                            />
+                        )}
+                        {BackendUtils.supportsForwardingHistory() &&
+                            BackendUtils.supportsForwardingHistoryChannelFilter(
+                                NodeInfoStore.nodeInfo?.version
+                            ) &&
+                            channelId && (
+                                <>
+                                    <Divider
+                                        orientation="horizontal"
+                                        style={{ margin: 20 }}
+                                    />
+                                    <TouchableOpacity
+                                        onPress={() =>
+                                            navigation.navigate('Routing', {
+                                                filterChanIdIn: channelId
+                                            })
+                                        }
+                                    >
+                                        <View style={styles.tappableRow}>
+                                            <Row justify="space-between">
+                                                <Text
+                                                    style={
+                                                        styles.tappableRowText
+                                                    }
+                                                >
+                                                    {localeString(
+                                                        'views.Channel.routingHistory'
+                                                    )}
+                                                </Text>
+                                                <CaretRight
+                                                    fill={themeColor(
+                                                        'secondaryText'
+                                                    )}
+                                                    width="20"
+                                                    height="20"
+                                                />
+                                            </Row>
+                                        </View>
+                                    </TouchableOpacity>
+                                </>
+                            )}
+                        {BackendUtils.supportsBumpFee() && pendingOpen && (
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString(
+                                        'views.BumpFee.titleAlt'
+                                    )}
+                                    onPress={() =>
+                                        navigation.navigate('BumpFee', {
+                                            outpoint: channel.channel_point,
+                                            pendingOpen: true
+                                        })
+                                    }
+                                    noUppercase
+                                />
+                            </View>
+                        )}
+                        {BackendUtils.supportsBumpFee() &&
+                            (pendingClose || closing) &&
+                            closing_txid && (
+                                <View style={styles.button}>
+                                    <Button
+                                        title={localeString(
+                                            'views.BumpFee.titleClose'
+                                        )}
+                                        onPress={() =>
+                                            navigation.navigate('BumpFee', {
+                                                outpoint: `${closing_txid}:0`,
+                                                pendingClose: true
+                                            })
+                                        }
+                                        noUppercase
+                                    />
+                                </View>
+                            )}
+                        {BackendUtils.supportsBumpFee() &&
+                            forceClose &&
+                            !blocks_til_maturity && (
+                                <View style={styles.button}>
+                                    <Button
+                                        title={localeString(
+                                            'views.BumpFee.titleClose'
+                                        )}
+                                        onPress={() =>
+                                            navigation.navigate('BumpFee', {
+                                                chan_point:
+                                                    channel.channel_point,
+                                                forceClose: true
+                                            })
+                                        }
+                                        noUppercase
+                                    />
+                                </View>
+                            )}
+                        {this.state.channel.isOpen && (
+                            <View
+                                style={{
+                                    ...styles.button,
+                                    marginTop: 20,
+                                    marginBottom: confirmCloseChannel ? 0 : 50
+                                }}
+                            >
+                                <Button
+                                    title={
+                                        confirmCloseChannel
+                                            ? localeString(
+                                                  'views.Channel.cancelClose'
+                                              )
+                                            : localeString(
+                                                  'views.Channel.close'
+                                              )
+                                    }
+                                    onPress={() =>
+                                        this.setState({
+                                            confirmCloseChannel:
+                                                !confirmCloseChannel
+                                        })
+                                    }
+                                    warning={!confirmCloseChannel}
+                                />
+                            </View>
+                        )}
+                        {confirmCloseChannel && (
+                            <View>
+                                {closingChannel && (
+                                    <View
+                                        style={{ margin: 20, marginBottom: 40 }}
+                                    >
+                                        <LoadingIndicator />
+                                    </View>
+                                )}
+                                {!closingChannel && closeChannelErr && (
+                                    <ErrorMessage message={closeChannelErr} />
+                                )}
+                                {BackendUtils.supportsForceClose() && (
+                                    <>
+                                        <View style={{ marginBottom: 10 }}>
+                                            <Text
+                                                infoModalText={[
+                                                    localeString(
+                                                        'views.Channel.forceClose.infoText1'
+                                                    ),
+                                                    localeString(
+                                                        'views.Channel.forceClose.infoText2'
+                                                    )
+                                                ]}
+                                                style={{
+                                                    ...styles.text,
+                                                    color: themeColor('text'),
+                                                    top: 20
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Channel.forceClose'
+                                                )}
+                                            </Text>
+                                            <Switch
+                                                value={forceCloseChannel}
+                                                onValueChange={() =>
+                                                    this.setState({
+                                                        forceCloseChannel:
+                                                            !forceCloseChannel
+                                                    })
+                                                }
+                                            />
+                                        </View>
+                                        {BackendUtils.isLNDBased() &&
+                                            !forceCloseChannel && (
+                                                <>
+                                                    <Text
+                                                        style={{
+                                                            ...styles.text,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.Channel.closingRate'
+                                                        )}
+                                                    </Text>
+                                                    <OnchainFeeInput
+                                                        fee={satPerByte}
+                                                        onChangeFee={(
+                                                            text: string
+                                                        ) => {
+                                                            this.setState({
+                                                                satPerByte: text
+                                                            });
+                                                        }}
+                                                        navigation={navigation}
+                                                    />
+
+                                                    <Text
+                                                        style={{
+                                                            ...styles.text,
+                                                            color: themeColor(
+                                                                'text'
+                                                            )
+                                                        }}
+                                                        infoModalText={
+                                                            closeAddress
+                                                                ? localeString(
+                                                                      'views.Channel.externalAddress.info2'
+                                                                  )
+                                                                : localeString(
+                                                                      'views.Channel.externalAddress.info1'
+                                                                  )
+                                                        }
+                                                    >
+                                                        {localeString(
+                                                            'views.Channel.externalAddress'
+                                                        )}
+                                                    </Text>
+                                                    <TextInput
+                                                        placeholder={'bc1...'}
+                                                        value={deliveryAddress}
+                                                        onChangeText={(
+                                                            text: string
+                                                        ) => {
+                                                            this.setState({
+                                                                deliveryAddress:
+                                                                    text
+                                                            });
+                                                        }}
+                                                        locked={
+                                                            closingChannel ||
+                                                            (closeAddress !==
+                                                                undefined &&
+                                                                closeAddress !==
+                                                                    '')
+                                                        }
+                                                    />
+                                                </>
+                                            )}
+                                    </>
+                                )}
+                                <View style={styles.button}>
+                                    <Button
+                                        title={localeString(
+                                            'views.Channel.confirmClose'
+                                        )}
+                                        onPress={() =>
+                                            this.closeChannel(
+                                                channel_point,
+                                                channelId,
+                                                satPerByte,
+                                                forceCloseChannel,
+                                                deliveryAddress
+                                            )
+                                        }
+                                        warning
+                                    />
+                                </View>
+                            </View>
+                        )}
+                    </ScrollView>
+                </Screen>
+            </SharedScreen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    content: {
+        marginLeft: 20,
+        marginRight: 20
+    },
+    center: {
+        alignItems: 'center'
+    },
+    status: {
+        fontFamily: 'PPNeueMontreal-Book',
+        marginVertical: 18,
+        flex: 1,
+        flexDirection: 'row',
+        textAlign: 'center'
+    },
+    alias: {
+        fontSize: 28,
+        paddingTop: 14,
+        paddingBottom: 10
+    },
+    pubkey: {
+        paddingBottom: 24,
+        textAlign: 'center'
+    },
+    button: {
+        paddingTop: 15,
+        paddingBottom: 15
+    },
+    container: {
+        paddingHorizontal: 16,
+        paddingVertical: 12,
+        borderRadius: 6,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'center'
+    },
+    image: {
+        width: 50,
+        height: 50,
+        borderRadius: 25,
+        marginRight: 14
+    },
+    tappableRow: {
+        paddingVertical: 10
+    },
+    tappableRowText: {
+        fontSize: 16
+    }
+});

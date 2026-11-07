@@ -1,0 +1,171 @@
+import { NativeModules } from 'react-native';
+import * as $protobuf from 'protobufjs';
+
+const { LncModule } = NativeModules;
+
+export interface ISendRequestClass<IReq, Req> {
+    create: (options: IReq) => Req;
+    encode: (request: Req) => $protobuf.Writer;
+}
+
+export interface ISendResponseClass<Res> {
+    decode: (reader: $protobuf.Reader | Uint8Array) => Res;
+    toObject(
+        message: Res,
+        options?: $protobuf.IConversionOptions
+    ): { [k: string]: any };
+}
+
+export interface ISyncCommandOptions<IReq, Req, Res> {
+    request: ISendRequestClass<IReq, Req>;
+    response: ISendResponseClass<Res>;
+    method: string;
+    options: IReq;
+}
+
+/**
+ * @throws
+ */
+export const createClaimTransaction = async ({
+    endpoint,
+    swapId,
+    claimLeaf,
+    refundLeaf,
+    privateKey,
+    servicePubKey,
+    transactionHash,
+    pubNonce
+}: {
+    endpoint: string;
+    swapId: string;
+    claimLeaf: string;
+    refundLeaf: string;
+    privateKey: string;
+    servicePubKey: string;
+    transactionHash: string;
+    pubNonce: string;
+}): Promise<string> => {
+    try {
+        const error: string = await LncModule.createClaimTransaction(
+            endpoint,
+            swapId,
+            claimLeaf,
+            refundLeaf,
+            privateKey,
+            servicePubKey,
+            transactionHash,
+            pubNonce
+        );
+        return error;
+    } catch (e) {
+        throw e;
+    }
+};
+
+/**
+ * Builds and signs a reverse swap claim and returns its hex. Nothing is
+ * broadcast: a cooperative claim has already sent the preimage to the swap
+ * host by the time this resolves, so the caller must store the result and
+ * keep broadcasting it until it confirms.
+ *
+ * @throws
+ */
+export const buildReverseClaimTransaction = async ({
+    endpoint,
+    swapId,
+    claimLeaf,
+    refundLeaf,
+    privateKey,
+    servicePubKey,
+    preimageHex,
+    transactionHex,
+    lockupAddress,
+    destinationAddress,
+    feeRate,
+    minerFee,
+    network
+}: {
+    endpoint: string;
+    swapId: string;
+    claimLeaf: string;
+    refundLeaf: string;
+    privateKey: string;
+    servicePubKey: string;
+    preimageHex: string;
+    transactionHex: string;
+    lockupAddress: string;
+    destinationAddress: string;
+    feeRate: number;
+    minerFee: number;
+    network: string;
+}): Promise<string> =>
+    LncModule.buildReverseClaimTransaction(
+        endpoint,
+        swapId,
+        claimLeaf,
+        refundLeaf,
+        privateKey,
+        servicePubKey,
+        preimageHex,
+        transactionHex,
+        lockupAddress,
+        destinationAddress,
+        feeRate,
+        minerFee,
+        network
+    );
+
+/**
+ * Builds and signs a submarine swap refund and returns its hex. Nothing is
+ * broadcast. Pays minerFee sats when it is above 0, and feeRate sat/vbyte
+ * otherwise.
+ *
+ * @throws
+ */
+export const buildRefundTransaction = async ({
+    endpoint,
+    swapId,
+    claimLeaf,
+    refundLeaf,
+    transactionHex,
+    privateKey,
+    servicePubKey,
+    feeRate,
+    minerFee = 0,
+    timeoutBlockHeight,
+    destinationAddress,
+    lockupAddress,
+    cooperative = false,
+    network
+}: {
+    endpoint: string;
+    swapId: string;
+    claimLeaf: string;
+    refundLeaf: string;
+    transactionHex: string;
+    privateKey: string;
+    servicePubKey: string;
+    feeRate: number;
+    minerFee?: number;
+    timeoutBlockHeight: number;
+    destinationAddress: string;
+    lockupAddress: string;
+    cooperative?: boolean;
+    network: string;
+}): Promise<string> =>
+    LncModule.buildRefundTransaction(
+        endpoint,
+        swapId,
+        claimLeaf,
+        refundLeaf,
+        transactionHex,
+        privateKey,
+        servicePubKey,
+        feeRate,
+        minerFee,
+        timeoutBlockHeight,
+        destinationAddress,
+        lockupAddress,
+        cooperative,
+        network
+    );

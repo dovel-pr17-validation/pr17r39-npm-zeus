@@ -1,0 +1,152 @@
+import React, { useEffect, useState } from 'react';
+import { Text, TouchableWithoutFeedback, View } from 'react-native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import LoadingIndicator from './LoadingIndicator';
+import TextInput from '../components/TextInput';
+
+import { feeStore, settingsStore } from '../stores/Stores';
+
+import { themeColor } from '../utils/ThemeUtils';
+import { localeString } from '../utils/LocaleUtils';
+import { isPlausibleSatPerVbyte } from '../utils/FeeUtils';
+
+interface OnchainFeeInputProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    fee?: string;
+    onChangeFee: (fee: string) => void;
+    onFeeError?: (error: boolean) => void;
+    onNavigateAway?: () => void;
+}
+
+export default function OnchainFeeInput(props: OnchainFeeInputProps) {
+    const { fee, onChangeFee, onNavigateAway, navigation } = props;
+    const { settings } = settingsStore;
+    const enableMempoolRates = settings?.privacy?.enableMempoolRates;
+    const preferredMempoolRate =
+        settings?.payments?.preferredMempoolRate || 'fastestFee';
+
+    const [newFee, setNewFee] = useState(fee);
+    const [loading, setLoading] = useState(false);
+    const [errorOccurredLoadingFees, setErrorOccurredLoadingFees] =
+        useState(false);
+
+    useEffect(() => setNewFee(fee), [fee]);
+
+    useEffect(() => {
+        const handleFeeError = () => {
+            onChangeFee('0');
+            setErrorOccurredLoadingFees(true);
+            setLoading(false);
+            if (props.onFeeError) {
+                props.onFeeError(true);
+            }
+        };
+
+        if (enableMempoolRates) {
+            const hasValidFee = fee && Number(fee) > 0;
+            if (hasValidFee) {
+                setNewFee(fee);
+                onChangeFee(fee);
+                setLoading(false);
+                return;
+            }
+            setLoading(true);
+            feeStore
+                .getOnchainFeesviaMempool()
+                .then((recommendedFees) => {
+                    const recommended =
+                        recommendedFees?.[preferredMempoolRate] ??
+                        recommendedFees?.fastestFee ??
+                        '';
+                    const feeStr =
+                        recommended !== '' && recommended != null
+                            ? String(recommended)
+                            : '';
+                    if (!feeStr) {
+                        // getOnchainFeesviaMempool never rejects: it
+                        // resolves undefined on any failure (non-200,
+                        // network error, or implausible payload). Treat
+                        // that as a failure so the error is shown
+                        // instead of an empty fee field.
+                        handleFeeError();
+                        return;
+                    }
+                    setNewFee(feeStr);
+                    onChangeFee(feeStr);
+                    setLoading(false);
+                })
+                .catch(handleFeeError);
+        }
+    }, []);
+
+    useEffect(() => {
+        const unsubscribe = navigation.addListener('focus', () => {
+            if (feeStore.tempFee) {
+                setErrorOccurredLoadingFees(false);
+                onChangeFee(feeStore.tempFee);
+                feeStore.setTempFee('');
+            }
+        });
+
+        return unsubscribe;
+    }, [navigation]);
+
+    return (
+        <>
+            {enableMempoolRates ? (
+                <TouchableWithoutFeedback
+                    onPress={() => {
+                        if (onNavigateAway) onNavigateAway();
+                        navigation.navigate('EditFee', {
+                            fee: newFee
+                        });
+                    }}
+                >
+                    <View
+                        style={{
+                            height: 55,
+                            justifyContent: 'center',
+                            marginTop: 15,
+                            borderRadius: 4,
+                            marginBottom: 20,
+                            borderColor: 'rgba(255, 217, 63, .6)',
+                            borderWidth: 3
+                        }}
+                    >
+                        {loading ? (
+                            <LoadingIndicator />
+                        ) : (
+                            <Text
+                                style={{
+                                    color: errorOccurredLoadingFees
+                                        ? themeColor('warning')
+                                        : themeColor('text'),
+                                    paddingLeft: 15,
+                                    fontSize: 18
+                                }}
+                            >
+                                {errorOccurredLoadingFees
+                                    ? localeString('views.EditFee.error')
+                                    : newFee}
+                            </Text>
+                        )}
+                    </View>
+                </TouchableWithoutFeedback>
+            ) : (
+                <TextInput
+                    keyboardType="numeric"
+                    placeholder={localeString(
+                        'components.OnchainFeeInput.placeholder'
+                    )}
+                    value={newFee}
+                    onChangeText={(text: string) => {
+                        setNewFee(text);
+                        onChangeFee(text);
+                    }}
+                    error={!newFee || !isPlausibleSatPerVbyte(newFee)}
+                />
+            )}
+        </>
+    );
+}

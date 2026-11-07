@@ -1,0 +1,295 @@
+import * as React from 'react';
+import { StyleSheet, View } from 'react-native';
+import { Icon } from '@rneui/themed';
+import { inject, observer } from 'mobx-react';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Button from '../../../components/Button';
+import DropdownSetting from '../../../components/DropdownSetting';
+import Screen from '../../../components/Screen';
+import Header from '../../../components/Header';
+import LoadingIndicator from '../../../components/LoadingIndicator';
+import { ErrorMessage } from '../../../components/SuccessErrorMessage';
+import { Row } from '../../../components/layout/Row';
+
+import CashuStore from '../../../stores/CashuStore';
+import LightningAddressStore from '../../../stores/LightningAddressStore';
+import SettingsStore from '../../../stores/SettingsStore';
+
+import { localeString } from '../../../utils/LocaleUtils';
+import { themeColor } from '../../../utils/ThemeUtils';
+
+import ZeusPayIcon from '../../../assets/images/SVG/zeus-pay.svg';
+
+interface CreateCashuLightningAddressProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    CashuStore: CashuStore;
+    LightningAddressStore: LightningAddressStore;
+    SettingsStore: SettingsStore;
+    route: Route<'CreateCashuLightningAddress', { switchTo: boolean }>;
+}
+
+interface MintItem {
+    key: string;
+    value: string;
+}
+
+interface CreateCashuLightningAddressState {
+    mintList: Array<MintItem>;
+    mintUrl: string;
+    loading: boolean;
+}
+
+@inject('CashuStore', 'LightningAddressStore', 'SettingsStore')
+@observer
+export default class CreateCashuLightningAddress extends React.Component<
+    CreateCashuLightningAddressProps,
+    CreateCashuLightningAddressState
+> {
+    isInitialFocus = true;
+    focusListener: any = null;
+
+    state = {
+        mintList: [],
+        mintUrl: '',
+        loading: false
+    };
+
+    async componentDidMount() {
+        const { navigation } = this.props;
+
+        this.loadMints();
+
+        // triggers when loaded from navigation or back action
+        this.focusListener = navigation.addListener('focus', this.handleFocus);
+    }
+
+    componentWillUnmount(): void {
+        if (this.focusListener) {
+            this.focusListener();
+        }
+    }
+
+    loadMints = () => {
+        const { CashuStore } = this.props;
+        const { selectedMintUrl, mintUrls, mintInfos } = CashuStore;
+
+        const mintList: Array<MintItem> = mintUrls
+            ? mintUrls.map((mintUrl) => {
+                  const mintInfo = mintInfos[mintUrl];
+                  return {
+                      key: mintInfo?.name || mintUrl,
+                      value: mintUrl
+                  };
+              })
+            : [];
+
+        this.setState({
+            mintList,
+            mintUrl: selectedMintUrl
+        });
+    };
+
+    handleFocus = () => {
+        if (this.isInitialFocus) {
+            this.isInitialFocus = false;
+        } else {
+            this.loadMints();
+        }
+    };
+
+    render() {
+        const {
+            navigation,
+            LightningAddressStore,
+            CashuStore,
+            SettingsStore,
+            route
+        } = this.props;
+        const { mintUrl, mintList } = this.state;
+        const { createCashu, update, error_msg } = LightningAddressStore;
+        const { updateSettingsGroup } = SettingsStore;
+        const switchTo = route.params?.switchTo;
+
+        const mintsNotConfigured = mintList.length === 0;
+
+        const loading = this.state.loading || LightningAddressStore.loading;
+
+        const InfoButton = () => (
+            <View>
+                <Icon
+                    name="info"
+                    onPress={() => {
+                        navigation.navigate('CashuLightningAddressInfo');
+                    }}
+                    color={themeColor('text')}
+                    underlayColor="transparent"
+                    size={35}
+                />
+            </View>
+        );
+
+        return (
+            <Screen>
+                <View style={{ flex: 1 }}>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={
+                            <ZeusPayIcon
+                                fill={themeColor('text')}
+                                width={30}
+                                height={30}
+                            />
+                        }
+                        rightComponent={
+                            !loading ? (
+                                <Row align="flex-end">
+                                    <InfoButton />
+                                </Row>
+                            ) : undefined
+                        }
+                        navigation={navigation}
+                    />
+                    <View style={{ flex: 1, margin: 5 }}>
+                        {loading && <LoadingIndicator />}
+                        {!loading && !!error_msg && (
+                            <ErrorMessage message={error_msg} dismissable />
+                        )}
+                        {!loading && (
+                            <>
+                                <View style={{ flex: 1 }}>
+                                    <View style={styles.wrapper}>
+                                        {mintsNotConfigured ? (
+                                            <View style={{ marginTop: 20 }}>
+                                                <Button
+                                                    title={localeString(
+                                                        'cashu.tapToConfigure'
+                                                    )}
+                                                    warning
+                                                    onPress={() =>
+                                                        navigation.navigate(
+                                                            'Mints'
+                                                        )
+                                                    }
+                                                />
+                                            </View>
+                                        ) : (
+                                            <DropdownSetting
+                                                title={localeString(
+                                                    'cashu.mint'
+                                                )}
+                                                selectedValue={
+                                                    this.props.CashuStore
+                                                        ?.mintInfos[mintUrl]
+                                                        ?.name || ''
+                                                }
+                                                values={mintList}
+                                                onValueChange={(
+                                                    value: string
+                                                ) => {
+                                                    this.setState({
+                                                        mintUrl: value
+                                                    });
+                                                }}
+                                            />
+                                        )}
+                                    </View>
+                                </View>
+                                <View style={{ bottom: 15, margin: 10 }}>
+                                    <Button
+                                        title={
+                                            switchTo
+                                                ? localeString(
+                                                      'views.Settings.LightningAddress.switchToCashu'
+                                                  )
+                                                : localeString(
+                                                      'views.Settings.LightningAddress.create'
+                                                  )
+                                        }
+                                        onPress={async () => {
+                                            if (switchTo) {
+                                                this.setState({
+                                                    loading: true
+                                                });
+                                                try {
+                                                    const response =
+                                                        await update({
+                                                            mint_url: mintUrl,
+                                                            cashu_pubkey:
+                                                                CashuStore
+                                                                    .cashuWallets[
+                                                                    mintUrl
+                                                                ].pubkey,
+                                                            address_type:
+                                                                'cashu'
+                                                        });
+                                                    if (response.success) {
+                                                        await updateSettingsGroup(
+                                                            'lightningAddress',
+                                                            {
+                                                                mintUrl
+                                                            }
+                                                        );
+                                                        // popTo() has no target and acts on the top
+                                                        // route, so only while this screen is on
+                                                        // top; otherwise turn the spinner off below
+                                                        if (
+                                                            navigation.isFocused()
+                                                        ) {
+                                                            navigation.popTo(
+                                                                'LightningAddress'
+                                                            );
+                                                            return;
+                                                        }
+                                                    }
+                                                } catch (e) {
+                                                    console.error(e);
+                                                }
+                                                this.setState({
+                                                    loading: false
+                                                });
+                                            } else {
+                                                createCashu(mintUrl)
+                                                    .then((response) => {
+                                                        if (
+                                                            response.success &&
+                                                            navigation.isFocused()
+                                                        ) {
+                                                            // Opened only from ReceiveEcash and
+                                                            // Get started on the ZEUS Pay screen,
+                                                            // so go back to whichever opened it.
+                                                            // goBack() has no target and pops the
+                                                            // top route, so only while this screen
+                                                            // is on top
+                                                            navigation.goBack();
+                                                        }
+                                                    })
+                                                    .catch((e) =>
+                                                        console.log(
+                                                            'Error creating Cashu Lightning address',
+                                                            e
+                                                        )
+                                                    );
+                                            }
+                                        }}
+                                        disabled={mintsNotConfigured}
+                                    />
+                                </View>
+                            </>
+                        )}
+                    </View>
+                </View>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    wrapper: {
+        paddingTop: 5,
+        paddingBottom: 5,
+        paddingLeft: 15,
+        paddingRight: 15
+    }
+});

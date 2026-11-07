@@ -1,0 +1,2266 @@
+jest.mock('react-native-blob-util', () => ({}));
+jest.mock('@react-native-documents/picker', () => ({
+    saveDocuments: jest.fn()
+}));
+jest.mock('react-native-encrypted-storage', () => ({
+    getItem: jest.fn(),
+    setItem: jest.fn()
+}));
+jest.mock('react-native-keychain', () => ({
+    getInternetCredentials: jest.fn(),
+    setInternetCredentials: jest.fn(),
+    resetInternetCredentials: jest.fn()
+}));
+jest.mock('@react-native-async-storage/async-storage', () => ({
+    getItem: jest.fn(),
+    setItem: jest.fn(),
+    clear: jest.fn()
+}));
+jest.mock('../stores/Stores', () => ({
+    settingsStore: {
+        settingsUpdateInProgress: false,
+        setSettings: jest.fn(),
+        updateSettings: jest.fn()
+    }
+}));
+jest.mock('../stores/ChannelBackupStore', () => ({}));
+jest.mock('../stores/LightningAddressStore', () => ({}));
+jest.mock('../stores/LSPStore', () => ({}));
+jest.mock('../utils/BackendUtils', () => ({}));
+
+jest.mock('../stores/SettingsStore', () => ({
+    DEFAULT_FIAT_RATES_SOURCE: 'Zeus',
+    DEFAULT_FIAT: 'USD',
+    DEFAULT_LSP_MAINNET: 'https://flow.zeuslsp.com',
+    DEFAULT_LSP_TESTNET: 'https://flow.testnet.zeuslsp.com',
+    DEFAULT_LSP_MUTINYNET: 'https://flow.mutinynet.zeuslsp.com',
+    DEFAULT_NOSTR_RELAYS: [
+        'wss://relay.damus.io',
+        'wss://nostr.land',
+        'wss://nostr.wine',
+        'wss://nos.lol',
+        'wss://relay.snort.social'
+    ],
+    DEFAULT_NEUTRINO_PEERS_MAINNET: [
+        'btcd1.lnolymp.us',
+        'btcd2.lnolymp.us',
+        'btcd-mainnet.lightning.computer',
+        'node.eldamar.icu',
+        'noad.sathoarder.com'
+    ],
+    DEFAULT_NEUTRINO_PEERS_TESTNET: [
+        'testnet.lnolymp.us',
+        'btcd-testnet.lightning.computer',
+        'testnet.blixtwallet.com'
+    ],
+    DEFAULT_LSPS1_HOST_MAINNET: '45.79.192.236:9735',
+    DEFAULT_LSPS1_HOST_TESTNET: '139.144.22.237:9735',
+    DEFAULT_LSPS1_PUBKEY_MAINNET:
+        '031b301307574bbe9b9ac7b79cbe1700e31e544513eae0b5d7497483083f99e581',
+    DEFAULT_LSPS1_PUBKEY_TESTNET:
+        '03e84a109cd70e57864274932fc87c5e6434c59ebb8e6e7d28532219ba38f7f6df',
+    DEFAULT_LSPS1_REST_MAINNET: 'https://lsps1.zeuslsp.com',
+    DEFAULT_LSPS1_REST_TESTNET: 'https://lsps1.testnet.zeuslsp.com',
+    DEFAULT_LSPS1_REST_MUTINYNET: 'https://lsps1.mutinynet.zeuslsp.com',
+    DEFAULT_SPEEDLOADER: 'https://egs.lnze.us/',
+    DEFAULT_SWAP_HOST_MAINNET: 'https://satsrouting.exchange/v2',
+    DEFAULT_SWAP_HOST_TESTNET: 'https://api.testnet.boltz.exchange/v2',
+    LEGACY_ZEUS_SWAP_HOST_MAINNET: 'https://swaps.zeuslsp.com/api/v2',
+    LEGACY_ZEUS_SWAP_HOST_TESTNET: 'https://testnet-swaps.zeuslsp.com/api/v2',
+    RETIRED_SWAP_HOSTS_MAINNET: ['https://boltz-api.eldamar.icu/v2'],
+    RETIRED_SWAP_HOSTS_MAINNET_V2: [
+        'https://api.boltz.exchange/v2',
+        'https://api.middle-way.space/v2'
+    ],
+    RETIRED_THEMES: ['junkie', 'bpm', 'desert', 'mint', 'watermelon'],
+    DEFAULT_THEME: 'kyriaki',
+    DEFAULT_NOSTR_RELAYS_2023: [
+        'wss://nostr.mutinywallet.com',
+        'wss://relay.damus.io',
+        'wss://nostr.lnproxy.org'
+    ],
+    DEFAULT_SLIDE_TO_PAY_THRESHOLD: 10000,
+    STORAGE_KEY: 'zeus-settings-v2',
+    LEGACY_CURRENCY_CODES_KEY: 'currency-codes',
+    CURRENCY_CODES_KEY: 'zeus-currency-codes',
+    PosEnabled: {
+        Disabled: 'disabled',
+        Square: 'square',
+        Standalone: 'standalone'
+    },
+    // Mirrors SettingsStore.DEFAULT_SETTINGS's top-level groups (the
+    // scalar defaults above are unused by applyMissingSettingsGroups,
+    // which only backfills object-valued top-level keys). Keep in sync
+    // with the real constant by hand, same as every other DEFAULT_* value
+    // in this mock.
+    DEFAULT_SETTINGS: {
+        settingsVersion: require('../utils/SettingsVersion').SETTINGS_VERSION,
+        privacy: {
+            defaultBlockExplorer: 'mempool.space',
+            customBlockExplorer: '',
+            clipboard: true,
+            lurkerMode: false,
+            enableMempoolRates: true,
+            mempoolInstance: 'electrs.zeusln.com',
+            customMempoolInstance: '',
+            stealthMode: false,
+            stealthApp: 'calculator',
+            stealthPinLength: 5,
+            stealthVpnCountry: 'Switzerland',
+            stealthVpnServer: 'Geneva'
+        },
+        display: {
+            theme: 'Dark',
+            defaultView: 'Keypad',
+            displayNickname: false,
+            bigKeypadButtons: false,
+            showAllDecimalPlaces: false,
+            removeDecimalSpaces: false,
+            showMillisatoshiAmounts: false
+        },
+        pos: {
+            posEnabled: 'disabled',
+            squareEnabled: false,
+            squareAccessToken: '',
+            squareLocationId: '',
+            merchantName: '',
+            confirmationPreference: 'lnOnly',
+            disableTips: false,
+            squareDevMode: false,
+            showKeypad: true,
+            taxPercentage: '',
+            enablePrinter: false,
+            defaultView: 'Products'
+        },
+        payments: {
+            defaultFeeMethod: 'fixed',
+            defaultFeePercentage: '5.0',
+            defaultFeeFixed: '1000',
+            timeoutSeconds: '60',
+            preferredMempoolRate: 'fastestFee',
+            slideToPayThreshold: 10000,
+            enableDonations: false,
+            defaultDonationPercentage: 5
+        },
+        invoices: {
+            addressType: '0',
+            memo: '',
+            receiverName: '',
+            expiry: '1',
+            timePeriod: 'Hours',
+            expirySeconds: '3600',
+            routeHints: false,
+            ampInvoice: false,
+            blindedPaths: false,
+            showCustomPreimageField: false,
+            displayAmountOnInvoice: false,
+            defaultInvoiceType: 'lightning'
+        },
+        channels: {
+            min_confs: 1,
+            privateChannel: true,
+            scidAlias: true,
+            simpleTaprootChannel: false
+        },
+        swaps: {
+            hostMainnet: 'https://satsrouting.exchange/v2',
+            hostTestnet: 'https://api.testnet.boltz.exchange/v2',
+            customHost: '',
+            proEnabled: false
+        },
+        lightningAddress: {
+            enabled: false,
+            automaticallyAccept: true,
+            automaticallyAcceptAttestationLevel: 2,
+            automaticallyRequestOlympusChannels: false,
+            routeHints: false,
+            allowComments: true,
+            zapReceiptsEnabled: true,
+            nostrPrivateKey: '',
+            nostrRelays: [
+                'wss://relay.damus.io',
+                'wss://nostr.land',
+                'wss://nostr.wine',
+                'wss://nos.lol',
+                'wss://relay.snort.social'
+            ],
+            notifications: 0,
+            mintUrl: '',
+            posEnabled: false
+        },
+        bolt12Address: {
+            localPart: ''
+        },
+        ecash: {
+            enableCashu: false,
+            enableMultiMint: false,
+            automaticallySweep: false,
+            sweepThresholdSats: 10000
+        },
+        networking: {
+            disableOfflineCheck: false
+        },
+        selectNodeOnStartup: false
+    }
+}));
+jest.mock('../storage', () => ({
+    setItem: jest.fn().mockResolvedValue(true),
+    getItem: jest.fn(),
+    removeItem: jest.fn(),
+    clear: jest.fn(),
+    KEY_PREFIX: 'zeus:',
+    getInternetPasswordServers: jest.fn().mockResolvedValue([]),
+    getRawItem: jest.fn().mockResolvedValue(null),
+    setRawLocalItem: jest.fn().mockResolvedValue(true),
+    removeRawItem: jest.fn().mockResolvedValue(undefined)
+}));
+
+import MigrationUtils from './MigrationUtils';
+// the real constant, deliberately not mocked: after a version bump these
+// gating tests must run against the bumped value
+import { SETTINGS_VERSION } from './SettingsVersion';
+// resolves to the mocked ../stores/SettingsStore above
+import { DEFAULT_SETTINGS } from '../stores/SettingsStore';
+
+// Mock console logs to keep test output clean
+const mockConsoleLog = jest.spyOn(console, 'log').mockImplementation(() => {});
+const mockConsoleError = jest
+    .spyOn(console, 'error')
+    .mockImplementation(() => {});
+
+// MigrationUtils is a process-wide singleton that caches one-shot flags
+// once they read 'true'; start every test with an empty cache
+beforeEach(() => {
+    MigrationUtils.clearConfirmedFlags();
+});
+
+describe('MigrationUtils', () => {
+    // Everything below the `payments` line is a group legacySettingsMigrations
+    // leaves entirely to applyMissingSettingsGroups: on an empty/legacy blob
+    // it comes out identical to SettingsStore.DEFAULT_SETTINGS's own value,
+    // since nothing else in the function touches these groups (#4776).
+    // `display` and `payments` above keep their existing partial shape:
+    // mod5 and the payments block each narrowly create/repair only the one
+    // field they're responsible for, so applyMissingSettingsGroups finds
+    // them already present and leaves the rest of those two groups alone.
+    const defaultSettings = {
+        customSpeedloader: '',
+        display: {
+            showMillisatoshiAmounts: true
+        },
+        enableLSP: true,
+        fiat: 'USD',
+        fiatEnabled: false,
+        fiatRatesSource: 'Zeus',
+        lightningAddress: {
+            allowComments: true,
+            automaticallyAccept: true,
+            automaticallyAcceptAttestationLevel: 2,
+            automaticallyRequestOlympusChannels: false,
+            enabled: false,
+            mintUrl: '',
+            nostrPrivateKey: '',
+            nostrRelays: [
+                'wss://relay.damus.io',
+                'wss://nostr.land',
+                'wss://nostr.wine',
+                'wss://nos.lol',
+                'wss://relay.snort.social'
+            ],
+            notifications: 0,
+            routeHints: false,
+            zapReceiptsEnabled: true,
+            posEnabled: false
+        },
+        lspMainnet: 'https://flow.zeuslsp.com',
+        lspTestnet: 'https://flow.testnet.zeuslsp.com',
+        lsps1HostMainnet: '45.79.192.236:9735',
+        lsps1HostTestnet: '139.144.22.237:9735',
+        lsps1PubkeyMainnet:
+            '031b301307574bbe9b9ac7b79cbe1700e31e544513eae0b5d7497483083f99e581',
+        lsps1PubkeyTestnet:
+            '03e84a109cd70e57864274932fc87c5e6434c59ebb8e6e7d28532219ba38f7f6df',
+        lsps1RestMainnet: 'https://lsps1.zeuslsp.com',
+        lsps1RestTestnet: 'https://lsps1.testnet.zeuslsp.com',
+        lsps1Token: '',
+        neutrinoPeersMainnet: [
+            'btcd1.lnolymp.us',
+            'btcd2.lnolymp.us',
+            'btcd-mainnet.lightning.computer',
+            'node.eldamar.icu',
+            'noad.sathoarder.com'
+        ],
+        neutrinoPeersTestnet: [
+            'testnet.lnolymp.us',
+            'btcd-testnet.lightning.computer',
+            'testnet.blixtwallet.com'
+        ],
+        payments: {
+            slideToPayThreshold: 10000
+        },
+        requestSimpleTaproot: true,
+        settingsVersion: SETTINGS_VERSION,
+        speedloader: 'https://egs.lnze.us/',
+        // backfilled by applyMissingSettingsGroups. clipboard/enableMempoolRates
+        // are false here, not DEFAULT_SETTINGS' true: BACKFILL_OVERRIDES keeps
+        // them off so a blob that never had this group doesn't start reading
+        // the clipboard or fetching mempool rates without having opted in.
+        privacy: {
+            defaultBlockExplorer: 'mempool.space',
+            customBlockExplorer: '',
+            clipboard: false,
+            lurkerMode: false,
+            enableMempoolRates: false,
+            mempoolInstance: 'electrs.zeusln.com',
+            customMempoolInstance: '',
+            stealthMode: false,
+            stealthApp: 'calculator',
+            stealthPinLength: 5,
+            stealthVpnCountry: 'Switzerland',
+            stealthVpnServer: 'Geneva'
+        },
+        pos: {
+            posEnabled: 'disabled',
+            squareEnabled: false,
+            squareAccessToken: '',
+            squareLocationId: '',
+            merchantName: '',
+            confirmationPreference: 'lnOnly',
+            disableTips: false,
+            squareDevMode: false,
+            showKeypad: true,
+            taxPercentage: '',
+            enablePrinter: false,
+            defaultView: 'Products'
+        },
+        invoices: {
+            addressType: '0',
+            memo: '',
+            receiverName: '',
+            expiry: '1',
+            timePeriod: 'Hours',
+            expirySeconds: '3600',
+            routeHints: false,
+            ampInvoice: false,
+            blindedPaths: false,
+            showCustomPreimageField: false,
+            displayAmountOnInvoice: false,
+            defaultInvoiceType: 'lightning'
+        },
+        channels: {
+            min_confs: 1,
+            privateChannel: true,
+            scidAlias: true,
+            simpleTaprootChannel: false
+        },
+        swaps: {
+            hostMainnet: 'https://satsrouting.exchange/v2',
+            hostTestnet: 'https://api.testnet.boltz.exchange/v2',
+            customHost: '',
+            proEnabled: false
+        },
+        bolt12Address: {
+            localPart: ''
+        },
+        ecash: {
+            enableCashu: false,
+            enableMultiMint: false,
+            automaticallySweep: false,
+            sweepThresholdSats: 10000
+        },
+        networking: {
+            disableOfflineCheck: false
+        }
+    };
+
+    describe('MigrationUtils', () => {
+        it('handles empty settings', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations('{}')
+            ).resolves.toEqual({
+                ...defaultSettings
+            });
+        });
+        it('handles mod1', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        requestSimpleTaproot: false,
+                        fiatRatesSource: 'Yadio'
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                fiatRatesSource: 'Yadio'
+            });
+        });
+        it('handles mod2', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        lspMainnet: 'https://lsp-preview.lnolymp.us',
+                        lspTestnet: 'https://testnet-lsp.lnolymp.us'
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings
+            });
+        });
+        it('migrates old default Olympus LSP hosts to zeuslsp.com hosts', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        lspMainnet: 'https://0conf.lnolymp.us',
+                        lspTestnet: 'https://testnet-0conf.lnolymp.us',
+                        lspMutinynet: 'https://mutinynet-flow.lnolymp.us',
+                        lsps1RestMainnet: 'https://lsps1.lnolymp.us',
+                        lsps1RestTestnet: 'https://testnet-lsps1.lnolymp.us',
+                        lsps1RestMutinynet: 'https://mutinynet-lsps1.lnolymp.us'
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                lspMutinynet: 'https://flow.mutinynet.zeuslsp.com',
+                lsps1RestMutinynet: 'https://lsps1.mutinynet.zeuslsp.com'
+            });
+        });
+        it('leaves custom LSP hosts untouched', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        lspMainnet: 'https://my-custom-lsp.com',
+                        lsps1RestMainnet: 'https://my-custom-lsps1.com'
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                lspMainnet: 'https://my-custom-lsp.com',
+                lsps1RestMainnet: 'https://my-custom-lsps1.com'
+            });
+        });
+        it('handles mod3', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        neutrinoPeersMainnet: [
+                            'btcd1.lnolymp.us',
+                            'btcd2.lnolymp.us',
+                            'btcd-mainnet.lightning.computer',
+                            'node.eldamar.icu',
+                            'noad.sathoarder.com'
+                        ]
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings
+            });
+        });
+        it('handles mod7', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        bimodalPathfinding: true
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                bimodalPathfinding: false
+            });
+        });
+        it('handles mod8', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        lightningAddress: {
+                            nostrRelays: [
+                                'wss://nostr.mutinywallet.com',
+                                'wss://relay.damus.io',
+                                'wss://nostr.lnproxy.org'
+                            ],
+                            allowComments: true,
+                            automaticallyAccept: true,
+                            automaticallyAcceptAttestationLevel: 2,
+                            automaticallyRequestOlympusChannels: false,
+                            enabled: false,
+                            mintUrl: '',
+                            nostrPrivateKey: '',
+                            notifications: 0,
+                            routeHints: false,
+                            zapReceiptsEnabled: true
+                        }
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                // The input already has a lightningAddress group (just with
+                // stale nostrRelays), so applyMissingSettingsGroups leaves
+                // it as-is rather than backfilling the later-added
+                // posEnabled field into an existing group
+                lightningAddress: {
+                    ...defaultSettings.lightningAddress,
+                    posEnabled: undefined
+                }
+            });
+        });
+        it('migrates old POS squareEnabled setting to posEnabled', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        pos: {
+                            squareEnabled: true
+                        }
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                pos: {
+                    posEnabled: 'square',
+                    squareEnabled: false
+                }
+            });
+        });
+        it('repairs invoice expiry display fields when out of sync with expirySeconds', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        invoices: {
+                            expiry: '3600',
+                            timePeriod: 'Hours',
+                            expirySeconds: '3600'
+                        }
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                invoices: {
+                    expiry: '1',
+                    timePeriod: 'Hours',
+                    expirySeconds: '3600'
+                }
+            });
+        });
+        it('backfills expirySeconds + timePeriod on pre-Feb-2024 installs with only `expiry: 3600`', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        invoices: {
+                            expiry: '3600'
+                        }
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                invoices: {
+                    expiry: '1',
+                    timePeriod: 'Hours',
+                    expirySeconds: '3600'
+                }
+            });
+        });
+        it('leaves consistent invoice expiry settings untouched', async () => {
+            await expect(
+                MigrationUtils.legacySettingsMigrations(
+                    JSON.stringify({
+                        invoices: {
+                            expiry: '2',
+                            timePeriod: 'Hours',
+                            expirySeconds: '7200'
+                        }
+                    })
+                )
+            ).resolves.toEqual({
+                ...defaultSettings,
+                invoices: {
+                    expiry: '2',
+                    timePeriod: 'Hours',
+                    expirySeconds: '7200'
+                }
+            });
+        });
+    });
+
+    describe('applySwapHostsToBoltz', () => {
+        it('migrates retired ZEUS swap hosts to the current defaults', () => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: 'https://swaps.zeuslsp.com/api/v2',
+                    hostTestnet: 'https://testnet-swaps.zeuslsp.com/api/v2'
+                }
+            };
+
+            expect(MigrationUtils.applySwapHostsToBoltz(settings)).toBe(true);
+            expect(settings.swaps).toEqual({
+                hostMainnet: 'https://satsrouting.exchange/v2',
+                hostTestnet: 'https://api.testnet.boltz.exchange/v2'
+            });
+        });
+
+        it('leaves non-ZEUS hosts untouched', () => {
+            const settings: any = {
+                swaps: { hostMainnet: 'https://my-custom-swaps.com/api' }
+            };
+
+            expect(MigrationUtils.applySwapHostsToBoltz(settings)).toBe(false);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://my-custom-swaps.com/api'
+            );
+        });
+
+        it('is a no-op without a swaps block', () => {
+            const settings: any = {};
+
+            expect(MigrationUtils.applySwapHostsToBoltz(settings)).toBe(false);
+            expect(settings).toEqual({});
+        });
+    });
+
+    describe('applyRetiredSwapHosts', () => {
+        it('moves a shut-down provider back to the default mainnet host', () => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: 'https://boltz-api.eldamar.icu/v2',
+                    hostTestnet: 'https://api.testnet.boltz.exchange/v2',
+                    customHost: '',
+                    proEnabled: false
+                }
+            };
+
+            expect(MigrationUtils.applyRetiredSwapHosts(settings)).toBe(true);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(settings.swaps.hostTestnet).toBe(
+                'https://api.testnet.boltz.exchange/v2'
+            );
+        });
+
+        it.each([
+            ['Boltz', 'https://api.boltz.exchange/v2'],
+            ['SwapMarket', 'https://api.middle-way.space/v2']
+        ])('moves %s off when given the v2 list', (_name, host) => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: host,
+                    hostTestnet: 'https://api.testnet.boltz.exchange/v2'
+                }
+            };
+
+            expect(
+                MigrationUtils.applyRetiredSwapHosts(settings, [
+                    'https://api.boltz.exchange/v2',
+                    'https://api.middle-way.space/v2'
+                ])
+            ).toBe(true);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            // the testnet Boltz host is a different URL and is never retired
+            expect(settings.swaps.hostTestnet).toBe(
+                'https://api.testnet.boltz.exchange/v2'
+            );
+        });
+
+        it('keeps each version list to its own hosts', () => {
+            // the default (v1) list must not reach the v2 retirements,
+            // or the v1 block would re-apply them to unstamped blobs
+            const onBoltz: any = {
+                swaps: { hostMainnet: 'https://api.boltz.exchange/v2' }
+            };
+            expect(MigrationUtils.applyRetiredSwapHosts(onBoltz)).toBe(false);
+            expect(onBoltz.swaps.hostMainnet).toBe(
+                'https://api.boltz.exchange/v2'
+            );
+
+            // and the v2 list must not reach Eldamar, or the v2 block would
+            // re-apply the v1 retirement to blobs already stamped at 1
+            const onEldamar: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+            expect(
+                MigrationUtils.applyRetiredSwapHosts(onEldamar, [
+                    'https://api.boltz.exchange/v2',
+                    'https://api.middle-way.space/v2'
+                ])
+            ).toBe(false);
+            expect(onEldamar.swaps.hostMainnet).toBe(
+                'https://boltz-api.eldamar.icu/v2'
+            );
+        });
+
+        it('leaves proEnabled alone, which is shared with the testnet host', () => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: 'https://api.boltz.exchange/v2',
+                    hostTestnet: 'Custom',
+                    customHost: 'https://my-boltz.local/v2',
+                    proEnabled: true
+                }
+            };
+
+            MigrationUtils.applyRetiredSwapHosts(settings, [
+                'https://api.boltz.exchange/v2'
+            ]);
+
+            expect(settings.swaps.proEnabled).toBe(true);
+        });
+
+        it('leaves a custom host pointed at a retired provider alone', () => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: 'Custom',
+                    customHost: 'https://boltz-api.eldamar.icu/v2',
+                    proEnabled: false
+                }
+            };
+
+            expect(MigrationUtils.applyRetiredSwapHosts(settings)).toBe(false);
+            expect(settings.swaps.hostMainnet).toBe('Custom');
+            expect(settings.swaps.customHost).toBe(
+                'https://boltz-api.eldamar.icu/v2'
+            );
+        });
+
+        it('leaves still-operating providers untouched', () => {
+            const settings: any = {
+                swaps: {
+                    hostMainnet: 'https://swap.coinos.io/v2',
+                    proEnabled: false
+                }
+            };
+
+            expect(MigrationUtils.applyRetiredSwapHosts(settings)).toBe(false);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://swap.coinos.io/v2'
+            );
+        });
+
+        it('is a no-op without a swaps block', () => {
+            const settings: any = {};
+
+            expect(MigrationUtils.applyRetiredSwapHosts(settings)).toBe(false);
+            expect(settings).toEqual({});
+        });
+    });
+
+    describe('applyRetiredThemes', () => {
+        it.each(['junkie', 'bpm', 'desert', 'mint', 'watermelon'])(
+            'moves %s to the default theme',
+            (theme) => {
+                const settings: any = {
+                    display: {
+                        theme,
+                        defaultView: 'Keypad',
+                        displayNickname: true
+                    }
+                };
+
+                expect(MigrationUtils.applyRetiredThemes(settings)).toBe(true);
+                expect(settings.display.theme).toBe('kyriaki');
+                // the rest of the display group is left as it was
+                expect(settings.display.defaultView).toBe('Keypad');
+                expect(settings.display.displayNickname).toBe(true);
+            }
+        );
+
+        it('leaves themes that still exist alone', () => {
+            const settings: any = { display: { theme: 'blueberry' } };
+
+            expect(MigrationUtils.applyRetiredThemes(settings)).toBe(false);
+            expect(settings.display.theme).toBe('blueberry');
+        });
+
+        it('ignores blobs without a display group or theme', () => {
+            expect(MigrationUtils.applyRetiredThemes({})).toBe(false);
+
+            const noTheme: any = { display: { defaultView: 'Balance' } };
+            expect(MigrationUtils.applyRetiredThemes(noTheme)).toBe(false);
+            expect(noTheme.display).toEqual({ defaultView: 'Balance' });
+        });
+    });
+
+    describe('applyInvoiceExpiryDisplay', () => {
+        it('repairs expiry display fields when out of sync with expirySeconds', () => {
+            const settings: any = {
+                invoices: {
+                    expiry: '3600',
+                    timePeriod: 'Hours',
+                    expirySeconds: '3600'
+                }
+            };
+
+            expect(MigrationUtils.applyInvoiceExpiryDisplay(settings)).toBe(
+                true
+            );
+            expect(settings.invoices).toEqual({
+                expiry: '1',
+                timePeriod: 'Hours',
+                expirySeconds: '3600'
+            });
+        });
+
+        it('backfills expirySeconds + timePeriod on pre-Feb-2024 installs with only `expiry: 3600`', () => {
+            const settings: any = { invoices: { expiry: '3600' } };
+
+            expect(MigrationUtils.applyInvoiceExpiryDisplay(settings)).toBe(
+                true
+            );
+            expect(settings.invoices).toEqual({
+                expiry: '1',
+                timePeriod: 'Hours',
+                expirySeconds: '3600'
+            });
+        });
+
+        it('backfills missing expirySeconds when expiry + timePeriod are valid', () => {
+            const settings: any = {
+                invoices: { expiry: '2', timePeriod: 'Hours' }
+            };
+
+            expect(MigrationUtils.applyInvoiceExpiryDisplay(settings)).toBe(
+                true
+            );
+            expect(settings.invoices).toEqual({
+                expiry: '2',
+                timePeriod: 'Hours',
+                expirySeconds: '7200'
+            });
+        });
+
+        it('leaves consistent settings untouched', () => {
+            const settings: any = {
+                invoices: {
+                    expiry: '2',
+                    timePeriod: 'Hours',
+                    expirySeconds: '7200'
+                }
+            };
+
+            expect(MigrationUtils.applyInvoiceExpiryDisplay(settings)).toBe(
+                false
+            );
+            expect(settings.invoices).toEqual({
+                expiry: '2',
+                timePeriod: 'Hours',
+                expirySeconds: '7200'
+            });
+        });
+
+        it('is a no-op without an invoices block', () => {
+            expect(MigrationUtils.applyInvoiceExpiryDisplay({})).toBe(false);
+        });
+    });
+
+    describe('applyOlympusHostsToZeusLsp', () => {
+        it('rewrites all six old default hosts', () => {
+            const settings: any = {
+                lspMainnet: 'https://0conf.lnolymp.us',
+                lspTestnet: 'https://testnet-0conf.lnolymp.us',
+                lspMutinynet: 'https://mutinynet-flow.lnolymp.us',
+                lsps1RestMainnet: 'https://lsps1.lnolymp.us',
+                lsps1RestTestnet: 'https://testnet-lsps1.lnolymp.us',
+                lsps1RestMutinynet: 'https://mutinynet-lsps1.lnolymp.us'
+            };
+
+            expect(MigrationUtils.applyOlympusHostsToZeusLsp(settings)).toBe(
+                true
+            );
+            expect(settings).toEqual({
+                lspMainnet: 'https://flow.zeuslsp.com',
+                lspTestnet: 'https://flow.testnet.zeuslsp.com',
+                lspMutinynet: 'https://flow.mutinynet.zeuslsp.com',
+                lsps1RestMainnet: 'https://lsps1.zeuslsp.com',
+                lsps1RestTestnet: 'https://lsps1.testnet.zeuslsp.com',
+                lsps1RestMutinynet: 'https://lsps1.mutinynet.zeuslsp.com'
+            });
+        });
+
+        it('leaves custom hosts untouched', () => {
+            const settings: any = {
+                lspMainnet: 'https://my-custom-lsp.com',
+                lsps1RestMainnet: 'https://my-custom-lsps1.com'
+            };
+
+            expect(MigrationUtils.applyOlympusHostsToZeusLsp(settings)).toBe(
+                false
+            );
+            expect(settings).toEqual({
+                lspMainnet: 'https://my-custom-lsp.com',
+                lsps1RestMainnet: 'https://my-custom-lsps1.com'
+            });
+        });
+
+        it('leaves unset hosts unset so runtime falls back to new defaults', () => {
+            const settings: any = {};
+
+            expect(MigrationUtils.applyOlympusHostsToZeusLsp(settings)).toBe(
+                false
+            );
+            expect(settings).toEqual({});
+        });
+    });
+
+    describe('applyRgsDefaultsToV2', () => {
+        it('rewrites both v1 default endpoints on mainnet nodes', () => {
+            const settings: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'mainnet',
+                        ldkRgsServer: 'https://rgs.zeusln.com/snapshot'
+                    },
+                    {
+                        implementation: 'ldk-node',
+                        // ldkNetwork unset counts as mainnet
+                        ldkRgsServer:
+                            'https://rapidsync.lightningdevkit.org/snapshot'
+                    }
+                ]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(true);
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://rgs.zeusln.com/snapshot/v2'
+            );
+            expect(settings.nodes[1].ldkRgsServer).toBe(
+                'https://rapidsync.lightningdevkit.org/snapshot/v2'
+            );
+        });
+
+        it('rewrites the v1 testnet default on testnet nodes', () => {
+            const settings: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'testnet',
+                        ldkRgsServer:
+                            'https://rapidsync.lightningdevkit.org/testnet/snapshot'
+                    }
+                ]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(true);
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://rapidsync.lightningdevkit.org/testnet/v2/snapshot'
+            );
+        });
+
+        it('does not apply mappings across networks', () => {
+            const settings: any = {
+                nodes: [
+                    {
+                        // mainnet URL on a testnet node: misconfigured
+                        // either way, not this migration's to fix
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'testnet',
+                        ldkRgsServer: 'https://rgs.zeusln.com/snapshot'
+                    },
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'mainnet',
+                        ldkRgsServer:
+                            'https://rapidsync.lightningdevkit.org/testnet/snapshot'
+                    }
+                ]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(false);
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://rgs.zeusln.com/snapshot'
+            );
+            expect(settings.nodes[1].ldkRgsServer).toBe(
+                'https://rapidsync.lightningdevkit.org/testnet/snapshot'
+            );
+        });
+
+        it('leaves custom URLs untouched', () => {
+            const settings: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'mainnet',
+                        ldkRgsServer: 'https://my-custom-rgs.com/snapshot'
+                    }
+                ]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(false);
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://my-custom-rgs.com/snapshot'
+            );
+        });
+
+        it('leaves unset values unset so runtime falls back to new defaults', () => {
+            const settings: any = {
+                nodes: [{ implementation: 'ldk-node', ldkNetwork: 'mainnet' }]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(false);
+            expect(settings.nodes[0].ldkRgsServer).toBeUndefined();
+        });
+
+        it('is idempotent', () => {
+            const settings: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkRgsServer: 'https://rgs.zeusln.com/snapshot'
+                    }
+                ]
+            };
+
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(true);
+            expect(MigrationUtils.applyRgsDefaultsToV2(settings)).toBe(false);
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://rgs.zeusln.com/snapshot/v2'
+            );
+        });
+
+        it('is a no-op without nodes', () => {
+            expect(MigrationUtils.applyRgsDefaultsToV2({})).toBe(false);
+        });
+    });
+
+    // #4776: SettingsStore.getSettings replaces the in-memory settings
+    // with whatever was stored, so a top-level group added to
+    // DEFAULT_SETTINGS after an install last wrote its blob is missing
+    // from `settings` entirely, and any unguarded nested read of it
+    // (settings.ecash.enableCashu, as #4763 hit) crashes.
+    describe('applyMissingSettingsGroups', () => {
+        it('backfills every missing top-level group from DEFAULT_SETTINGS', () => {
+            const settings: any = { settingsVersion: SETTINGS_VERSION };
+
+            const changed = MigrationUtils.applyMissingSettingsGroups(settings);
+
+            expect(changed).toBe(true);
+            expect(settings.ecash).toEqual(DEFAULT_SETTINGS.ecash);
+            expect(settings.networking).toEqual(DEFAULT_SETTINGS.networking);
+            // privacy is overridden — see the dedicated test below
+            expect(settings.pos).toEqual(DEFAULT_SETTINGS.pos);
+            expect(settings.invoices).toEqual(DEFAULT_SETTINGS.invoices);
+            expect(settings.channels).toEqual(DEFAULT_SETTINGS.channels);
+            expect(settings.swaps).toEqual(DEFAULT_SETTINGS.swaps);
+            expect(settings.bolt12Address).toEqual(
+                DEFAULT_SETTINGS.bolt12Address
+            );
+            expect(settings.lightningAddress).toEqual(
+                DEFAULT_SETTINGS.lightningAddress
+            );
+            expect(settings.display).toEqual(DEFAULT_SETTINGS.display);
+            expect(settings.payments).toEqual(DEFAULT_SETTINGS.payments);
+        });
+
+        // clipboard/enableMempoolRates default to true for a fresh install,
+        // but existing read sites (OpenChannel.tsx, WalletConfiguration.tsx,
+        // SeedRecovery.tsx, Send.tsx, WalletHeader.tsx, ChoosePaymentMethod.tsx)
+        // guard on `settings.privacy && settings.privacy.<field>`, so an
+        // absent privacy group already reads as both fields off. Backfilling
+        // the literal DEFAULT_SETTINGS value would flip that on for an
+        // install that never opted in.
+        //
+        // Onboarding/RecommendedSettings.tsx and Onboarding/WalletSettings.tsx
+        // read `settings.privacy?.clipboard ?? true`, so an absent group
+        // currently prefills that screen's clipboard toggle as on; with the
+        // override it prefills off instead. The user sees and can change the
+        // toggle before it's saved, so this is a prefill difference, not a
+        // silent setting change.
+        it('overrides clipboard and enableMempoolRates to false when backfilling privacy', () => {
+            const settings: any = { settingsVersion: SETTINGS_VERSION };
+
+            MigrationUtils.applyMissingSettingsGroups(settings);
+
+            expect(settings.privacy).toEqual({
+                ...DEFAULT_SETTINGS.privacy,
+                clipboard: false,
+                enableMempoolRates: false
+            });
+            // the override didn't mutate the shared default
+            expect(DEFAULT_SETTINGS.privacy.clipboard).toBe(true);
+            expect(DEFAULT_SETTINGS.privacy.enableMempoolRates).toBe(true);
+        });
+
+        it('leaves an existing privacy group untouched, override included', () => {
+            const settings: any = {
+                settingsVersion: SETTINGS_VERSION,
+                privacy: { clipboard: true } // a real, deliberate user choice
+            };
+
+            MigrationUtils.applyMissingSettingsGroups(settings);
+
+            expect(settings.privacy).toEqual({ clipboard: true });
+        });
+
+        it('never touches a group that already exists, even partially', () => {
+            const settings: any = {
+                settingsVersion: SETTINGS_VERSION,
+                ecash: { enableCashu: true } // real user data, missing fields
+            };
+
+            const changed = MigrationUtils.applyMissingSettingsGroups(settings);
+
+            // other groups were still missing
+            expect(changed).toBe(true);
+            // the partial group is untouched, not merged with the default
+            expect(settings.ecash).toEqual({ enableCashu: true });
+        });
+
+        it('is a no-op once every group is present', () => {
+            const settings: any = { ...DEFAULT_SETTINGS };
+
+            expect(MigrationUtils.applyMissingSettingsGroups(settings)).toBe(
+                false
+            );
+        });
+
+        it('leaves scalar and array defaults alone', () => {
+            // settingsVersion (number), neutrinoPeersMainnet (array):
+            // backfilling these is out of scope, and out of the crash
+            // class this closes — a missing scalar or array does not throw
+            // on read the way `settings.group.field` does when `group`
+            // itself is undefined
+            const settings: any = {};
+
+            MigrationUtils.applyMissingSettingsGroups(settings);
+
+            expect(settings.settingsVersion).toBeUndefined();
+            expect(settings.neutrinoPeersMainnet).toBeUndefined();
+        });
+
+        it('does not alias DEFAULT_SETTINGS: mutating a backfilled group leaves the default untouched', () => {
+            const settings: any = { settingsVersion: SETTINGS_VERSION };
+            MigrationUtils.applyMissingSettingsGroups(settings);
+
+            settings.ecash.enableCashu = true;
+
+            expect(DEFAULT_SETTINGS.ecash.enableCashu).toBe(false);
+        });
+
+        // A version-gated migration in applySettingsMigrations must see
+        // the blob as the install actually had it, not a group this
+        // function has already defaulted — a future migration guarded on
+        // a group being absent (building it from older flat keys, the
+        // way applyInvoiceExpiryDisplay's `if (!invoices) return false`
+        // is shaped) would otherwise find the group already present and
+        // skip, discarding the user's legacy values. Both entry points
+        // must therefore run applySettingsMigrations first.
+        it('runs after applySettingsMigrations on both the legacy and queued paths', async () => {
+            const calls: string[] = [];
+            const applySettingsMigrationsSpy = jest
+                .spyOn(MigrationUtils, 'applySettingsMigrations')
+                .mockImplementation(async () => {
+                    calls.push('applySettingsMigrations');
+                    return false;
+                });
+            const applyMissingSettingsGroupsSpy = jest
+                .spyOn(MigrationUtils, 'applyMissingSettingsGroups')
+                .mockImplementation(() => {
+                    calls.push('applyMissingSettingsGroups');
+                    return false;
+                });
+
+            try {
+                await MigrationUtils.legacySettingsMigrations('{}');
+                expect(calls).toEqual([
+                    'applySettingsMigrations',
+                    'applyMissingSettingsGroups'
+                ]);
+
+                calls.length = 0;
+                const EncryptedStorage = require('react-native-encrypted-storage');
+                EncryptedStorage.getItem.mockResolvedValue(null);
+                await MigrationUtils.runSettingsMigrations({}, true);
+                expect(calls).toEqual([
+                    'applySettingsMigrations',
+                    'applyMissingSettingsGroups'
+                ]);
+            } finally {
+                applySettingsMigrationsSpy.mockRestore();
+                applyMissingSettingsGroupsSpy.mockRestore();
+            }
+        });
+    });
+
+    describe('hasMissingSettingsGroups', () => {
+        it('is true when a group is absent and false once backfilled', () => {
+            const settings: any = { settingsVersion: SETTINGS_VERSION };
+
+            expect(MigrationUtils.hasMissingSettingsGroups(settings)).toBe(
+                true
+            );
+
+            MigrationUtils.applyMissingSettingsGroups(settings);
+
+            expect(MigrationUtils.hasMissingSettingsGroups(settings)).toBe(
+                false
+            );
+        });
+
+        it('is false for a blob with every group present', () => {
+            expect(
+                MigrationUtils.hasMissingSettingsGroups({
+                    ...DEFAULT_SETTINGS
+                })
+            ).toBe(false);
+        });
+    });
+
+    describe('runSettingsMigrations', () => {
+        const EncryptedStorage = require('react-native-encrypted-storage');
+        const { settingsStore } = require('../stores/Stores');
+
+        beforeEach(() => {
+            EncryptedStorage.getItem.mockReset();
+            EncryptedStorage.setItem.mockReset();
+            settingsStore.setSettings.mockReset();
+            settingsStore.updateSettings.mockReset();
+        });
+
+        afterEach(() => {
+            settingsStore.settingsUpdateInProgress = false;
+        });
+
+        it('skips everything when the blob is already stamped and has every group', async () => {
+            // a real modern blob: every group DEFAULT_SETTINGS defines is
+            // present, so there is truly nothing left to do
+            const settings: any = {
+                ...DEFAULT_SETTINGS,
+                lspMainnet: 'https://0conf.lnolymp.us'
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings);
+
+            expect(settings.lspMainnet).toBe('https://0conf.lnolymp.us');
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+            expect(settingsStore.updateSettings).not.toHaveBeenCalled();
+        });
+
+        // #4776: a blob stamped at the current version is not necessarily
+        // complete — it can predate a group's addition to DEFAULT_SETTINGS
+        // and never have written to it since. Unlike every other case in
+        // this file, the version gate alone must not skip the write.
+        it('still enqueues a write when a stamped blob is missing a group', async () => {
+            const settings: any = {
+                settingsVersion: SETTINGS_VERSION,
+                lspMainnet: 'https://0conf.lnolymp.us'
+                // no `ecash`, `privacy`, etc: an install that migrated
+                // before those groups existed
+            };
+            settingsStore.updateSettings.mockImplementation(
+                async () =>
+                    await MigrationUtils.runSettingsMigrations(settings, true)
+            );
+
+            const result = await MigrationUtils.runSettingsMigrations(settings);
+
+            expect(settingsStore.updateSettings).toHaveBeenCalledWith({});
+            // the missing groups are filled from DEFAULT_SETTINGS
+            expect(result.ecash).toEqual(DEFAULT_SETTINGS.ecash);
+            expect(result.networking).toEqual(DEFAULT_SETTINGS.networking);
+            // the pre-existing, unrelated field is untouched
+            expect(result.lspMainnet).toBe('https://0conf.lnolymp.us');
+        });
+
+        it('routes the write through the updateSettings queue when outside it', async () => {
+            settingsStore.updateSettings.mockResolvedValue({
+                settingsVersion: SETTINGS_VERSION
+            });
+            const settings: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+
+            const result = await MigrationUtils.runSettingsMigrations(settings);
+
+            expect(settingsStore.updateSettings).toHaveBeenCalledWith({});
+            // the potentially stale snapshot is never written directly,
+            // and its flags are not read; the queued re-entry does both
+            // on fresh state
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(result).toEqual({ settingsVersion: SETTINGS_VERSION });
+        });
+
+        it('enqueues even while an unrelated update is in flight', async () => {
+            // settingsUpdateInProgress only means some update is in
+            // flight somewhere; being on the queue's call stack arrives
+            // as the inQueue parameter. An outside caller during an
+            // unrelated update is exactly when a direct write would
+            // clobber, so it must still enqueue.
+            settingsStore.settingsUpdateInProgress = true;
+            settingsStore.updateSettings.mockResolvedValue({
+                settingsVersion: SETTINGS_VERSION
+            });
+            const stale: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+
+            await MigrationUtils.runSettingsMigrations(stale);
+
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settingsStore.updateSettings).toHaveBeenCalledWith({});
+        });
+
+        it('does not clobber a concurrent update when called outside the queue', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+
+            // snapshot read before a concurrent updateSettings landed
+            const stale: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+            // state as the queue's critical section re-reads it, with
+            // the concurrent update's key present
+            const fresh: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' },
+                supportedBiometryType: 'FaceID'
+            };
+
+            settingsStore.updateSettings.mockImplementation(async () => {
+                // emulate applySettingsUpdate: getSettings re-enters
+                // runSettingsMigrations inside the critical section and
+                // persists the returned object itself
+                return await MigrationUtils.runSettingsMigrations(fresh, true);
+            });
+
+            const result = await MigrationUtils.runSettingsMigrations(stale);
+
+            // neither the stale snapshot nor anything else is written
+            // directly; the queue's critical section owns the persist
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+            // the fresh state is migrated and stamped with the
+            // concurrent update intact
+            expect(result).toBe(fresh);
+            expect(result.supportedBiometryType).toBe('FaceID');
+            expect(result.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(result.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('consolidates an unstamped blob in memory inside the queue, without writing', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            const settings: any = {
+                lspMainnet: 'https://0conf.lnolymp.us',
+                swaps: { hostMainnet: 'https://swaps.zeuslsp.com/api/v2' }
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(settings.lspMainnet).toBe('https://flow.zeuslsp.com');
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+            // applySettingsUpdate persists right after getSettings
+            // returns; a direct write here would be redundant, and
+            // enqueueing would deadlock behind the awaiting task
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+            expect(settingsStore.updateSettings).not.toHaveBeenCalled();
+            // retired per-migration flags are never written again
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+        });
+
+        it('returns the same object so the queue persists the migrated blob', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            const settings: any = {};
+
+            const result = await MigrationUtils.runSettingsMigrations(
+                settings,
+                true
+            );
+
+            expect(result).toBe(settings);
+            expect(result.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('honors retired per-migration flags during consolidation', async () => {
+            EncryptedStorage.getItem.mockImplementation((key: string) =>
+                Promise.resolve(key === 'zeuslsp-hosts-2026' ? 'true' : null)
+            );
+            const settings: any = {
+                lspMainnet: 'https://0conf.lnolymp.us',
+                swaps: { hostMainnet: 'https://swaps.zeuslsp.com/api/v2' }
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            // Olympus host migration already ran on this install, so the
+            // (user-restored) old value must not be rewritten again
+            expect(settings.lspMainnet).toBe('https://0conf.lnolymp.us');
+            // the un-flagged swap migration still applies
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('honors rgs-defaults-v2 but ignores the superseded rgs-default-zeus flag', async () => {
+            // typical existing install: the retired v1 migration already ran
+            // and pinned the v1 ZEUS default — its flag must not gate the v2
+            // rewrite, only rgs-defaults-v2 does
+            EncryptedStorage.getItem.mockImplementation((key: string) =>
+                Promise.resolve(key === 'rgs-default-zeus' ? 'true' : null)
+            );
+            const settings: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'mainnet',
+                        ldkRgsServer: 'https://rgs.zeusln.com/snapshot'
+                    }
+                ]
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(settings.nodes[0].ldkRgsServer).toBe(
+                'https://rgs.zeusln.com/snapshot/v2'
+            );
+
+            EncryptedStorage.getItem.mockImplementation((key: string) =>
+                Promise.resolve(key === 'rgs-defaults-v2' ? 'true' : null)
+            );
+            const flagged: any = {
+                nodes: [
+                    {
+                        implementation: 'ldk-node',
+                        ldkNetwork: 'mainnet',
+                        ldkRgsServer: 'https://rgs.zeusln.com/snapshot'
+                    }
+                ]
+            };
+
+            await MigrationUtils.runSettingsMigrations(flagged, true);
+
+            expect(flagged.nodes[0].ldkRgsServer).toBe(
+                'https://rgs.zeusln.com/snapshot'
+            );
+        });
+
+        it('applies the retired-swap-host rewrite only when its flag is unset', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            const settings: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+
+            EncryptedStorage.getItem.mockImplementation((key: string) =>
+                Promise.resolve(
+                    key === 'swap-hosts-retired-eldamar' ? 'true' : null
+                )
+            );
+            const flagged: any = {
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+
+            await MigrationUtils.runSettingsMigrations(flagged, true);
+
+            // the retirement migration already ran on this install; the
+            // (user-restored) host must not be rewritten again
+            expect(flagged.swaps.hostMainnet).toBe(
+                'https://boltz-api.eldamar.icu/v2'
+            );
+        });
+
+        it.each([
+            ['Boltz', 'https://api.boltz.exchange/v2'],
+            ['SwapMarket', 'https://api.middle-way.space/v2']
+        ])(
+            'retires %s on an unstamped blob even when every v1 flag is set',
+            async (_name, host) => {
+                // a typical existing install: every retired v1 flag is set,
+                // including 'swap-hosts-retired-eldamar'. That flag gates only
+                // the v1 retirement, so it must not hold users on a host that
+                // was retired afterwards.
+                EncryptedStorage.getItem.mockResolvedValue('true');
+                const settings: any = { swaps: { hostMainnet: host } };
+
+                await MigrationUtils.runSettingsMigrations(settings, true);
+
+                expect(settings.swaps.hostMainnet).toBe(
+                    'https://satsrouting.exchange/v2'
+                );
+                expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+            }
+        );
+
+        it('moves an unstamped blob off a retired theme even when every v1 flag is set', async () => {
+            // a typical existing install: every retired v1 flag is set. The
+            // theme retirement came later and is gated by the stamp alone.
+            EncryptedStorage.getItem.mockResolvedValue('true');
+            const settings: any = { display: { theme: 'desert' } };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(settings.display.theme).toBe('kyriaki');
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('stamps even when nothing needed migrating, then goes quiet', async () => {
+            EncryptedStorage.getItem.mockResolvedValue('true');
+            const settings: any = {
+                lspMainnet: 'https://flow.zeuslsp.com'
+            };
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+
+            // second run: stamped, zero storage traffic
+            EncryptedStorage.getItem.mockClear();
+            settingsStore.setSettings.mockClear();
+
+            await MigrationUtils.runSettingsMigrations(settings, true);
+
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settingsStore.setSettings).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('settings version gates', () => {
+        const EncryptedStorage = require('react-native-encrypted-storage');
+
+        beforeEach(() => {
+            EncryptedStorage.getItem.mockReset();
+        });
+
+        it('keeps the highest version gate equal to SETTINGS_VERSION', () => {
+            // Adding a block gated above SETTINGS_VERSION (forgotten
+            // bump) makes it unreachable: stamped blobs short-circuit in
+            // runSettingsMigrations before the gate is consulted. Bumping
+            // without adding a gated block is the same mistake mirrored.
+            // No runtime assertion can see either, so scan the source.
+            const fs = require('fs');
+            const path = require('path');
+            const source = fs.readFileSync(
+                path.join(__dirname, 'MigrationUtils.ts'),
+                'utf8'
+            );
+
+            const gates = Array.from(
+                source.matchAll(/priorVersion < (\d+)/g),
+                (match: any) => Number(match[1])
+            );
+
+            expect(gates.length).toBeGreaterThan(0);
+            expect(Math.max(...gates)).toBe(SETTINGS_VERSION);
+        });
+
+        it('skips the v1 blocks for a blob already stamped at 1', async () => {
+            // Simulates a future SETTINGS_VERSION bump: a v1-stamped blob
+            // re-enters applySettingsMigrations on its way to v2. The v1
+            // blocks must be exactly-once, not merely idempotent: this
+            // user re-created old-default-looking values after stamping,
+            // and no flags exist to protect them (they are never written
+            // under the stamp system).
+            const settings: any = {
+                settingsVersion: 1,
+                lspMainnet: 'https://0conf.lnolymp.us',
+                swaps: { hostMainnet: 'https://boltz-api.eldamar.icu/v2' }
+            };
+
+            const changed = await MigrationUtils.applySettingsMigrations(
+                settings
+            );
+
+            expect(changed).toBe(false);
+            expect(settings.lspMainnet).toBe('https://0conf.lnolymp.us');
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://boltz-api.eldamar.icu/v2'
+            );
+            // the retired-flag reads are skipped along with the blocks
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('applies the v2 retirement to a blob already stamped at 1', async () => {
+            // installs that booted a v1-stamping build skip the v1 blocks
+            // entirely, so the v2 block is the only thing that moves them
+            // off Boltz. It needs no flag: the stamp alone makes it
+            // exactly-once.
+            const settings: any = {
+                settingsVersion: 1,
+                swaps: { hostMainnet: 'https://api.boltz.exchange/v2' }
+            };
+
+            const changed = await MigrationUtils.applySettingsMigrations(
+                settings
+            );
+
+            expect(changed).toBe(true);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://satsrouting.exchange/v2'
+            );
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('skips the v1 and v2 blocks for a blob already stamped at 2', async () => {
+            const settings: any = {
+                settingsVersion: 2,
+                swaps: { hostMainnet: 'https://api.boltz.exchange/v2' }
+            };
+
+            const changed = await MigrationUtils.applySettingsMigrations(
+                settings
+            );
+
+            // a user who deliberately picked Boltz again after stamping,
+            // e.g. once it returns, is not moved off it a second time
+            expect(changed).toBe(false);
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://api.boltz.exchange/v2'
+            );
+        });
+
+        it('applies the v3 theme retirement to a blob already stamped at 2', async () => {
+            // installs that booted v13.2.2 are stamped at 2 and skip the
+            // earlier blocks, so the v3 block alone moves them off a
+            // removed theme, without any flag read
+            const settings: any = {
+                settingsVersion: 2,
+                display: { theme: 'watermelon' },
+                swaps: { hostMainnet: 'https://api.boltz.exchange/v2' }
+            };
+
+            const changed = await MigrationUtils.applySettingsMigrations(
+                settings
+            );
+
+            expect(changed).toBe(true);
+            expect(settings.display.theme).toBe('kyriaki');
+            // the v2 block stays skipped
+            expect(settings.swaps.hostMainnet).toBe(
+                'https://api.boltz.exchange/v2'
+            );
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(settings.settingsVersion).toBe(SETTINGS_VERSION);
+        });
+
+        it('skips every block for a blob already stamped at 3', async () => {
+            const settings: any = {
+                settingsVersion: 3,
+                display: { theme: 'mint' }
+            };
+
+            const changed = await MigrationUtils.applySettingsMigrations(
+                settings
+            );
+
+            // the theme retirement is exactly-once, not merely idempotent
+            expect(changed).toBe(false);
+            expect(settings.display.theme).toBe('mint');
+        });
+    });
+
+    describe('purgeRescueKeyFiles', () => {
+        const RNFS = require('react-native-fs');
+        const EncryptedStorage = require('react-native-encrypted-storage');
+        // Platform.OS is 'ios' under the RN jest preset, so the legacy path
+        // is the Documents dir. The staging path is the cache dir on both.
+        const STAGING_PATH = '/cache/rescue_key.json';
+        const LEGACY_PATH = '/docs/rescue_key.json';
+
+        const stagingUnlinks = () =>
+            RNFS.unlink.mock.calls.filter(
+                (call: any[]) => call[0] === STAGING_PATH
+            );
+
+        beforeEach(() => {
+            RNFS.exists.mockReset().mockResolvedValue(true);
+            RNFS.unlink.mockReset().mockResolvedValue(undefined);
+            EncryptedStorage.getItem.mockReset();
+            EncryptedStorage.setItem.mockReset();
+        });
+
+        it('unlinks the staging file at most once per process', async () => {
+            // getSettings() calls this on every transition to the background
+            // (App.tsx stealth-mode handler), not only at launch. The Android
+            // save dialog backgrounds the app while the staging file still
+            // has to be readable - saveDocuments() copies it only once the
+            // app is back in the foreground - so unlinking on every call
+            // deletes the export source mid-save and fails the export.
+            EncryptedStorage.getItem.mockResolvedValue('true');
+
+            await MigrationUtils.purgeRescueKeyFiles();
+            await MigrationUtils.purgeRescueKeyFiles();
+            await MigrationUtils.purgeRescueKeyFiles();
+
+            expect(stagingUnlinks()).toHaveLength(1);
+        });
+
+        it('purges the legacy shared-storage file once and sets the flag', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+
+            await MigrationUtils.purgeRescueKeyFiles();
+
+            expect(RNFS.unlink).toHaveBeenCalledWith(LEGACY_PATH);
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'rescue-key-file-cleanup',
+                'true'
+            );
+        });
+
+        it('skips the legacy purge when the flag is already set', async () => {
+            EncryptedStorage.getItem.mockResolvedValue('true');
+
+            await MigrationUtils.purgeRescueKeyFiles();
+
+            expect(RNFS.unlink).not.toHaveBeenCalledWith(LEGACY_PATH);
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('migrateCashuSeedVersion', () => {
+        beforeEach(() => {
+            // Clear mock history before each test
+            require('../storage').setItem.mockClear();
+            mockConsoleLog.mockClear();
+            mockConsoleError.mockClear();
+        });
+
+        afterAll(() => {
+            // Restore original console functions
+            mockConsoleLog.mockRestore();
+            mockConsoleError.mockRestore();
+        });
+
+        it('should set seedVersion to "v1" and save to Storage if undefined', async () => {
+            const mockCashuStore: any = {
+                seedVersion: undefined,
+                settingsStore: { implementation: 'embedded-lnd' },
+                getNodeDir: jest.fn().mockReturnValue('testLndDir')
+            };
+
+            await MigrationUtils.migrateCashuSeedVersion(mockCashuStore);
+
+            expect(mockCashuStore.seedVersion).toBe('v1');
+            expect(require('../storage').setItem).toHaveBeenCalledTimes(1);
+            expect(require('../storage').setItem).toHaveBeenCalledWith(
+                'testLndDir-cashu-seed-version',
+                'v1'
+            );
+            expect(mockConsoleLog).toHaveBeenCalledWith(
+                'Migrating Cashu seed version to v1'
+            );
+            expect(mockConsoleLog).toHaveBeenCalledWith(
+                'Cashu seed version migrated and saved as v1.'
+            );
+        });
+
+        it('should not change seedVersion or call Storage.setItem if seedVersion is already "v1"', async () => {
+            const mockCashuStore: any = {
+                seedVersion: 'v1',
+                settingsStore: { implementation: 'embedded-lnd' },
+                getNodeDir: jest.fn().mockReturnValue('testLndDir')
+            };
+
+            await MigrationUtils.migrateCashuSeedVersion(mockCashuStore);
+
+            expect(mockCashuStore.seedVersion).toBe('v1');
+            expect(require('../storage').setItem).not.toHaveBeenCalled();
+            expect(mockConsoleLog).not.toHaveBeenCalledWith(
+                'Migrating Cashu seed version to v1'
+            );
+        });
+
+        it('should not change seedVersion or call Storage.setItem if seedVersion is already defined with another value', async () => {
+            const mockCashuStore: any = {
+                seedVersion: 'v2-bip39',
+                settingsStore: { implementation: 'embedded-lnd' },
+                getNodeDir: jest.fn().mockReturnValue('testLndDir')
+            };
+
+            await MigrationUtils.migrateCashuSeedVersion(mockCashuStore);
+
+            expect(mockCashuStore.seedVersion).toBe('v2-bip39');
+            expect(require('../storage').setItem).not.toHaveBeenCalled();
+        });
+
+        it('should handle errors during Storage.setItem gracefully', async () => {
+            require('../storage').setItem.mockRejectedValueOnce(
+                new Error('Storage failed')
+            );
+            const mockCashuStore: any = {
+                seedVersion: undefined,
+                settingsStore: { implementation: 'embedded-lnd' },
+                getNodeDir: jest.fn().mockReturnValue('testLndDir')
+            };
+
+            await MigrationUtils.migrateCashuSeedVersion(mockCashuStore);
+
+            expect(mockCashuStore.seedVersion).toBe('v1'); // Version is set before storage attempt
+            expect(require('../storage').setItem).toHaveBeenCalledTimes(1);
+            expect(require('../storage').setItem).toHaveBeenCalledWith(
+                'testLndDir-cashu-seed-version',
+                'v1'
+            );
+            expect(mockConsoleError).toHaveBeenCalledWith(
+                'Error saving migrated Cashu seed version:',
+                expect.any(Error)
+            );
+        });
+    });
+
+    // getSettings runs these migrations before every queued settings
+    // write, so a flag that already read 'true' must not cost another
+    // keychain read on the next write (#4903)
+    describe('one-shot flag cache', () => {
+        const EncryptedStorage = require('react-native-encrypted-storage');
+        const { Platform } = require('react-native');
+        const flagReads = (key: string) =>
+            EncryptedStorage.getItem.mock.calls.filter(
+                ([k]: [string]) => k === key
+            ).length;
+
+        beforeEach(() => {
+            EncryptedStorage.getItem.mockReset();
+            EncryptedStorage.setItem.mockReset();
+            Platform.OS = 'ios';
+        });
+
+        it('reads each flag once after it is set', async () => {
+            EncryptedStorage.getItem.mockResolvedValue('true');
+
+            for (let i = 0; i < 3; i++) {
+                await MigrationUtils.keychainDesyncMigration();
+                await MigrationUtils.keychainCloudSyncMigration();
+                await MigrationUtils.purgeRescueKeyFiles();
+            }
+
+            expect(flagReads('keychain-desync-v1')).toBe(1);
+            expect(flagReads('ios-keychain-cloud-sync-migration-v1')).toBe(1);
+            expect(flagReads('rescue-key-file-cleanup')).toBe(1);
+            expect(EncryptedStorage.getItem).toHaveBeenCalledTimes(4);
+        });
+
+        it('keeps reading a flag that is not set', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            // The purge itself fails here; the flag stays unset
+            EncryptedStorage.setItem.mockRejectedValue(new Error('locked'));
+
+            await MigrationUtils.purgeRescueKeyFiles().catch(() => {});
+            await MigrationUtils.purgeRescueKeyFiles().catch(() => {});
+
+            expect(flagReads('rescue-key-file-cleanup')).toBe(2);
+        });
+
+        it('skips the read after the migration sets the flag itself', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            EncryptedStorage.setItem.mockResolvedValue(undefined);
+
+            await MigrationUtils.purgeRescueKeyFiles();
+            await MigrationUtils.purgeRescueKeyFiles();
+
+            expect(flagReads('rescue-key-file-cleanup')).toBe(1);
+        });
+
+        it('reads the flags again after clearConfirmedFlags', async () => {
+            EncryptedStorage.getItem.mockResolvedValue('true');
+
+            await MigrationUtils.purgeRescueKeyFiles();
+            MigrationUtils.clearConfirmedFlags();
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            EncryptedStorage.setItem.mockResolvedValue(undefined);
+            await MigrationUtils.purgeRescueKeyFiles();
+
+            expect(flagReads('rescue-key-file-cleanup')).toBe(2);
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'rescue-key-file-cleanup',
+                'true'
+            );
+        });
+    });
+
+    describe('keychainDesyncMigration', () => {
+        const EncryptedStorage = require('react-native-encrypted-storage');
+        const StorageModule = require('../storage');
+        const { Platform } = require('react-native');
+
+        // The file-level console.error spy is restored by an earlier
+        // describe's afterAll, so this describe needs its own
+        let consoleErrorSpy: jest.SpyInstance;
+
+        beforeEach(() => {
+            EncryptedStorage.getItem.mockReset();
+            EncryptedStorage.setItem.mockReset();
+            StorageModule.getInternetPasswordServers.mockReset();
+            StorageModule.getRawItem.mockReset();
+            StorageModule.setRawLocalItem.mockReset();
+            StorageModule.setRawLocalItem.mockResolvedValue(true);
+            Platform.OS = 'ios';
+            consoleErrorSpy = jest
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+        });
+
+        afterEach(() => {
+            consoleErrorSpy.mockRestore();
+        });
+
+        it('is a no-op off iOS', async () => {
+            Platform.OS = 'android';
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(EncryptedStorage.getItem).not.toHaveBeenCalled();
+            expect(
+                StorageModule.getInternetPasswordServers
+            ).not.toHaveBeenCalled();
+        });
+
+        it('skips entirely when the flag is set', async () => {
+            EncryptedStorage.getItem.mockResolvedValue('true');
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(
+                StorageModule.getInternetPasswordServers
+            ).not.toHaveBeenCalled();
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+        });
+
+        it('copies missing zeus: servers and ignores unprefixed sync entries', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:zeus-settings-v2',
+                'zeus-settings-v2', // unprefixed legacy relic, must be skipped
+                'zeus:zeus-notes-v2'
+            ]);
+            const partitions: Record<string, Record<string, string>> = {
+                sync: {
+                    'zeus:zeus-settings-v2': '{"nodes":[]}',
+                    'zeus:zeus-notes-v2': '["note1"]'
+                },
+                local: {}
+            };
+            StorageModule.getRawItem.mockImplementation(
+                async (server: string, cloudSync: boolean) =>
+                    partitions[cloudSync ? 'sync' : 'local'][server] ?? null
+            );
+            StorageModule.setRawLocalItem.mockImplementation(
+                async (server: string, value: string) => {
+                    partitions.local[server] = value;
+                    return true;
+                }
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(StorageModule.setRawLocalItem).toHaveBeenCalledTimes(2);
+            expect(StorageModule.setRawLocalItem).toHaveBeenCalledWith(
+                'zeus:zeus-settings-v2',
+                '{"nodes":[]}'
+            );
+            expect(StorageModule.setRawLocalItem).toHaveBeenCalledWith(
+                'zeus:zeus-notes-v2',
+                '["note1"]'
+            );
+            // Never asked for the unprefixed relic's value
+            expect(StorageModule.getRawItem).not.toHaveBeenCalledWith(
+                'zeus-settings-v2',
+                expect.anything()
+            );
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'keychain-desync-v1',
+                'true'
+            );
+        });
+
+        it('leaves existing local copies untouched (copy-if-missing)', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:zeus-settings-v2'
+            ]);
+            StorageModule.getRawItem.mockImplementation(
+                async (_server: string, cloudSync: boolean) =>
+                    cloudSync ? '{"stale":true}' : '{"fresh":true}'
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(StorageModule.setRawLocalItem).not.toHaveBeenCalled();
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'keychain-desync-v1',
+                'true'
+            );
+        });
+
+        it('skips empty synchronizable values', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:empty-key'
+            ]);
+            StorageModule.getRawItem.mockImplementation(
+                async (_server: string, cloudSync: boolean) =>
+                    cloudSync ? '' : null
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(StorageModule.setRawLocalItem).not.toHaveBeenCalled();
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'keychain-desync-v1',
+                'true'
+            );
+        });
+
+        it('holds the flag on verify mismatch without throwing', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:zeus-settings-v2'
+            ]);
+            let localWritten: string | null = null;
+            StorageModule.getRawItem.mockImplementation(
+                async (_server: string, cloudSync: boolean) =>
+                    cloudSync ? '{"nodes":[]}' : localWritten
+            );
+            StorageModule.setRawLocalItem.mockImplementation(async () => {
+                localWritten = '{"corrupted"'; // read-back differs from source
+                return true;
+            });
+
+            // Must resolve: a propagated error would abort getSettings
+            // before the blob read and strand the user on onboarding
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+            expect(consoleErrorSpy).toHaveBeenCalledWith(
+                'Keychain desync migration failed for zeus:zeus-settings-v2',
+                expect.objectContaining({
+                    message: expect.stringContaining('verify failed')
+                })
+            );
+        });
+
+        it('contains per-key failures so remaining keys still copy, flag stays unset', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:zeus-contacts',
+                'zeus:zeus-settings-v2',
+                'zeus:zeus-notes-v2'
+            ]);
+            const partitions: Record<string, Record<string, string>> = {
+                sync: {
+                    'zeus:zeus-contacts': '[]',
+                    'zeus:zeus-settings-v2': '{"nodes":[]}',
+                    'zeus:zeus-notes-v2': '["note1"]'
+                },
+                local: {}
+            };
+            StorageModule.getRawItem.mockImplementation(
+                async (server: string, cloudSync: boolean) =>
+                    partitions[cloudSync ? 'sync' : 'local'][server] ?? null
+            );
+            StorageModule.setRawLocalItem.mockImplementation(
+                async (server: string, value: string) => {
+                    if (server === 'zeus:zeus-contacts')
+                        throw new Error('errSecInteractionNotAllowed');
+                    partitions.local[server] = value;
+                    return true;
+                }
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            // Enumeration order is arbitrary, so the first key's failure
+            // must not abort the keys after it
+            expect(partitions.local['zeus:zeus-settings-v2']).toBe(
+                '{"nodes":[]}'
+            );
+            expect(partitions.local['zeus:zeus-notes-v2']).toBe('["note1"]');
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+            expect(consoleErrorSpy).toHaveBeenCalledWith(
+                'Keychain desync migration failed for zeus:zeus-contacts',
+                expect.any(Error)
+            );
+        });
+
+        it('retry after a partial failure copies only the failed key, then flags', async () => {
+            // State left by the previous test's scenario: two keys made it
+            // local, zeus:zeus-contacts did not, and the flag is unset
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([
+                'zeus:zeus-contacts',
+                'zeus:zeus-settings-v2',
+                'zeus:zeus-notes-v2'
+            ]);
+            const partitions: Record<string, Record<string, string>> = {
+                sync: {
+                    'zeus:zeus-contacts': '[]',
+                    'zeus:zeus-settings-v2': '{"nodes":[]}',
+                    'zeus:zeus-notes-v2': '["note1"]'
+                },
+                local: {
+                    'zeus:zeus-settings-v2': '{"nodes":[]}',
+                    'zeus:zeus-notes-v2': '["note1"]'
+                }
+            };
+            StorageModule.getRawItem.mockImplementation(
+                async (server: string, cloudSync: boolean) =>
+                    partitions[cloudSync ? 'sync' : 'local'][server] ?? null
+            );
+            StorageModule.setRawLocalItem.mockImplementation(
+                async (server: string, value: string) => {
+                    partitions.local[server] = value;
+                    return true;
+                }
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(StorageModule.setRawLocalItem).toHaveBeenCalledTimes(1);
+            expect(StorageModule.setRawLocalItem).toHaveBeenCalledWith(
+                'zeus:zeus-contacts',
+                '[]'
+            );
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'keychain-desync-v1',
+                'true'
+            );
+        });
+
+        it('aborts on enumeration failure without setting the flag or throwing', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockRejectedValue(
+                new Error('SecItemCopyMatching failed: -25308')
+            );
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(EncryptedStorage.setItem).not.toHaveBeenCalled();
+        });
+
+        it('sets the flag exactly once after a clean full pass', async () => {
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            StorageModule.getInternetPasswordServers.mockResolvedValue([]);
+
+            await MigrationUtils.keychainDesyncMigration();
+
+            expect(EncryptedStorage.setItem).toHaveBeenCalledTimes(1);
+            expect(EncryptedStorage.setItem).toHaveBeenCalledWith(
+                'keychain-desync-v1',
+                'true'
+            );
+        });
+    });
+    describe('keychainCloudSyncMigration write verification', () => {
+        const Keychain = require('react-native-keychain');
+        const EncryptedStorage = require('react-native-encrypted-storage');
+        const StorageModule = require('../storage');
+        const STORAGE_KEY = 'zeus-settings-v2';
+        const KEYCHAIN_MIGRATION_KEY = 'ios-keychain-cloud-sync-migration-v1';
+        const SETTINGS = '{"nodes":[{"nickname":"fresh"}]}';
+        const OTHER = '{"nodes":[{"nickname":"other"}]}';
+        const CONTACTS = '[{"name":"alice"}]';
+        // Two legacy keys, not one: with a single key, a verification that
+        // reads back STORAGE_KEY instead of the key it just wrote is
+        // indistinguishable from a correct one.
+        const LEGACY: Record<string, string> = {
+            [STORAGE_KEY]: SETTINGS,
+            'zeus-contacts-v2': CONTACTS
+        };
+
+        // The file-level console spies are restored by an earlier describe's
+        // afterAll, so this describe needs its own
+        let consoleErrorSpy: jest.SpyInstance;
+        let consoleLogSpy: jest.SpyInstance;
+
+        beforeEach(() => {
+            jest.clearAllMocks();
+            consoleErrorSpy = jest
+                .spyOn(console, 'error')
+                .mockImplementation(() => {});
+            consoleLogSpy = jest
+                .spyOn(console, 'log')
+                .mockImplementation(() => {});
+            // Not yet migrated, and the Cashu pass has nothing to do.
+            EncryptedStorage.getItem.mockResolvedValue(null);
+            EncryptedStorage.setItem.mockResolvedValue(undefined);
+            StorageModule.setItem.mockResolvedValue(true);
+            // Only STORAGE_KEY exists in the old keychain; every other key in
+            // the migration list reads as absent so the pass stays short.
+            Keychain.getInternetCredentials.mockImplementation(
+                async (server: string) =>
+                    LEGACY[server]
+                        ? { username: server, password: LEGACY[server] }
+                        : false
+            );
+        });
+
+        afterEach(() => {
+            consoleErrorSpy.mockRestore();
+            consoleLogSpy.mockRestore();
+        });
+
+        const migratedFlagSet = () =>
+            EncryptedStorage.setItem.mock.calls.some(
+                (c: any[]) => c[0] === KEYCHAIN_MIGRATION_KEY && c[1] === 'true'
+            );
+
+        it('completes when the read-back matches what was written', async () => {
+            // The stub stores what it is given and hands it back, so the
+            // verification compares against the real write rather than a
+            // fixed answer. Reading absent first matters too: migrateKey
+            // returns at step 1 when the new namespace already holds the key,
+            // and would never reach the verification this test covers.
+            const store: Record<string, string> = {};
+            StorageModule.setItem.mockImplementation(
+                async (key: string, value: string) => {
+                    store[key] = value;
+                    return true;
+                }
+            );
+            StorageModule.getItem.mockImplementation(
+                async (key: string) => store[key] ?? false
+            );
+
+            await MigrationUtils.keychainCloudSyncMigration();
+
+            expect(migratedFlagSet()).toBe(true);
+        });
+
+        it('fails verification when the read-back is not what was written', async () => {
+            // setItem reports success, but the key reads back as something
+            // else - another writer landing between step 1 and the read-back.
+            // It cannot be a pre-existing copy: step 1 returns early if the
+            // key already holds anything. A truthiness check passes this and
+            // records the migration as done over a value it did not write.
+            let written = false;
+            StorageModule.setItem.mockImplementation(async () => {
+                written = true;
+                return true;
+            });
+            StorageModule.getItem.mockImplementation(async (key: string) =>
+                key === STORAGE_KEY ? (written ? OTHER : false) : false
+            );
+
+            await MigrationUtils.keychainCloudSyncMigration();
+
+            expect(migratedFlagSet()).toBe(false);
+            expect(consoleErrorSpy).toHaveBeenCalledWith(
+                'Error during keychain cloud sync migration:',
+                expect.objectContaining({
+                    message: expect.stringContaining(
+                        `Verification failed for ${STORAGE_KEY}`
+                    )
+                })
+            );
+        });
+
+        it('still fails verification when the key reads back as absent', async () => {
+            // The case the old truthiness check did catch, kept so the change
+            // is not a trade of one blind spot for another.
+            StorageModule.getItem.mockResolvedValue(false);
+
+            await MigrationUtils.keychainCloudSyncMigration();
+
+            expect(migratedFlagSet()).toBe(false);
+        });
+    });
+});

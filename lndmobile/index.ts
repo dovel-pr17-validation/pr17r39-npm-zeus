@@ -1,0 +1,892 @@
+import { EmitterSubscription, NativeModules } from 'react-native';
+import { sendCommand, sendStreamCommand, decodeStreamResult } from './utils';
+import {
+    isEventForRequest,
+    newStreamRequestId
+} from '../utils/StreamRequestUtils';
+import { lnrpc, routerrpc, invoicesrpc } from './../proto/lightning';
+import Long from 'long';
+
+import Base64Utils from '../utils/Base64Utils';
+import { matchesExpectedPayment } from '../utils/EmbeddedLndPayUtils';
+import { deriveExpectedPaymentHash } from '../utils/LncPayUtils';
+import { localeString } from '../utils/LocaleUtils';
+import {
+    checkLndStreamErrorResponse,
+    LndMobileEventEmitter
+} from '../utils/LndMobileUtils';
+
+import { getChanInfo, listPrivateChannels } from './channel';
+
+const { LndMobile, LndMobileTools } = NativeModules;
+
+// const TLV_KEYSEND = 5482373484;
+// const TLV_WHATSAT_MESSAGE = 34349334;
+
+/**
+ * @throws
+ */
+export const initialize = async (): Promise<{ data: string } | number> => {
+    return await LndMobile.initialize();
+};
+
+export enum ELndMobileStatusCodes {
+    STATUS_SERVICE_BOUND = 1,
+    STATUS_PROCESS_STARTED = 2,
+    STATUS_WALLET_UNLOCKED = 4
+}
+
+export const checkStatus = async (): Promise<ELndMobileStatusCodes> => {
+    return await LndMobile.checkStatus();
+};
+
+/**
+ * @throws
+ * @return string
+ */
+export const writeConfig = async ({
+    config,
+    lndDir
+}: {
+    config: string;
+    lndDir: string;
+}) => {
+    return await LndMobileTools.writeConfig(config, lndDir);
+};
+
+export const subscribeState = async () => {
+    const response = await sendStreamCommand<
+        lnrpc.ISubscribeStateRequest,
+        lnrpc.SubscribeStateRequest
+    >(
+        {
+            request: lnrpc.SubscribeStateRequest,
+            method: 'SubscribeState',
+            options: {}
+        },
+        false
+    );
+    return response;
+};
+
+export const decodeState = (data: string): lnrpc.SubscribeStateResponse => {
+    return decodeStreamResult<lnrpc.SubscribeStateResponse>({
+        response: lnrpc.SubscribeStateResponse,
+        base64Result: data
+    });
+};
+/**
+ * @throws
+ */
+export const stopLnd = async (): Promise<{ data: string }> => {
+    return await LndMobile.stopLnd();
+};
+
+/**
+ * @throws
+ */
+export const startLnd = async ({
+    args,
+    lndDir,
+    isTorEnabled = false,
+    isTestnet = false
+}: {
+    args?: string;
+    lndDir: string;
+    isTorEnabled: boolean;
+    isTestnet: boolean;
+}): Promise<{ data: string }> => {
+    return await LndMobile.startLnd(
+        args || '',
+        lndDir,
+        isTorEnabled,
+        isTestnet
+    );
+};
+
+/**
+ * @throws
+ */
+export const gossipSync = async (
+    serviceUrl: string,
+    lndDir: string = 'lnd',
+    isSqlite: boolean = false
+): Promise<{ data: string }> => {
+    return await LndMobile.gossipSync(serviceUrl, lndDir, isSqlite);
+};
+
+/**
+ * @throws
+ */
+export const cancelGossipSync = async () => {
+    return LndMobile.cancelGossipSync();
+};
+
+export const checkICloudEnabled = async (): Promise<boolean> => {
+    return await LndMobileTools.checkICloudEnabled();
+};
+
+/**
+ * @throws
+ */
+export const checkApplicationSupportExists = async () => {
+    return await LndMobileTools.checkApplicationSupportExists();
+};
+
+/**
+ * @throws
+ */
+export const checkLndFolderExists = async (lndDir: string = 'lnd') => {
+    return await LndMobileTools.checkLndFolderExists(lndDir);
+};
+
+/**
+ * @throws
+ */
+export const createIOSApplicationSupportAndLndDirectories = async (
+    lndDir: string
+) => {
+    return await LndMobileTools.createIOSApplicationSupportAndLndDirectories(
+        lndDir
+    );
+};
+
+/**
+ * @throws
+ */
+export const TEMP_moveLndToApplicationSupport = async () => {
+    return await LndMobileTools.TEMP_moveLndToApplicationSupport();
+};
+
+/**
+ * @throws
+ */
+export const excludeLndICloudBackup = async (lndDir: string) => {
+    return await LndMobileTools.excludeLndICloudBackup(lndDir);
+};
+
+/**
+ * @throws
+ */
+export const connectPeer = async (
+    pubkey: string,
+    host: string,
+    perm?: boolean
+): Promise<lnrpc.ConnectPeerResponse> => {
+    return await sendCommand<
+        lnrpc.IConnectPeerRequest,
+        lnrpc.ConnectPeerRequest,
+        lnrpc.ConnectPeerResponse
+    >({
+        request: lnrpc.ConnectPeerRequest,
+        response: lnrpc.ConnectPeerResponse,
+        method: 'ConnectPeer',
+        options: {
+            addr: lnrpc.LightningAddress.create({
+                host,
+                pubkey
+            }),
+            perm
+        }
+    });
+};
+
+/**
+ * @throws
+ */
+export const sendCustomMessage = async (
+    peer: string,
+    type: number,
+    data: string
+): Promise<lnrpc.SendCustomMessageResponse> => {
+    return await sendCommand<
+        lnrpc.ISendCustomMessageRequest,
+        lnrpc.SendCustomMessageRequest,
+        lnrpc.SendCustomMessageResponse
+    >({
+        request: lnrpc.SendCustomMessageRequest,
+        response: lnrpc.SendCustomMessageResponse,
+        method: 'SendCustomMessage',
+        options: {
+            // @ts-ignore:next-line
+            peer: Base64Utils.hexToBase64(peer),
+            type,
+            // @ts-ignore:next-line
+            data: Base64Utils.hexToBase64(data)
+        }
+    });
+};
+
+/**
+ * @throws
+ */
+export const subscribeCustomMessages = async (): Promise<string> => {
+    const response = await sendStreamCommand<
+        lnrpc.ISubscribeCustomMessagesRequest,
+        lnrpc.SubscribeCustomMessagesRequest
+    >({
+        request: lnrpc.SubscribeCustomMessagesRequest,
+        method: 'SubscribeCustomMessages',
+        options: {}
+    });
+    return response;
+};
+
+export const decodeCustomMessage = (data: string): lnrpc.CustomMessage => {
+    return decodeStreamResult<lnrpc.CustomMessage>({
+        response: lnrpc.CustomMessage,
+        base64Result: data
+    });
+};
+
+/**
+ * @throws
+ */
+export const disconnectPeer = async (
+    pub_key: string
+): Promise<lnrpc.DisconnectPeerResponse> => {
+    const response = await sendCommand<
+        lnrpc.IDisconnectPeerRequest,
+        lnrpc.DisconnectPeerRequest,
+        lnrpc.DisconnectPeerResponse
+    >({
+        request: lnrpc.DisconnectPeerRequest,
+        response: lnrpc.DisconnectPeerResponse,
+        method: 'DisconnectPeer',
+        options: {
+            pub_key
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const getNodeInfo = async (
+    pub_key: string,
+    include_channels: boolean = false
+): Promise<lnrpc.NodeInfo> => {
+    const response = await sendCommand<
+        lnrpc.INodeInfoRequest,
+        lnrpc.NodeInfoRequest,
+        lnrpc.NodeInfo
+    >({
+        request: lnrpc.NodeInfoRequest,
+        response: lnrpc.NodeInfo,
+        method: 'GetNodeInfo',
+        options: {
+            pub_key,
+            include_channels
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const getInfo = async (): Promise<lnrpc.GetInfoResponse> => {
+    const response = await sendCommand<
+        lnrpc.IGetInfoRequest,
+        lnrpc.GetInfoRequest,
+        lnrpc.GetInfoResponse
+    >({
+        request: lnrpc.GetInfoRequest,
+        response: lnrpc.GetInfoResponse,
+        method: 'GetInfo',
+        options: {}
+    });
+    return response;
+};
+
+const forcedTimeout = async (time_ms: number, response: any) => {
+    await new Promise((res) => setTimeout(res, time_ms));
+    return response;
+};
+
+// Sends one RouterSendPaymentV2 request and waits for its terminal event,
+// or for timeout_seconds + 1 with an outcome-unknown result. Every in-flight
+// call shares the stream's events, so each listener skips events tagged with
+// another call's request id, and payment updates for other payment hashes.
+const sendPaymentV2Stream = async (
+    options: routerrpc.ISendPaymentRequest,
+    expectedPaymentHash: string | undefined,
+    timeout_seconds: number
+): Promise<lnrpc.Payment> => {
+    let listener: EmitterSubscription | undefined;
+    const requestId = newStreamRequestId();
+    const call = () =>
+        new Promise<lnrpc.Payment>((resolve, reject) => {
+            listener = LndMobileEventEmitter.addListener(
+                'RouterSendPaymentV2',
+                (e) => {
+                    // other payments' errors and EOFs arrive on the same event
+                    if (!isEventForRequest(e, requestId)) return;
+                    try {
+                        const error = checkLndStreamErrorResponse(
+                            'RouterSendPaymentV2',
+                            e
+                        );
+
+                        if (error === 'EOF') {
+                            return;
+                        } else if (error) {
+                            console.log('Got error from RouterSendPaymentV2', [
+                                error
+                            ]);
+                            listener?.remove();
+                            return reject(error);
+                        }
+
+                        const response = decodeSendPaymentV2Result(e.data);
+                        // a concurrent payment's event: leave it for that
+                        // payment's listener
+                        if (
+                            !matchesExpectedPayment(
+                                expectedPaymentHash,
+                                response
+                            )
+                        ) {
+                            return;
+                        }
+                        listener?.remove();
+                        resolve(response);
+                    } catch (error: any) {
+                        listener?.remove();
+                        reject(error.message || error.toString());
+                    }
+                }
+            );
+
+            sendStreamCommand<
+                routerrpc.ISendPaymentRequest,
+                routerrpc.SendPaymentRequest
+            >(
+                {
+                    request: routerrpc.SendPaymentRequest,
+                    method: 'RouterSendPaymentV2',
+                    options,
+                    requestId
+                },
+                false
+            ).catch((error) => {
+                listener?.remove();
+                reject(error);
+            });
+        });
+
+    try {
+        const result: any = await Promise.race([
+            forcedTimeout((timeout_seconds + 1) * 1000, {
+                payment_error: localeString(
+                    'views.SendingLightning.paymentTimedOut'
+                ),
+                // outcome unknown on the node: lets the caller track the
+                // payment to a terminal state instead of reporting failure
+                payment_timed_out: true,
+                // in-process call: the request reached lnd at dispatch
+                dispatch_deadline_ms: Date.now()
+            }),
+            call()
+        ]);
+
+        return result;
+    } finally {
+        // if the timeout won the race, stop listening so a late event
+        // cannot be mistaken for a different payment's outcome
+        if (listener) listener.remove();
+    }
+};
+
+export const sendPaymentV2Sync = async (
+    sendPaymentReq: any
+): Promise<lnrpc.Payment> => {
+    const {
+        payment_request,
+        amt,
+        fee_limit_sat,
+        last_hop_pubkey,
+        route_hints,
+        dest_custom_records,
+        max_parts,
+        cltv_limit,
+        outgoing_chan_ids,
+        max_shard_size_msat,
+        payment_hash,
+        amp,
+        dest,
+        timeout_seconds
+    } = sendPaymentReq;
+
+    const options: routerrpc.ISendPaymentRequest = {
+        payment_request,
+        no_inflight_updates: true,
+        timeout_seconds,
+        max_parts,
+        fee_limit_sat,
+        route_hints,
+        cltv_limit: cltv_limit || 0,
+        allow_self_payment: true,
+        last_hop_pubkey,
+        outgoing_chan_ids,
+        max_shard_size_msat,
+        dest_custom_records,
+        amt,
+        payment_hash,
+        amp,
+        dest
+    };
+
+    return await sendPaymentV2Stream(
+        options,
+        deriveExpectedPaymentHash({ payment_hash, payment_request, amp }),
+        timeout_seconds
+    );
+};
+
+// TODO error handling
+export const decodeSendPaymentV2Result = (data: string): lnrpc.Payment => {
+    return decodeStreamResult<lnrpc.Payment>({
+        response: lnrpc.Payment,
+        base64Result: data
+    });
+};
+
+export const sendKeysendPaymentV2 = async (
+    request: any
+): Promise<lnrpc.Payment> => {
+    const {
+        dest,
+        amt,
+        dest_custom_records,
+        payment_hash,
+        fee_limit_sat,
+        max_shard_size_msat,
+        max_parts,
+        cltv_limit,
+        amp
+    } = request;
+
+    // the store sends the configured payment timeout; 60 matches its default
+    const timeout_seconds = Number(request.timeout_seconds) || 60;
+
+    const options: routerrpc.ISendPaymentRequest = {
+        dest: Base64Utils.hexToBytes(dest),
+        amt,
+        dest_custom_records,
+        payment_hash,
+        dest_features: [lnrpc.FeatureBit.TLV_ONION_REQ],
+        no_inflight_updates: true,
+        timeout_seconds,
+        max_parts: max_parts || 1,
+        fee_limit_sat,
+        max_shard_size_msat,
+        cltv_limit: cltv_limit || 0,
+        amp
+    };
+
+    return await sendPaymentV2Stream(
+        options,
+        deriveExpectedPaymentHash({ payment_hash, amp }),
+        timeout_seconds
+    );
+};
+
+/**
+ * @throws
+ */
+export const addInvoice = async ({
+    amount,
+    amount_msat,
+    memo,
+    expiry = 3600,
+    is_amp,
+    is_blinded,
+    is_private,
+    preimage,
+    route_hints
+}: {
+    amount?: number;
+    amount_msat?: number;
+    memo: string;
+    expiry: number;
+    is_amp?: boolean;
+    is_blinded?: boolean;
+    is_private?: boolean;
+    preimage?: string;
+    route_hints?: lnrpc.IRouteHint[] | null;
+}): Promise<lnrpc.AddInvoiceResponse> => {
+    const response = await sendCommand<
+        lnrpc.IInvoice,
+        lnrpc.Invoice,
+        lnrpc.AddInvoiceResponse
+    >({
+        request: lnrpc.Invoice,
+        response: lnrpc.AddInvoiceResponse,
+        method: 'AddInvoice',
+        options: {
+            value: amount ? Long.fromValue(amount) : undefined,
+            value_msat: amount_msat ? Long.fromValue(amount_msat) : undefined,
+            memo,
+            expiry: Long.fromValue(expiry),
+            private: is_private,
+            min_hop_hints: is_private ? 6 : 0,
+            is_amp,
+            is_blinded,
+            r_preimage: preimage ? Base64Utils.hexToBytes(preimage) : undefined,
+            route_hints
+        }
+    });
+    return response;
+};
+
+export const getRouteHints = async (): Promise<lnrpc.IRouteHint[]> => {
+    const routeHints: lnrpc.IRouteHint[] = [];
+    const channels = await listPrivateChannels();
+
+    // Follows the code in `addInvoice()` of the lnd project
+    for (const channel of channels.channels) {
+        const chanInfo = await getChanInfo(channel.chan_id!);
+        const remotePubkey = channel.remote_pubkey;
+
+        // TODO check if node is publicly
+        // advertised in the network graph
+        // https://github.com/lightningnetwork/lnd/blob/38b521d87d3fd9cff628e5dc09b764aeabaf011a/channeldb/graph.go#L2141
+
+        let policy: lnrpc.IRoutingPolicy;
+        if (remotePubkey === chanInfo.node1_pub) {
+            policy = chanInfo.node1_policy!;
+        } else {
+            policy = chanInfo.node2_policy!;
+        }
+
+        if (!policy) {
+            continue;
+        }
+
+        let channelId = chanInfo.channel_id;
+        if (channel.peer_scid_alias) {
+            channelId = channel.peer_scid_alias;
+        }
+
+        routeHints.push(
+            lnrpc.RouteHint.create({
+                hop_hints: [
+                    {
+                        node_id: remotePubkey,
+                        chan_id: channelId,
+                        fee_base_msat: policy.fee_base_msat
+                            ? policy.fee_base_msat.toNumber()
+                            : 0,
+                        fee_proportional_millionths: policy.fee_rate_milli_msat
+                            ? policy.fee_rate_milli_msat.toNumber()
+                            : 0,
+                        cltv_expiry_delta: policy.time_lock_delta
+                    }
+                ]
+            })
+        );
+    }
+
+    console.log('our hints', routeHints);
+    return routeHints;
+};
+
+/**
+ * @throws
+ */
+export const cancelInvoice = async (
+    paymentHash: string
+): Promise<invoicesrpc.CancelInvoiceResp> => {
+    const response = await sendCommand<
+        invoicesrpc.ICancelInvoiceMsg,
+        invoicesrpc.CancelInvoiceMsg,
+        invoicesrpc.CancelInvoiceResp
+    >({
+        request: invoicesrpc.CancelInvoiceMsg,
+        response: invoicesrpc.CancelInvoiceResp,
+        method: 'InvoicesCancelInvoice',
+        options: {
+            payment_hash: Base64Utils.hexToBytes(paymentHash)
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const lookupInvoice = async (rHash: string): Promise<lnrpc.Invoice> => {
+    const response = await sendCommand<
+        lnrpc.IPaymentHash,
+        lnrpc.PaymentHash,
+        lnrpc.Invoice
+    >({
+        request: lnrpc.PaymentHash,
+        response: lnrpc.Invoice,
+        method: 'LookupInvoice',
+        options: {
+            r_hash_str: rHash
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const listPeers = async (): Promise<lnrpc.ListPeersResponse> => {
+    const response = await sendCommand<
+        lnrpc.IListPeersRequest,
+        lnrpc.ListPeersRequest,
+        lnrpc.ListPeersResponse
+    >({
+        request: lnrpc.ListPeersRequest,
+        response: lnrpc.ListPeersResponse,
+        method: 'ListPeers',
+        options: {}
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const listPayments = async (params?: {
+    maxPayments?: number;
+    reversed?: boolean;
+    creationDateStart?: number;
+}): Promise<lnrpc.ListPaymentsResponse> => {
+    const response = await sendCommand<
+        lnrpc.IListPaymentsRequest,
+        lnrpc.ListPaymentsRequest,
+        lnrpc.ListPaymentsResponse
+    >({
+        request: lnrpc.ListPaymentsRequest,
+        response: lnrpc.ListPaymentsResponse,
+        method: 'ListPayments',
+        options: {
+            include_incomplete: true,
+            max_payments: Long.fromValue(params?.maxPayments ?? 1000),
+            // without reversed, lnd pages forward from the oldest payment
+            // and never returns those made after the first max_payments
+            reversed: params?.reversed ?? true,
+            ...(params?.creationDateStart && {
+                creation_date_start: Long.fromValue(params.creationDateStart)
+            })
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const queryRoutes = async (
+    pub_key: string,
+    amount?: Long,
+    route_hints?: lnrpc.IRouteHint[]
+): Promise<lnrpc.QueryRoutesResponse> => {
+    const response = await sendCommand<
+        lnrpc.IQueryRoutesRequest,
+        lnrpc.IQueryRoutesRequest,
+        lnrpc.QueryRoutesResponse
+    >({
+        request: lnrpc.QueryRoutesRequest,
+        response: lnrpc.QueryRoutesResponse,
+        method: 'QueryRoutes',
+        options: {
+            pub_key,
+            amt: amount,
+            route_hints
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const decodePayReq = async (bolt11: string): Promise<lnrpc.PayReq> => {
+    const response = await sendCommand<
+        lnrpc.IPayReqString,
+        lnrpc.PayReqString,
+        lnrpc.PayReq
+    >({
+        request: lnrpc.PayReqString,
+        response: lnrpc.PayReq,
+        method: 'DecodePayReq',
+        options: {
+            pay_req: bolt11
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const describeGraph = async (): Promise<lnrpc.ChannelGraph> => {
+    const response = await sendCommand<
+        lnrpc.IChannelGraphRequest,
+        lnrpc.ChannelGraphRequest,
+        lnrpc.ChannelGraph
+    >({
+        request: lnrpc.ChannelGraphRequest,
+        response: lnrpc.ChannelGraph,
+        method: 'DescribeGraph',
+        options: {}
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const getRecoveryInfo =
+    async (): Promise<lnrpc.GetRecoveryInfoResponse> => {
+        const response = await sendCommand<
+            lnrpc.IGetRecoveryInfoRequest,
+            lnrpc.GetRecoveryInfoRequest,
+            lnrpc.GetRecoveryInfoResponse
+        >({
+            request: lnrpc.GetRecoveryInfoRequest,
+            response: lnrpc.GetRecoveryInfoResponse,
+            method: 'GetRecoveryInfo',
+            options: {}
+        });
+        return response;
+    };
+
+/**
+ * @throws
+ */
+export const listUnspent = async ({
+    account = 'default'
+}: {
+    account: string;
+}): Promise<lnrpc.ListUnspentResponse> => {
+    const response = await sendCommand<
+        lnrpc.IListUnspentRequest,
+        lnrpc.ListUnspentRequest,
+        lnrpc.ListUnspentResponse
+    >({
+        request: lnrpc.ListUnspentRequest,
+        response: lnrpc.ListUnspentResponse,
+        method: 'WalletKitListUnspent',
+        options: {
+            account
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const resetMissionControl =
+    async (): Promise<routerrpc.ResetMissionControlResponse> => {
+        const response = await sendCommand<
+            routerrpc.IResetMissionControlRequest,
+            routerrpc.ResetMissionControlRequest,
+            routerrpc.ResetMissionControlResponse
+        >({
+            request: routerrpc.ResetMissionControlRequest,
+            response: routerrpc.ResetMissionControlResponse,
+            method: 'RouterResetMissionControl',
+            options: {}
+        });
+        return response;
+    };
+
+/**
+ * @throws
+ */
+export const getNetworkInfo = async (): Promise<lnrpc.NetworkInfo> => {
+    const response = await sendCommand<
+        lnrpc.INetworkInfoRequest,
+        lnrpc.NetworkInfoRequest,
+        lnrpc.NetworkInfo
+    >({
+        request: lnrpc.NetworkInfoRequest,
+        response: lnrpc.NetworkInfo,
+        method: 'GetNetworkInfo',
+        options: {}
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const listInvoices = async (): Promise<lnrpc.ListInvoiceResponse> => {
+    const response = await sendCommand<
+        lnrpc.IListInvoiceRequest,
+        lnrpc.ListInvoiceRequest,
+        lnrpc.ListInvoiceResponse
+    >({
+        request: lnrpc.ListInvoiceRequest,
+        response: lnrpc.ListInvoiceResponse,
+        method: 'ListInvoices',
+        options: {
+            reversed: true,
+            num_max_invoices: Long.fromValue(1000)
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const fundingStateStep = async ({
+    shim_register,
+    shim_cancel,
+    psbt_verify,
+    psbt_finalize
+}: any): Promise<lnrpc.FundingStateStepResp> => {
+    const response = await sendCommand<
+        lnrpc.IFundingTransitionMsg,
+        lnrpc.FundingTransitionMsg,
+        lnrpc.FundingStateStepResp
+    >({
+        request: lnrpc.FundingTransitionMsg,
+        response: lnrpc.FundingStateStepResp,
+        method: 'FundingStateStep',
+        options: {
+            shim_register,
+            shim_cancel,
+            psbt_verify,
+            psbt_finalize
+        }
+    });
+    return response;
+};
+
+/**
+ * @throws
+ */
+export const subscribeChannelGraph = async (): Promise<string> => {
+    const response = await sendStreamCommand<
+        lnrpc.IGraphTopologySubscription,
+        lnrpc.GraphTopologySubscription
+    >(
+        {
+            request: lnrpc.GraphTopologySubscription,
+            method: 'SubscribeChannelGraph',
+            options: {}
+        },
+        false
+    );
+    return response;
+};
+
+export type IReadLndLogResponse = string[];
+/**
+ * @throws
+ * TODO remove
+ */
+export const readLndLog = async (): Promise<IReadLndLogResponse> => {
+    return [''];
+};

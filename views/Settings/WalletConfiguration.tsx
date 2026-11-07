@@ -1,0 +1,3761 @@
+import * as React from 'react';
+import {
+    Alert,
+    KeyboardAvoidingView,
+    Modal,
+    StyleSheet,
+    Text,
+    View,
+    Image,
+    ScrollView,
+    TouchableOpacity,
+    Platform
+} from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { inject, observer } from 'mobx-react';
+import differenceBy from 'lodash/differenceBy';
+import isEqual from 'lodash/isEqual';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { v4 as uuidv4 } from 'uuid';
+
+import { hash, LNC_STORAGE_KEY } from '../../backends/LNC/credentialStore';
+
+import AddressUtils, { CUSTODIAL_LNDHUBS } from '../../utils/AddressUtils';
+import ConnectionFormatUtils from '../../utils/ConnectionFormatUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+import ValidationUtils from '../../utils/ValidationUtils';
+import { confirmAction } from '../../utils/ActionUtils';
+import { reAuthNavigation } from '../../utils/NavigationUtils';
+
+import Storage from '../../storage';
+
+import Button from '../../components/Button';
+import CollapsedQR from '../../components/CollapsedQR';
+import DropdownSetting from '../../components/DropdownSetting';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import Pill from '../../components/Pill';
+import Screen from '../../components/Screen';
+import {
+    SuccessMessage,
+    ErrorMessage,
+    WarningMessage
+} from '../../components/SuccessErrorMessage';
+import Switch from '../../components/Switch';
+import TextInput from '../../components/TextInput';
+import Accordion from '../../components/Accordion';
+import VssServerPicker, {
+    resolveVssServer,
+    isVssServerValid
+} from '../../components/VssServerPicker';
+import { Row } from '../../components/layout/Row';
+import ShowHideToggle from '../../components/ShowHideToggle';
+
+import BalanceStore from '../../stores/BalanceStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+import NostrWalletConnectStore from '../../stores/NostrWalletConnectStore';
+import SyncStore from '../../stores/SyncStore';
+import SettingsStore, {
+    INTERFACE_KEYS,
+    LNC_MAILBOX_KEYS,
+    EMBEDDED_NODE_NETWORK_KEYS,
+    Settings,
+    Node,
+    Implementations,
+    getLspConfigForNetwork
+} from '../../stores/SettingsStore';
+
+import Scan from '../../assets/images/SVG/Scan.svg';
+import AddIcon from '../../assets/images/SVG/Add.svg';
+
+import { getPhoto } from '../../utils/PhotoUtils';
+import {
+    clearNodeKeychainData,
+    clearCDKDatabase,
+    clearCDKDatabaseForNode,
+    deleteNodeDataDirectoryWithRetry
+} from '../../utils/DataClearUtils';
+import {
+    optimizeNeutrinoPeers,
+    createLndWallet,
+    stopLnd
+} from '../../utils/LndMobileUtils';
+import {
+    createLdkNodeWallet,
+    stopLdkNode,
+    getDefaultEsploraServer,
+    getDefaultRgsServer,
+    DEFAULT_VSS_SERVER,
+    DEFAULT_SCORER_URL,
+    SupportedNetwork
+} from '../../utils/LdkNodeUtils';
+
+interface WalletConfigurationProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    BalanceStore: BalanceStore;
+    ChannelsStore: ChannelsStore;
+    NostrWalletConnectStore: NostrWalletConnectStore;
+    SettingsStore: SettingsStore;
+    SyncStore: SyncStore;
+    route: Route<
+        'WalletConfiguration',
+        {
+            node: Node;
+            index: any;
+            active: boolean;
+            enableTor: boolean;
+            saved: boolean;
+            newEntry: boolean;
+            photo: string;
+        }
+    >;
+}
+
+interface WalletConfigurationState {
+    node: Node | null;
+    nickname: string; //
+    host: string; // lnd
+    port: string; // lnd
+    macaroonHex: string; // lnd
+    rune: string; // CLN-rest
+    lndhubUrl: string; // lndhub
+    username: string | undefined; // lndhub
+    password: string | undefined; // lndhub
+    hidden: boolean;
+    existingAccount: boolean; // lndhub
+    dismissCustodialWarning: boolean;
+    implementation: Implementations;
+    certVerification: boolean;
+    saved: boolean;
+    active: boolean;
+    index: number | null;
+    newEntry: boolean;
+    suggestImport: string;
+    importError: string;
+    showLndHubModal: boolean;
+    showCertModal: boolean;
+    enableTor: boolean;
+    interfaceKeys: Array<any>;
+    photo?: string;
+    // lnc
+    pairingPhrase: string;
+    mailboxServer: string;
+    customMailboxServer?: string;
+    localKey?: string;
+    remoteKey?: string;
+    // embeded lnd
+    seedPhrase?: string[];
+    walletPassword?: string;
+    adminMacaroon?: string;
+    embeddedLndNetwork?: string;
+    lndDir?: string;
+    isSqlite?: boolean;
+    recoveryCipherSeed?: string;
+    channelBackupsBase64?: string;
+    creatingWallet: boolean;
+    errorCreatingWallet: boolean;
+    // embedded ldk node
+    ldkMnemonic?: string;
+    ldkPassphrase?: string;
+    ldkNodeDir?: string;
+    ldkNetwork?: string;
+    ldkSeedWordCount: 12 | 24;
+    ldkEsploraServer?: string;
+    ldkRgsServer?: string;
+    ldkScorerUrl?: string;
+    ldkVssServer?: string;
+    ldkVssServerSelected: string;
+    ldkVssServerCustom: string;
+    ldkNodeInitialized?: boolean;
+    // NWC
+    nostrWalletConnectUrl: string;
+    deletingWallet: boolean;
+    saving: boolean;
+    // Errors
+    lndhubUrlError: boolean;
+    usernameError: boolean;
+    hostError: boolean;
+    runeError: boolean;
+    macaroonHexError: boolean;
+    portError: boolean;
+    customMailboxServerError: boolean;
+    pairingPhraseError: boolean;
+}
+
+const ScanBadge = ({ onPress }: { onPress: () => void }) => (
+    <TouchableOpacity onPress={onPress}>
+        <Scan fill={themeColor('text')} width={30} height={30} />
+    </TouchableOpacity>
+);
+
+@inject(
+    'BalanceStore',
+    'ChannelsStore',
+    'NostrWalletConnectStore',
+    'SettingsStore',
+    'SyncStore'
+)
+@observer
+export default class WalletConfiguration extends React.Component<
+    WalletConfigurationProps,
+    WalletConfigurationState
+> {
+    state: WalletConfigurationState = {
+        node: null,
+        nickname: '',
+        dismissCustodialWarning: false,
+        host: '',
+        port: '',
+        macaroonHex: '',
+        rune: '',
+        saved: false,
+        index: null as number | null,
+        active: false,
+        newEntry: false,
+        implementation: 'ldk-node',
+        certVerification: false,
+        enableTor: false,
+        existingAccount: false,
+        suggestImport: '',
+        importError: '',
+        lndhubUrl: '',
+        showLndHubModal: false,
+        showCertModal: false,
+        username: '',
+        password: '',
+        hidden: true,
+        photo: undefined,
+        // lnc
+        pairingPhrase: '',
+        mailboxServer: 'mailbox.terminal.lightning.today:443',
+        customMailboxServer: '',
+        localKey: '',
+        remoteKey: '',
+        // embedded lnd
+        seedPhrase: [],
+        walletPassword: '',
+        adminMacaroon: '',
+        embeddedLndNetwork: 'mainnet',
+        lndDir: '',
+        isSqlite: false,
+        interfaceKeys: INTERFACE_KEYS,
+        recoveryCipherSeed: '',
+        channelBackupsBase64: '',
+        creatingWallet: false,
+        errorCreatingWallet: false,
+        deletingWallet: false,
+        saving: false,
+        // embedded ldk node
+        ldkMnemonic: '',
+        ldkPassphrase: '',
+        ldkNodeDir: '',
+        ldkNetwork: 'mainnet',
+        ldkSeedWordCount: 12,
+        ldkEsploraServer: '',
+        ldkRgsServer: '',
+        ldkScorerUrl: undefined,
+        ldkVssServer: DEFAULT_VSS_SERVER,
+        ldkVssServerSelected: DEFAULT_VSS_SERVER,
+        ldkVssServerCustom: '',
+        ldkNodeInitialized: false,
+        // NWC
+        nostrWalletConnectUrl: '',
+        // Errors
+        lndhubUrlError: false,
+        usernameError: false,
+        hostError: false,
+        runeError: false,
+        macaroonHexError: false,
+        portError: false,
+        customMailboxServerError: false,
+        pairingPhraseError: false
+    };
+
+    scrollViewRef = React.createRef<ScrollView>();
+
+    // A different interface means a different server, so drop the previous
+    // server's address, credentials and input errors. Fields a form hides
+    // are still saved with the node, and a stale error flag keeps Save
+    // disabled. saved: false shows Save on an existing wallet.
+    //
+    // keepCertVerification (used by the clipboard imports) keeps the
+    // user's Certificate Verification choice instead of the dropdown's
+    // per-interface value, so an import never turns verification off. The
+    // lndhub form forces verification on and hides the switch, so a value
+    // carried to or from lndhub is not the user's and is reset.
+    resetConnection = (
+        implementation: Implementations,
+        {
+            keepCertVerification = false
+        }: { keepCertVerification?: boolean } = {}
+    ) => ({
+        implementation,
+        saved: false,
+        certVerification:
+            keepCertVerification &&
+            implementation !== 'lndhub' &&
+            this.state.implementation !== 'lndhub'
+                ? this.state.certVerification
+                : implementation === 'lndhub',
+        host: '',
+        port: '',
+        macaroonHex: '',
+        rune: '',
+        lndhubUrl: '',
+        username: '',
+        password: '',
+        pairingPhrase: '',
+        customMailboxServer: '',
+        nostrWalletConnectUrl: '',
+        hostError: false,
+        portError: false,
+        macaroonHexError: false,
+        runeError: false,
+        lndhubUrlError: false,
+        usernameError: false,
+        customMailboxServerError: false,
+        pairingPhraseError: false
+    });
+
+    // A port filled in from a saved wallet, a scan or an import is marked
+    // the same way as a typed one, so a disabled Save button has a reason
+    // on screen.
+    isInvalidPort = (port?: string) =>
+        !!port && !ValidationUtils.isValidPort(port);
+
+    importClipboard = () => {
+        const { suggestImport } = this.state;
+
+        if (suggestImport.includes('lndconnect://')) {
+            const { host, port, macaroonHex } =
+                ConnectionFormatUtils.processLndConnectUrl(suggestImport);
+
+            // An lndconnect string describes an LND REST node. A Core
+            // Lightning rune left in the form would be sent to the
+            // imported host.
+            this.setState({
+                ...this.resetConnection('lnd', {
+                    keepCertVerification: true
+                }),
+                host,
+                port,
+                portError: this.isInvalidPort(port),
+                macaroonHex: macaroonHex || '',
+                suggestImport: '',
+                importError: '',
+                enableTor: host.includes('.onion')
+            });
+        } else if (
+            suggestImport.includes('lndhub://') ||
+            suggestImport.includes('bluewallet:')
+        ) {
+            if (!AddressUtils.isValidLNDHubAddress(suggestImport)) {
+                this.setState({
+                    suggestImport: '',
+                    importError: localeString('utils.handleAnything.notValid')
+                });
+                return;
+            }
+
+            try {
+                const { username, password, host } =
+                    AddressUtils.processLNDHubAddress(suggestImport);
+
+                const existingAccount = !!username;
+
+                const stateUpdate: any = {
+                    ...this.resetConnection('lndhub'),
+                    username,
+                    password,
+                    suggestImport: '',
+                    importError: '',
+                    existingAccount,
+                    ...(host && {
+                        lndhubUrl: host,
+                        enableTor: host.includes('.onion')
+                    })
+                };
+                this.setState(stateUpdate);
+            } catch (error) {
+                this.setState({
+                    suggestImport: '',
+                    importError: localeString('utils.handleAnything.notValid')
+                });
+                return;
+            }
+        } else if (
+            suggestImport.includes('clnrest://') ||
+            suggestImport.includes('clnrest+')
+        ) {
+            const {
+                host,
+                rune,
+                port,
+                enableTor,
+                implementation
+            }: {
+                host: string;
+                rune: string;
+                port: string;
+                enableTor: boolean;
+                implementation: Implementations;
+            } = ConnectionFormatUtils.processCLNRestConnectUrl(suggestImport);
+
+            this.setState({
+                ...this.resetConnection(implementation, {
+                    keepCertVerification: true
+                }),
+                host,
+                rune,
+                port,
+                portError: this.isInvalidPort(port),
+                enableTor,
+                suggestImport: '',
+                importError: ''
+            });
+        }
+
+        Clipboard.setString('');
+    };
+
+    clearImportSuggestion = () => {
+        this.setState({
+            suggestImport: '',
+            importError: ''
+        });
+    };
+
+    async componentDidMount() {
+        const { SettingsStore } = this.props;
+        const { settings } = SettingsStore;
+
+        if (settings.privacy && settings.privacy.clipboard) {
+            const clipboard = await Clipboard.getString();
+
+            if (
+                clipboard.includes('lndconnect://') ||
+                clipboard.includes('lndhub://') ||
+                clipboard.includes('bluewallet:') ||
+                clipboard.includes('clnrest://') ||
+                clipboard.includes('clnrest+')
+            ) {
+                this.setState({
+                    suggestImport: clipboard
+                });
+            }
+        }
+
+        await this.initFromProps(this.props);
+
+        const { implementation, pairingPhrase } = this.state;
+        if (implementation === 'lightning-node-connect') {
+            const key = `${LNC_STORAGE_KEY}:${hash(pairingPhrase)}`;
+            const json: any = await Storage.getItem(key);
+            const parsed = JSON.parse(json);
+            if (parsed) {
+                if (parsed.localKey && parsed.remoteKey) {
+                    this.setState({
+                        localKey: parsed.localKey,
+                        remoteKey: parsed.remoteKey
+                    });
+                }
+            }
+        }
+    }
+
+    async componentDidUpdate(prevProps: any) {
+        if (prevProps !== this.props) {
+            await this.initFromProps(this.props);
+        }
+    }
+    componentWillUnmount() {
+        const { SettingsStore } = this.props;
+        SettingsStore.createAccountError = '';
+        SettingsStore.createAccountSuccess = '';
+    }
+
+    async initFromProps(props: WalletConfigurationProps) {
+        const { route } = props;
+
+        // When returning from SetWalletPicture, only update the photo
+        // to avoid overwriting unsaved edits (e.g. nickname) from node
+        if (route.params.photo && !route.params.node) {
+            this.setState({
+                photo: route.params.photo,
+                saved: route.params.saved ?? this.state.saved
+            });
+            return;
+        }
+
+        const node = route.params.node ?? this.state.node;
+        const index = route.params.index ?? this.state.index;
+        const active = route.params.active ?? this.state.active;
+        const tor = route.params.enableTor ?? this.state.enableTor;
+        const saved = route.params.saved ?? this.state.saved;
+        const newEntry = route.params.newEntry ?? this.state.newEntry;
+        const newPhoto = route.params.photo ?? this.state.photo;
+
+        if (node) {
+            const {
+                nickname,
+                dismissCustodialWarning,
+                host,
+                port,
+                macaroonHex,
+                rune,
+                implementation,
+                certVerification,
+                enableTor,
+                photo,
+                // LNDHub
+                lndhubUrl,
+                existingAccount,
+                username,
+                password,
+                // LNC
+                pairingPhrase,
+                mailboxServer,
+                customMailboxServer,
+                // embedded LND
+                seedPhrase,
+                walletPassword,
+                adminMacaroon,
+                embeddedLndNetwork,
+                lndDir,
+                isSqlite,
+                // embedded LDK Node
+                ldkMnemonic,
+                ldkPassphrase,
+                ldkNodeDir,
+                ldkNetwork,
+                ldkEsploraServer,
+                ldkRgsServer,
+                ldkScorerUrl,
+                ldkVssServer,
+                // NWC
+                nostrWalletConnectUrl
+            } = node as any;
+
+            this.setState({
+                node,
+                nickname,
+                dismissCustodialWarning,
+                host,
+                port,
+                portError: this.isInvalidPort(port),
+                macaroonHex,
+                rune,
+                implementation: implementation || 'lnd',
+                certVerification,
+                index,
+                active,
+                saved,
+                newEntry,
+                enableTor: tor || enableTor,
+                photo: newPhoto || photo || '',
+                // LNDHub,
+                lndhubUrl,
+                existingAccount,
+                username,
+                password,
+                // LNC
+                pairingPhrase,
+                mailboxServer,
+                customMailboxServer,
+                // embedded LND
+                seedPhrase,
+                walletPassword,
+                adminMacaroon,
+                embeddedLndNetwork,
+                lndDir,
+                isSqlite,
+                // embedded LDK Node
+                ldkMnemonic,
+                ldkPassphrase,
+                ldkNodeDir,
+                ldkNetwork,
+                ldkEsploraServer,
+                ldkRgsServer,
+                ldkScorerUrl,
+                ldkVssServer,
+                ldkNodeInitialized: !!ldkMnemonic,
+                // NWC
+                nostrWalletConnectUrl
+            });
+        } else {
+            this.setState({
+                index,
+                active,
+                newEntry,
+                photo: newPhoto || ''
+            });
+        }
+    }
+
+    // Returns true when the active implementation would carry node
+    // credentials (macaroon/rune/token) over an explicit http:// scheme to
+    // a host that is neither loopback nor a Tor onion service. A bare host
+    // or an https:// scheme resolves to HTTPS in the backend getURL(), so
+    // only an explicit http:// is treated as insecure. Gated per
+    // implementation because state retains fields some backends never read
+    // (e.g. a stale lndhubUrl on an lnd config, or a stale host on an
+    // lndhub config).
+    private hasInsecureCleartextTransport = (): boolean => {
+        const { implementation, host, lndhubUrl } = this.state;
+        switch (implementation) {
+            case 'lnd':
+            case 'cln-rest':
+                return UrlUtils.isCleartextHttpTransport(host);
+            case 'lndhub':
+                return UrlUtils.isCleartextHttpTransport(lndhubUrl);
+            default:
+                return false;
+        }
+    };
+
+    selectImplementation = (value: Implementations) => {
+        this.setState(this.resetConnection(value));
+    };
+
+    saveWalletConfiguration = (
+        recoveryCipherSeed?: string,
+        newEmbeddedLndWallet?: boolean
+    ) => {
+        if (this.hasInsecureCleartextTransport()) {
+            confirmAction(
+                localeString('general.warning'),
+                localeString(
+                    'views.Settings.WalletConfiguration.cleartextHttpWarning'
+                ),
+                {
+                    text: localeString('general.proceed'),
+                    style: 'destructive',
+                    onPress: () =>
+                        this.performSaveWalletConfiguration(
+                            recoveryCipherSeed,
+                            newEmbeddedLndWallet
+                        )
+                },
+                {
+                    text: localeString('general.cancel'),
+                    onPress: () => void 0,
+                    isPreferred: true
+                }
+            );
+            return;
+        }
+
+        this.performSaveWalletConfiguration(
+            recoveryCipherSeed,
+            newEmbeddedLndWallet
+        );
+    };
+
+    private performSaveWalletConfiguration = (
+        recoveryCipherSeed?: string,
+        newEmbeddedLndWallet?: boolean
+    ) => {
+        const { SettingsStore, NostrWalletConnectStore, navigation } =
+            this.props;
+        const {
+            nickname,
+            dismissCustodialWarning,
+            host,
+            port,
+            enableTor,
+            lndhubUrl,
+            existingAccount,
+            macaroonHex,
+            rune,
+            username,
+            password,
+            implementation,
+            certVerification,
+            index,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer,
+            seedPhrase,
+            walletPassword,
+            adminMacaroon,
+            embeddedLndNetwork,
+            lndDir,
+            isSqlite,
+            nostrWalletConnectUrl,
+            photo,
+            // embedded LDK Node
+            ldkMnemonic,
+            ldkPassphrase,
+            ldkNodeDir,
+            ldkNetwork,
+            ldkEsploraServer,
+            ldkRgsServer,
+            ldkScorerUrl,
+            ldkVssServer
+        } = this.state;
+        const { setConnectingStatus, updateSettings, settings } = SettingsStore;
+
+        if (
+            implementation === 'lndhub' &&
+            (!lndhubUrl || !username || !password)
+        ) {
+            throw new Error('lndhub settings missing.');
+        }
+
+        // Block the action buttons until navigation: a second Save (or a
+        // Delete) firing mid-write would re-persist the stale nodes array.
+        this.setState({ saving: true });
+
+        const node = {
+            nickname,
+            dismissCustodialWarning,
+            host,
+            port,
+            lndhubUrl,
+            existingAccount,
+            macaroonHex,
+            rune,
+            username,
+            password,
+            implementation,
+            certVerification,
+            enableTor,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer,
+            seedPhrase,
+            walletPassword,
+            adminMacaroon,
+            embeddedLndNetwork,
+            lndDir,
+            isSqlite,
+            nostrWalletConnectUrl,
+            photo,
+            // embedded LDK Node
+            ldkMnemonic,
+            ldkPassphrase,
+            ldkNodeDir,
+            ldkNetwork,
+            ldkEsploraServer,
+            ldkRgsServer,
+            ldkScorerUrl,
+            ldkVssServer
+        };
+
+        // Built inside the queued update so a write still in the queue
+        // cannot be undone by a nodes array copied before it landed
+        let originalNode: Node;
+        let otherNodes: Node[] = [];
+        const update = (current: Settings) => {
+            let nodes: Node[];
+            if (current.nodes) {
+                nodes = [...current.nodes];
+                if (index != null) {
+                    originalNode = nodes[index];
+                    otherNodes = nodes.filter((_, i) => i !== index);
+                    nodes[index] = node;
+                } else {
+                    nodes.push(node);
+                }
+            } else {
+                nodes = [node];
+            }
+
+            if (newEmbeddedLndWallet) {
+                return {
+                    nodes,
+                    selectedNode: nodes.length - 1,
+                    // Force Wallet view to restart connection for new wallet
+                    justDeletedWallet: false,
+                    // Ensure Express Graph Sync runs for new wallet
+                    initialLoad: false
+                };
+            }
+            return { nodes };
+        };
+
+        updateSettings(update)
+            .then(async () => {
+                // Keep this wallet's NWC connections matched to its config
+                // when an edit changes the fields its id is derived from.
+                // Best effort, like the deletion cleanup.
+                if (originalNode != null) {
+                    try {
+                        await NostrWalletConnectStore.rekeyWalletConfigConnections(
+                            originalNode,
+                            node,
+                            otherNodes
+                        );
+                    } catch (error) {
+                        console.error('Error updating NWC connections:', error);
+                    }
+                }
+                if (recoveryCipherSeed) {
+                    await updateSettings({
+                        recovery: true
+                    });
+                }
+
+                this.setState({
+                    saved: true
+                });
+
+                const activeNodeIndex = settings.selectedNode || 0;
+                if (index === activeNodeIndex) {
+                    // updating active node
+                    if (originalNode != null) {
+                        const diff = differenceBy(
+                            Object.entries(originalNode),
+                            Object.entries(node),
+                            (entry) => entry[0] + entry[1]
+                        ).filter(
+                            (entry) =>
+                                entry[0] !== 'nickname' && entry[0] !== 'photo'
+                        );
+                        if (diff.length === 0) {
+                            // only nickname or photo was edited - no reconnect necessary
+                            navigation.goBack();
+                            return;
+                        }
+                    }
+                    if (implementation === 'lightning-node-connect') {
+                        // Awaited: the edited wallet's session must be closed
+                        // and its credential writes flushed before the Wallet
+                        // view reinitializes on the same credentials.
+                        await BackendUtils.disconnect();
+                    }
+                    setConnectingStatus(true);
+                    // reset, not popTo: popTo only collapses the stack
+                    // when the target route already exists on it. The
+                    // advanced-setup first-wallet path can reach here
+                    // with no Wallet route on the stack at all (its
+                    // stale root was removed by the reset above), and
+                    // popTo would then just pop-and-push, leaving
+                    // IntroSplash/Menu/Wallets stranded underneath
+                    navigation.reset({
+                        index: 0,
+                        routes: [{ name: 'Wallet' }]
+                    });
+                } else {
+                    if (newEmbeddedLndWallet) {
+                        // New wallet created - trigger fresh connection
+                        // LND was already stopped in createNewWallet(), just navigate
+                        setConnectingStatus(true);
+                        navigation.reset({
+                            index: 0,
+                            routes: [{ name: 'Wallet' }]
+                        });
+                    } else if (this.state.newEntry) {
+                        navigation.navigate('Wallets');
+                    } else {
+                        navigation.goBack();
+                    }
+                }
+            })
+            .catch((error: any) => {
+                console.error('Error saving wallet configuration:', error);
+                this.setState({ saving: false });
+            });
+    };
+
+    copyNodeConfig = () => {
+        const { SettingsStore, navigation } = this.props;
+        const { settings } = SettingsStore;
+        const {
+            nickname,
+            host,
+            port,
+            enableTor,
+            lndhubUrl,
+            existingAccount,
+            macaroonHex,
+            rune,
+            username,
+            password,
+            implementation,
+            certVerification,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer,
+            photo,
+            nostrWalletConnectUrl
+        } = this.state;
+        const { nodes } = settings;
+
+        const node = {
+            nickname: `${nickname} copy`,
+            host,
+            port,
+            lndhubUrl,
+            existingAccount,
+            macaroonHex,
+            rune,
+            username,
+            password,
+            implementation,
+            certVerification,
+            enableTor,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer,
+            photo,
+            nostrWalletConnectUrl
+        };
+
+        navigation.navigate('WalletConfiguration', {
+            node,
+            newEntry: true,
+            active: false,
+            saved: false,
+            index: nodes!.length
+        });
+    };
+
+    deleteNodeConfig = async () => {
+        if (this.state.deletingWallet) return;
+        this.setState({ deletingWallet: true });
+        const { SettingsStore, NostrWalletConnectStore, navigation } =
+            this.props;
+        const { updateSettings, embeddedLndStarted, settings } = SettingsStore;
+        const { index, implementation, lndDir, ldkNodeDir, active } =
+            this.state;
+        const { nodes } = settings;
+        const deletedNode = index != null ? nodes?.[index] : undefined;
+
+        try {
+            // The next wallet takes this one's index without a reconnect.
+            // Two embedded LND, LDK Node or NWC wallets have the same
+            // implementation and no host, so updateNodeProperties sees no
+            // change of target: end the deleted wallet's connection here
+            if (active) SettingsStore.invalidateConnection();
+
+            // Delete the wallet's NWC connections first, so they are no
+            // longer served now or when the same node is added again. The
+            // active wallet's are matched while it is still the current
+            // one; an inactive wallet's by its config.
+            // Best effort: a storage failure here must not block the
+            // deletion, and the last-wallet sweep below removes leftovers.
+            try {
+                if (active) {
+                    await NostrWalletConnectStore.deleteCurrentWalletConnections();
+                } else {
+                    await NostrWalletConnectStore.deleteWalletConfigConnections(
+                        deletedNode,
+                        (nodes || []).filter((_, i) => i !== index)
+                    );
+                }
+            } catch (error) {
+                console.error('Error deleting NWC connections:', error);
+            }
+
+            // If deleting active embedded LND wallet, stop it first
+            if (
+                active &&
+                implementation === 'embedded-lnd' &&
+                embeddedLndStarted
+            ) {
+                try {
+                    console.log(
+                        'Stopping active LND before deletion:',
+                        lndDir || 'lnd'
+                    );
+                    this.props.SyncStore.reset(); // Stop sync loop before stopping LND
+                    await stopLnd();
+                } catch (error) {
+                    console.log('Error stopping LND before deletion:', error);
+                }
+                SettingsStore.embeddedLndStarted = false;
+            }
+
+            // If deleting active LDK Node wallet, stop it first
+            if (active && implementation === 'ldk-node') {
+                await stopLdkNode();
+            }
+
+            // Delete this wallet's per-wallet CDK ecash database first: its
+            // filename embeds a hash of the cashu seed, which
+            // clearNodeKeychainData wipes below.
+            await clearCDKDatabaseForNode(deletedNode);
+
+            // Clear this node's keychain material (Cashu seeds/keys namespaced
+            // by node dir, LNC pairing credentials) so it does not outlive the
+            // wallet. This must happen before updateSettings removes the node
+            // config: the hashed LNC keys can only be reconstructed from the
+            // pairing phrase stored there, so a crash after the config is gone
+            // would orphan them permanently. LNC credentials another config
+            // still points to (a copy of this wallet) are kept.
+            await clearNodeKeychainData(deletedNode, {
+                keepLncCredentials:
+                    !!deletedNode?.pairingPhrase &&
+                    nodes!.some(
+                        (n, i) =>
+                            i !== index &&
+                            n.pairingPhrase === deletedNode.pairingPhrase
+                    )
+            });
+
+            // Update settings first to clear node references before
+            // deleting files — prevents stale references if navigation
+            // triggers a reconnect. The nodes array is computed inside the
+            // serialized update from the freshest persisted settings: the
+            // stops above take seconds, and a functional update is what
+            // keeps a concurrent settings write from either resurrecting
+            // the deleted node or being clobbered by a snapshot taken
+            // before it.
+            const newSettings = await updateSettings(
+                (currentSettings: Settings) => {
+                    const currentNodes = currentSettings.nodes || [];
+                    // Re-locate the wallet at update time: the captured
+                    // index can go stale during the multi-second stops
+                    // above if a concurrent length-changing nodes write
+                    // (e.g. an overlapping deletion of another wallet)
+                    // shifts the array. Matching the captured config keeps
+                    // the removal pinned to the wallet whose data was just
+                    // wiped, never a neighbor that slid into its slot.
+                    const freshIndex = deletedNode
+                        ? currentNodes.findIndex((node) =>
+                              isEqual(node, deletedNode)
+                          )
+                        : index;
+                    if (freshIndex == null || freshIndex === -1) {
+                        // Config already gone (removed concurrently):
+                        // nothing to filter, just flag the deletion
+                        return { justDeletedWallet: active };
+                    }
+                    return {
+                        nodes: currentNodes.filter(
+                            (_: any, i: number) => i !== freshIndex
+                        ),
+                        selectedNode: this.getNewSelectedNodeIndex(
+                            freshIndex,
+                            currentSettings
+                        ),
+                        justDeletedWallet: active
+                    };
+                }
+            );
+            const remainingNodes = newSettings?.nodes || [];
+
+            // Delete wallet data after settings are updated. Retried: the
+            // node may still hold file handles while shutting down, which
+            // clears on its own after a moment.
+            const dirDeleted = await deleteNodeDataDirectoryWithRetry(
+                deletedNode ?? { implementation, lndDir, ldkNodeDir }
+            );
+            if (!dirDeleted) {
+                // Surface the failure instead of navigating away as if the
+                // deletion succeeded: the directory holds wallet and channel
+                // state. The config is already gone, so retrying from the
+                // captured node object is the only remaining path; Skip is
+                // offered so a permanently held file handle cannot strand
+                // the user here. (The duress wipe path never comes through
+                // here and stays silent by design.)
+                await this.promptRetryDataDirDeletion(
+                    deletedNode ?? { implementation, lndDir, ldkNodeDir }
+                );
+            }
+
+            if (remainingNodes.length === 0) {
+                // Last wallet gone: sweep every remaining CDK database file
+                // (legacy shared db, any per-wallet dbs whose seeds are no
+                // longer recoverable, and WAL/SHM sidecars).
+                await clearCDKDatabase();
+                // Also drop NWC connections of wallets deleted while
+                // inactive, which could not be matched to their wallet.
+                // Best effort: the config is already gone, so a failure
+                // here must not keep the user on this screen.
+                try {
+                    await NostrWalletConnectStore.deleteAllConnectionData();
+                } catch (error) {
+                    console.error('Error deleting NWC connection data:', error);
+                }
+                // reset, not navigate/replace: this screen is normally
+                // reached several pushes deep (Menu/Wallets ->
+                // WalletConfiguration), and once its last wallet is
+                // deleted every one of those earlier routes is stale too
+                // - a plain replace only swaps this top entry and leaves
+                // them reachable underneath via swipe-back/hardware back
+                navigation.reset({
+                    index: 0,
+                    routes: [{ name: 'IntroSplash' }]
+                });
+            } else {
+                navigation.popTo('Wallets');
+            }
+        } catch (error) {
+            console.error('Error deleting wallet:', error);
+            this.setState({ deletingWallet: false });
+        }
+    };
+
+    // Alert loop for a node data directory that survived deletion retries.
+    // Resolves once a retry succeeds or the user explicitly skips, so the
+    // caller only navigates on an informed decision, never on silent failure.
+    private promptRetryDataDirDeletion = (node: any): Promise<void> =>
+        new Promise((resolve) => {
+            const prompt = () => {
+                Alert.alert(
+                    localeString('general.error'),
+                    localeString(
+                        'views.Settings.WalletConfiguration.deleteWallet.dataDirError'
+                    ),
+                    [
+                        {
+                            text: localeString('general.retry'),
+                            onPress: async () => {
+                                const dirDeleted =
+                                    await deleteNodeDataDirectoryWithRetry(
+                                        node
+                                    );
+                                if (dirDeleted) resolve();
+                                else prompt();
+                            },
+                            isPreferred: true
+                        },
+                        {
+                            text: localeString('general.skip'),
+                            style: 'destructive',
+                            onPress: () => resolve()
+                        }
+                    ],
+                    { cancelable: false }
+                );
+            };
+            prompt();
+        });
+
+    private handleDeletePress = () => {
+        confirmAction(
+            localeString('views.Settings.WalletConfiguration.deleteWallet'),
+            localeString(
+                'views.Settings.WalletConfiguration.deleteWallet.confirm'
+            ),
+            {
+                text: localeString(
+                    'views.Settings.WalletConfiguration.deleteWallet'
+                ),
+                style: 'destructive',
+                onPress: this.performDelete
+            },
+            {
+                text: localeString('general.cancel'),
+                onPress: () => void 0,
+                isPreferred: true
+            }
+        );
+    };
+
+    private performDelete = () => {
+        const { implementation, active } = this.state;
+        const { ChannelsStore, BalanceStore, navigation } = this.props;
+
+        if (implementation === 'embedded-lnd' && !active) {
+            Alert.alert(
+                localeString('general.error'),
+                localeString(
+                    'views.Settings.WalletConfiguration.deleteWallet.inactiveWarning'
+                ),
+                [
+                    {
+                        text: localeString(
+                            'views.Settings.WalletConfiguration.setWalletActive'
+                        ),
+                        onPress: () => this.setWalletConfigurationAsActive(),
+                        isPreferred: true
+                    },
+                    {
+                        text: localeString('general.cancel'),
+                        onPress: () => void 0
+                    }
+                ],
+                { cancelable: false }
+            );
+        } else if (
+            implementation === 'embedded-lnd' &&
+            (ChannelsStore.channels.length > 0 ||
+                ChannelsStore.pendingChannels.length > 0)
+        ) {
+            Alert.alert(
+                localeString('general.warning'),
+                localeString(
+                    'views.Settings.WalletConfiguration.deleteWallet.channelsWarning'
+                ),
+                [
+                    {
+                        text: localeString(
+                            'views.Settings.WalletConfiguration.deleteWallet'
+                        ),
+                        onPress: () => this.deleteNodeConfig()
+                    },
+                    {
+                        text: localeString(
+                            'views.Settings.WalletConfiguration.deleteWallet.exportChannels'
+                        ),
+                        onPress: () =>
+                            // Active embedded-LND only reaches this branch;
+                            // SettingsStore already has this wallet's seed.
+                            reAuthNavigation(navigation, 'Seed', {
+                                skipWarning: true
+                            }),
+                        isPreferred: true
+                    },
+                    {
+                        text: localeString('general.cancel'),
+                        onPress: () => void 0
+                    }
+                ],
+                { cancelable: false }
+            );
+        } else if (
+            implementation === 'embedded-lnd' &&
+            (BalanceStore.confirmedBlockchainBalance !== 0 ||
+                BalanceStore.unconfirmedBlockchainBalance !== 0)
+        ) {
+            Alert.alert(
+                localeString('general.warning'),
+                localeString(
+                    'views.Settings.WalletConfiguration.deleteWallet.balanceWarning'
+                ),
+                [
+                    {
+                        text: localeString(
+                            'views.Settings.WalletConfiguration.deleteWallet'
+                        ),
+                        onPress: () => this.deleteNodeConfig()
+                    },
+                    {
+                        text: localeString('general.cancel'),
+                        onPress: () => void 0,
+                        isPreferred: true
+                    }
+                ],
+                { cancelable: false }
+            );
+        } else {
+            this.deleteNodeConfig();
+        }
+    };
+
+    getNewSelectedNodeIndex(
+        indexOfDeletedNode: number | null,
+        settings: Settings
+    ): number | undefined {
+        if (
+            settings.selectedNode == null ||
+            indexOfDeletedNode == null ||
+            indexOfDeletedNode > settings.selectedNode
+        ) {
+            return settings.selectedNode;
+        }
+        if (indexOfDeletedNode < settings.selectedNode) {
+            return settings.selectedNode - 1;
+        }
+        return settings.nodes?.length != null && settings.nodes?.length > 0
+            ? 0
+            : undefined;
+    }
+
+    setWalletConfigurationAsActive = async () => {
+        const { SettingsStore, navigation } = this.props;
+        const { updateSettings, setConnectingStatus, setInitialStart } =
+            SettingsStore;
+        const { index } = this.state;
+
+        await updateSettings({
+            selectedNode: index
+        });
+
+        this.setState({
+            active: true
+        });
+
+        setConnectingStatus(true);
+        setInitialStart(false);
+
+        navigation.popTo('Wallet');
+    };
+
+    createNewWallet = async (network: string = 'Mainnet') => {
+        const { recoveryCipherSeed, channelBackupsBase64, isSqlite } =
+            this.state;
+        const { SettingsStore, SyncStore } = this.props;
+        const { embeddedLndStarted } = SettingsStore;
+
+        this.setState({
+            creatingWallet: true,
+            errorCreatingWallet: false
+        });
+
+        // CRITICAL: Stop old LND instance completely before creating new wallet
+        if (embeddedLndStarted) {
+            try {
+                console.log(
+                    'Stopping existing LND before creating new wallet...'
+                );
+                SyncStore.reset(); // Stop sync loop before stopping LND to prevent crash
+                await stopLnd();
+                console.log('LND stopped successfully');
+            } catch (error) {
+                console.log(
+                    'Error stopping LND before creating new wallet:',
+                    error
+                );
+                // Continue anyway - stopLnd handles errors gracefully
+            }
+        }
+
+        await optimizeNeutrinoPeers(network === 'Testnet');
+
+        const lndDir = uuidv4();
+
+        if (!embeddedLndStarted) {
+            SyncStore.reset();
+        }
+        let response;
+        try {
+            response = await createLndWallet({
+                lndDir,
+                seedMnemonic: recoveryCipherSeed,
+                isTestnet: network === 'Testnet',
+                channelBackupsBase64,
+                isSqlite: isSqlite ?? false
+            });
+        } catch (error) {
+            console.log('Error creating wallet:', error);
+            this.setState({
+                creatingWallet: false,
+                errorCreatingWallet: true
+            });
+            return;
+        }
+
+        const { wallet, seed, randomBase64 }: any = response;
+
+        if (wallet && wallet.admin_macaroon) {
+            this.setState(
+                {
+                    adminMacaroon: wallet.admin_macaroon,
+                    seedPhrase: seed.cipher_seed_mnemonic,
+                    walletPassword: randomBase64,
+                    embeddedLndNetwork: network,
+                    lndDir,
+                    isSqlite: this.state.isSqlite ?? false,
+                    creatingWallet: false
+                },
+                () => {
+                    this.saveWalletConfiguration(recoveryCipherSeed, true);
+                }
+            );
+        } else {
+            this.setState({
+                creatingWallet: false,
+                errorCreatingWallet: true
+            });
+        }
+    };
+
+    saveLdkNodeWalletConfiguration = (
+        mnemonic: string,
+        nodeDir: string,
+        network: string
+    ) => {
+        const { SettingsStore, navigation } = this.props;
+        const { nickname, photo, ldkPassphrase, ldkVssServer } = this.state;
+        const { setConnectingStatus, updateSettings } = SettingsStore;
+
+        const node = {
+            nickname,
+            photo,
+            implementation: 'ldk-node',
+            ldkNetwork: network,
+            ldkNodeDir: nodeDir,
+            ldkMnemonic: mnemonic,
+            ldkPassphrase,
+            ldkEsploraServer: getDefaultEsploraServer(
+                network as SupportedNetwork
+            ),
+            ldkRgsServer: getDefaultRgsServer(network as SupportedNetwork),
+            ldkScorerUrl: DEFAULT_SCORER_URL,
+            ldkVssServer: ldkVssServer || DEFAULT_VSS_SERVER
+        };
+
+        let nodes: any[] = [];
+        updateSettings((current: Settings) => {
+            nodes = [...(current.nodes || []), node];
+            return {
+                nodes,
+                selectedNode: nodes.length - 1
+            };
+        }).then(async () => {
+            this.setState({ saved: true });
+            setConnectingStatus(true);
+
+            if (nodes.length === 1) {
+                // reset, not popTo: this is the first-ever wallet, so
+                // Wallet may not be on the stack at all (its stale root
+                // was removed by the boot-time reset when there were no
+                // wallets) - popTo would then just pop-and-push, leaving
+                // IntroSplash/Menu/Wallets stranded underneath
+                navigation.reset({
+                    index: 0,
+                    routes: [{ name: 'Wallet' }]
+                });
+            } else {
+                navigation.popTo('Wallets');
+            }
+        });
+    };
+
+    createLdkNodeNewWallet = async (network: string = 'mainnet') => {
+        const {
+            ldkPassphrase,
+            ldkEsploraServer,
+            ldkRgsServer,
+            ldkScorerUrl,
+            ldkVssServer,
+            ldkMnemonic,
+            ldkSeedWordCount
+        } = this.state;
+
+        this.setState({
+            creatingWallet: true
+        });
+
+        try {
+            await stopLdkNode();
+
+            const ldkNodeDir = uuidv4();
+            const networkType = network as
+                | 'mainnet'
+                | 'testnet'
+                | 'signet'
+                | 'regtest'
+                | 'mutinynet';
+
+            // Get LSPS1 config from settings based on network
+            const { SettingsStore } = this.props;
+            const { settings } = SettingsStore;
+            const lspConfig = getLspConfigForNetwork(settings, networkType);
+            const lsps1Token = settings.lsps1Token;
+
+            const lsps1Config =
+                lspConfig.lsps1Pubkey && lspConfig.lsps1Host
+                    ? {
+                          nodeId: lspConfig.lsps1Pubkey,
+                          address: lspConfig.lsps1Host,
+                          token: lsps1Token || null
+                      }
+                    : undefined;
+
+            // Always include Flow LSP pubkey as trusted 0-conf peer
+            const flowLspPubkey = lspConfig.defaultPubkey;
+
+            const trustedPeers = [flowLspPubkey];
+            if (lsps1Config?.nodeId && lsps1Config.nodeId !== flowLspPubkey) {
+                trustedPeers.push(lsps1Config.nodeId);
+            }
+
+            const response = await createLdkNodeWallet({
+                nodeDir: ldkNodeDir,
+                seedMnemonic: ldkMnemonic || undefined,
+                wordCount: ldkSeedWordCount,
+                passphrase: ldkPassphrase || undefined,
+                network: networkType,
+                esploraServerUrl:
+                    ldkEsploraServer || getDefaultEsploraServer(networkType),
+                rgsServerUrl: ldkRgsServer || getDefaultRgsServer(networkType),
+                scorerUrl:
+                    ldkScorerUrl === undefined
+                        ? DEFAULT_SCORER_URL
+                        : ldkScorerUrl,
+                lsps1Config,
+                trustedPeers0conf: trustedPeers,
+                vssServerUrl: ldkVssServer || DEFAULT_VSS_SERVER,
+                // If an existing seed is being imported, this is a restore:
+                // a VSS failure must not silently produce an empty wallet
+                failOnVssError: !!ldkMnemonic
+            });
+
+            // Node is already built — tell Wallet.tsx to skip re-init
+            SettingsStore.walletJustCreated = true;
+
+            if (response?.vssError) {
+                console.warn(
+                    'LDK Node: VSS unavailable during wallet creation:',
+                    response.vssError
+                );
+            }
+
+            if (response && response.mnemonic) {
+                this.setState({
+                    ldkMnemonic: response.mnemonic,
+                    ldkNodeDir,
+                    ldkNetwork: network,
+                    ldkNodeInitialized: true,
+                    creatingWallet: false
+                });
+
+                this.saveLdkNodeWalletConfiguration(
+                    response.mnemonic,
+                    ldkNodeDir,
+                    network
+                );
+            } else {
+                this.setState({
+                    creatingWallet: false,
+                    errorCreatingWallet: true
+                });
+            }
+        } catch (error) {
+            console.error('Error creating LDK Node wallet:', error);
+            this.setState({
+                creatingWallet: false,
+                errorCreatingWallet: true
+            });
+        }
+    };
+
+    render() {
+        const SERVER_ADDRESS_CHARS = "a-zA-Z0-9-._~!$&'()*+,;=";
+
+        const { navigation, SettingsStore } = this.props;
+        const {
+            node,
+            nickname,
+            host,
+            port,
+            lndhubUrl,
+            macaroonHex,
+            rune,
+            username,
+            password,
+            saved,
+            active,
+            newEntry,
+            implementation,
+            certVerification,
+            enableTor,
+            photo,
+            interfaceKeys,
+            existingAccount,
+            suggestImport,
+            importError,
+            showLndHubModal,
+            showCertModal,
+            pairingPhrase,
+            mailboxServer,
+            customMailboxServer,
+            localKey,
+            remoteKey,
+            adminMacaroon,
+            embeddedLndNetwork,
+            isSqlite,
+            recoveryCipherSeed,
+            channelBackupsBase64,
+            creatingWallet,
+            errorCreatingWallet,
+            deletingWallet,
+            saving,
+            // LDK Node
+            ldkMnemonic,
+            ldkNetwork,
+            ldkSeedWordCount,
+            ldkVssServerSelected,
+            ldkVssServerCustom,
+            ldkNodeInitialized,
+            // NWC
+            nostrWalletConnectUrl,
+            lndhubUrlError,
+            usernameError,
+            hostError,
+            runeError,
+            macaroonHexError,
+            portError,
+            customMailboxServerError,
+            pairingPhraseError
+        } = this.state;
+        const {
+            loading,
+            createAccountError,
+            createAccountSuccess,
+            createAccount
+        } = SettingsStore;
+
+        // A save or delete in flight: block every action button so a
+        // concurrent updateSettings cannot re-persist stale node configs
+        // (e.g. resurrecting a wallet mid-deletion).
+        const processing = loading || saving || deletingWallet;
+
+        const isLocalImpl =
+            implementation === 'embedded-lnd' || implementation === 'ldk-node';
+        const supportsTor =
+            implementation !== 'lightning-node-connect' &&
+            !isLocalImpl &&
+            implementation !== 'nostr-wallet-connect';
+        const supportsCertVerification =
+            implementation !== 'lightning-node-connect' &&
+            !isLocalImpl &&
+            implementation !== 'nostr-wallet-connect';
+
+        // The banner only needs to let the user recognise the string;
+        // the credentials it carries stay masked like the fields below
+        const importPreview =
+            ConnectionFormatUtils.redactConnectionString(suggestImport);
+
+        const nostrWalletConnectUrlInvalid =
+            implementation === 'nostr-wallet-connect' &&
+            !ValidationUtils.isValidNostrWalletConnectUrl(
+                nostrWalletConnectUrl
+            );
+
+        const CertInstallInstructions = () => (
+            <View style={styles.button}>
+                <Button
+                    title={localeString(
+                        'views.Settings.AddEditNode.certificateButton'
+                    )}
+                    onPress={() => {
+                        this.setState({
+                            showCertModal: false
+                        });
+                        navigation.navigate('CertInstallInstructions');
+                    }}
+                    secondary
+                />
+            </View>
+        );
+
+        const WalletInterface = () => (
+            <DropdownSetting
+                title={localeString(
+                    'views.Settings.WalletConfiguration.walletInterface'
+                )}
+                selectedValue={implementation}
+                onValueChange={this.selectImplementation}
+                values={interfaceKeys}
+            />
+        );
+
+        const Mailbox = () => {
+            return (
+                <DropdownSetting
+                    title={localeString(
+                        'views.Settings.AddEditNode.mailboxServer'
+                    )}
+                    selectedValue={mailboxServer}
+                    onValueChange={(value: string) => {
+                        this.setState({
+                            mailboxServer: value,
+                            saved: false
+                        });
+                    }}
+                    values={LNC_MAILBOX_KEYS}
+                />
+            );
+        };
+
+        const AddPhotos = () => (
+            <AddIcon
+                fill={themeColor('background')}
+                width="14"
+                height="14"
+                style={{ alignSelf: 'center' }}
+            />
+        );
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString(
+                            'views.Settings.WalletConfiguration.title'
+                        ),
+                        style: { ...styles.text, color: themeColor('text') }
+                    }}
+                    rightComponent={
+                        <Row>
+                            {processing && (
+                                <View style={{ paddingRight: 15 }}>
+                                    <LoadingIndicator size={30} />
+                                </View>
+                            )}
+                            <ScanBadge
+                                onPress={() =>
+                                    navigation.navigate(
+                                        'HandleAnythingQRScanner'
+                                    )
+                                }
+                            />
+                        </Row>
+                    }
+                    navigation={navigation}
+                />
+                {/* Same guard as the interface dropdown: an import would
+                    turn a set-up on-device wallet into a remote one */}
+                {!!suggestImport && !adminMacaroon && !ldkNodeInitialized && (
+                    <View
+                        style={{
+                            padding: 10,
+                            backgroundColor: themeColor('disabled')
+                        }}
+                    >
+                        <Text style={styles.whiteText}>
+                            {localeString(
+                                'views.Settings.AddEditNode.connectionStringClipboard'
+                            )}
+                            :
+                        </Text>
+                        <Text
+                            style={{
+                                ...styles.whiteText,
+                                padding: 15
+                            }}
+                        >
+                            {importPreview.length > 100
+                                ? `${importPreview.substring(0, 100)}...`
+                                : importPreview}
+                        </Text>
+                        <Text style={{ ...styles.whiteText, marginBottom: 10 }}>
+                            {localeString(
+                                'views.Settings.AddEditNode.importPrompt'
+                            )}
+                        </Text>
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString(
+                                    'views.Settings.AddEditNode.import'
+                                )}
+                                onPress={() => this.importClipboard()}
+                                tertiary
+                            />
+                        </View>
+                        <View style={styles.button}>
+                            <Button
+                                title={localeString('general.cancel')}
+                                onPress={() => this.clearImportSuggestion()}
+                                tertiary
+                            />
+                        </View>
+                    </View>
+                )}
+
+                <Modal
+                    animationType="slide"
+                    transparent={true}
+                    visible={showLndHubModal || showCertModal}
+                >
+                    <View style={styles.centeredView}>
+                        <View style={styles.modal}>
+                            {showLndHubModal && (
+                                <>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            fontSize: 40
+                                        }}
+                                    >
+                                        {localeString('general.warning')}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            paddingTop: 20,
+                                            color: 'black'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.lndhubWarning'
+                                        )}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            paddingTop: 20,
+                                            paddingBottom: 20,
+                                            color: 'black'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.lndhubFriend'
+                                        )}
+                                    </Text>
+                                    <View style={styles.button}>
+                                        <Button
+                                            title={localeString(
+                                                'views.Settings.AddEditNode.lndhubUnderstand'
+                                            )}
+                                            onPress={() => {
+                                                createAccount(
+                                                    lndhubUrl,
+                                                    certVerification,
+                                                    enableTor
+                                                ).then((data: any) => {
+                                                    if (
+                                                        data.login &&
+                                                        data.password
+                                                    ) {
+                                                        this.setState({
+                                                            username:
+                                                                data.login,
+                                                            password:
+                                                                data.password,
+                                                            existingAccount:
+                                                                true
+                                                        });
+                                                    }
+
+                                                    this.setState({
+                                                        showLndHubModal: false
+                                                    });
+                                                });
+                                            }}
+                                            secondary
+                                        />
+                                    </View>
+                                    <View style={styles.button}>
+                                        <Button
+                                            title={localeString(
+                                                'general.cancel'
+                                            )}
+                                            onPress={() =>
+                                                this.setState({
+                                                    showLndHubModal: false
+                                                })
+                                            }
+                                        />
+                                    </View>
+                                </>
+                            )}
+                            {showCertModal && (
+                                <>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            fontSize: 40
+                                        }}
+                                    >
+                                        {localeString('general.warning')}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            paddingTop: 20
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.certificateWarning1'
+                                        )}
+                                    </Text>
+                                    <Text
+                                        style={{
+                                            ...styles.blackText,
+                                            paddingTop: 20,
+                                            paddingBottom: 20,
+                                            color: 'black'
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.certificateWarning2'
+                                        )}
+                                    </Text>
+                                    <CertInstallInstructions />
+                                    <View style={styles.button}>
+                                        <Button
+                                            title={localeString(
+                                                'views.Settings.WalletConfiguration.certificateUnderstand'
+                                            )}
+                                            onPress={() => {
+                                                this.saveWalletConfiguration();
+                                                this.setState({
+                                                    showCertModal: false
+                                                });
+                                            }}
+                                            tertiary
+                                        />
+                                    </View>
+                                    <View style={styles.button}>
+                                        <Button
+                                            title={localeString(
+                                                'general.cancel'
+                                            )}
+                                            onPress={() =>
+                                                this.setState({
+                                                    showCertModal: false
+                                                })
+                                            }
+                                        />
+                                    </View>
+                                </>
+                            )}
+                        </View>
+                    </View>
+                </Modal>
+
+                <KeyboardAvoidingView
+                    style={{ flex: 1 }}
+                    behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+                >
+                    <ScrollView
+                        ref={this.scrollViewRef}
+                        style={{ flex: 1, paddingHorizontal: 20 }}
+                        keyboardShouldPersistTaps="handled"
+                    >
+                        <View style={{ ...styles.form, marginBottom: 20 }}>
+                            {!!importError && (
+                                <ErrorMessage message={importError} />
+                            )}
+
+                            {!!createAccountError &&
+                                implementation === 'lndhub' &&
+                                !loading && (
+                                    <ErrorMessage
+                                        message={createAccountError}
+                                    />
+                                )}
+
+                            {!!createAccountSuccess &&
+                                implementation === 'lndhub' &&
+                                !loading && (
+                                    <SuccessMessage
+                                        message={createAccountSuccess}
+                                    />
+                                )}
+
+                            <View style={{ marginLeft: 64 }}>
+                                <Text
+                                    style={{
+                                        ...styles.text,
+                                        color: themeColor('text')
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.AddEditNode.nickname'
+                                    )}
+                                </Text>
+                            </View>
+                            <View style={styles.container}>
+                                <TouchableOpacity
+                                    onPress={
+                                        (!node || !node.photo) && !photo
+                                            ? () =>
+                                                  navigation.navigate(
+                                                      'SetWalletPicture',
+                                                      { implementation }
+                                                  )
+                                            : () => {
+                                                  if (node) {
+                                                      this.setState({
+                                                          node: {
+                                                              ...node,
+                                                              photo: undefined
+                                                          }
+                                                      });
+                                                  }
+                                                  this.setState(
+                                                      {
+                                                          photo: undefined,
+                                                          saved: false
+                                                      },
+                                                      () => {
+                                                          node
+                                                              ? (node.photo =
+                                                                    '')
+                                                              : null;
+                                                      }
+                                                  );
+                                              }
+                                    }
+                                >
+                                    <View
+                                        style={{
+                                            ...styles.imageBackground,
+                                            backgroundColor:
+                                                themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {node?.photo || photo ? (
+                                            <Image
+                                                source={{
+                                                    uri: getPhoto(
+                                                        node?.photo || photo
+                                                    )
+                                                }}
+                                                style={styles.imageBackground}
+                                            />
+                                        ) : (
+                                            <AddPhotos />
+                                        )}
+                                    </View>
+                                </TouchableOpacity>
+
+                                <View
+                                    style={{
+                                        flex: 1,
+                                        marginLeft: 14
+                                    }}
+                                >
+                                    <TextInput
+                                        placeholder={localeString(
+                                            'general.defaultNodeNickname'
+                                        )}
+                                        value={nickname}
+                                        onChangeText={(text: string) =>
+                                            this.setState({
+                                                nickname: text,
+                                                saved: false
+                                            })
+                                        }
+                                        locked={loading}
+                                    />
+                                </View>
+                            </View>
+
+                            {!adminMacaroon && !ldkNodeInitialized && (
+                                <WalletInterface />
+                            )}
+
+                            {!adminMacaroon &&
+                                implementation === 'embedded-lnd' && (
+                                    <View>
+                                        {!adminMacaroon && (
+                                            <DropdownSetting
+                                                title={localeString(
+                                                    'general.network'
+                                                )}
+                                                selectedValue={
+                                                    embeddedLndNetwork ||
+                                                    'mainnet'
+                                                }
+                                                onValueChange={(
+                                                    value: string
+                                                ) => {
+                                                    this.setState({
+                                                        embeddedLndNetwork:
+                                                            value
+                                                    });
+                                                }}
+                                                values={EMBEDDED_NODE_NETWORK_KEYS.filter(
+                                                    (k) =>
+                                                        k.value !== 'mutinynet'
+                                                )}
+                                            />
+                                        )}
+                                        <DropdownSetting
+                                            title={localeString(
+                                                'views.Settings.WalletConfiguration.database'
+                                            )}
+                                            selectedValue={
+                                                isSqlite ? 'sqlite' : 'bolt'
+                                            }
+                                            onValueChange={(value: string) => {
+                                                this.setState({
+                                                    isSqlite: value === 'sqlite'
+                                                });
+                                            }}
+                                            values={[
+                                                {
+                                                    key: 'Bolt',
+                                                    value: 'bolt'
+                                                },
+                                                {
+                                                    key: `SQLite (${localeString(
+                                                        'general.experimental'
+                                                    )})`,
+                                                    value: 'sqlite'
+                                                }
+                                            ]}
+                                        />
+                                    </View>
+                                )}
+
+                            {!adminMacaroon &&
+                                implementation === 'embedded-lnd' &&
+                                recoveryCipherSeed && (
+                                    <View>
+                                        <Text
+                                            style={{
+                                                ...styles.text,
+                                                color: themeColor('text')
+                                            }}
+                                        >
+                                            {`${localeString(
+                                                'views.Settings.AddEditNode.disasterRecoveryBase64'
+                                            )} (${localeString(
+                                                'general.optional'
+                                            )})`}
+                                        </Text>
+                                        <TextInput
+                                            value={channelBackupsBase64}
+                                            onChangeText={(text: string) =>
+                                                this.setState({
+                                                    channelBackupsBase64: text
+                                                })
+                                            }
+                                            locked={loading}
+                                        />
+                                    </View>
+                                )}
+
+                            {!ldkNodeInitialized &&
+                                implementation === 'ldk-node' && (
+                                    <View>
+                                        <DropdownSetting
+                                            title={localeString(
+                                                'general.network'
+                                            )}
+                                            selectedValue={
+                                                ldkNetwork || 'mainnet'
+                                            }
+                                            onValueChange={(value: string) => {
+                                                this.setState({
+                                                    ldkNetwork: value
+                                                });
+                                            }}
+                                            values={EMBEDDED_NODE_NETWORK_KEYS}
+                                        />
+
+                                        <Accordion
+                                            headerLayout="form"
+                                            id="ldk-advanced-settings"
+                                            scrollRef={this.scrollViewRef}
+                                            title={localeString(
+                                                'general.advancedSettings'
+                                            )}
+                                        >
+                                            <DropdownSetting
+                                                title={localeString(
+                                                    'views.Settings.WalletConfiguration.seedPhraseLength'
+                                                )}
+                                                selectedValue={ldkSeedWordCount}
+                                                onValueChange={(
+                                                    value: number
+                                                ) => {
+                                                    this.setState({
+                                                        ldkSeedWordCount:
+                                                            value as 12 | 24
+                                                    });
+                                                }}
+                                                values={[
+                                                    {
+                                                        key: localeString(
+                                                            'views.Settings.WalletConfiguration.seedPhraseLength.12'
+                                                        ),
+                                                        value: 12
+                                                    },
+                                                    {
+                                                        key: localeString(
+                                                            'views.Settings.WalletConfiguration.seedPhraseLength.24'
+                                                        ),
+                                                        value: 24
+                                                    }
+                                                ]}
+                                            />
+
+                                            <VssServerPicker
+                                                selectedValue={
+                                                    ldkVssServerSelected
+                                                }
+                                                customServer={
+                                                    ldkVssServerCustom
+                                                }
+                                                locked={loading}
+                                                onChange={(value, custom) =>
+                                                    this.setState({
+                                                        ldkVssServerSelected:
+                                                            value,
+                                                        ldkVssServerCustom:
+                                                            custom,
+                                                        ldkVssServer:
+                                                            resolveVssServer(
+                                                                value,
+                                                                custom
+                                                            )
+                                                    })
+                                                }
+                                            />
+                                        </Accordion>
+                                    </View>
+                                )}
+
+                            {implementation === 'nostr-wallet-connect' && (
+                                <>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.WalletConfiguration.nostrWalletConnectUrl'
+                                        )}
+                                    </Text>
+                                    <View
+                                        style={{
+                                            flexDirection: 'row',
+                                            alignItems: 'center'
+                                        }}
+                                    >
+                                        <TextInput
+                                            placeholder={
+                                                'nostr+walletconnect://'
+                                            }
+                                            textColor={
+                                                nostrWalletConnectUrlInvalid &&
+                                                nostrWalletConnectUrl
+                                                    ? themeColor('error')
+                                                    : themeColor('text')
+                                            }
+                                            value={nostrWalletConnectUrl}
+                                            autoCapitalize="none"
+                                            secureTextEntry={this.state.hidden}
+                                            style={{
+                                                flex: 1,
+                                                marginRight: 15
+                                            }}
+                                            onChangeText={(text: string) => {
+                                                this.setState({
+                                                    nostrWalletConnectUrl: text
+                                                        .trim()
+                                                        .replace(/\s+/g, ' '),
+                                                    saved: false
+                                                });
+                                            }}
+                                            locked={loading}
+                                            autoCorrect={false}
+                                        />
+                                        <ShowHideToggle
+                                            onPress={() =>
+                                                this.setState({
+                                                    hidden: !this.state.hidden
+                                                })
+                                            }
+                                        />
+                                    </View>
+                                </>
+                            )}
+                            {implementation === 'lndhub' && (
+                                <>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.serverAddress'
+                                        )}
+                                    </Text>
+                                    <TextInput
+                                        placeholder={'https://'}
+                                        textColor={
+                                            lndhubUrlError
+                                                ? themeColor('error')
+                                                : themeColor('text')
+                                        }
+                                        value={lndhubUrl}
+                                        autoCorrect={false}
+                                        autoCapitalize="none"
+                                        keyboardType="url"
+                                        onChangeText={(text: string) => {
+                                            this.setState({
+                                                lndhubUrlError: false
+                                            });
+
+                                            // Allow backspace/delete operations without validation
+                                            if (
+                                                text.length <
+                                                (lndhubUrl?.length || 0)
+                                            ) {
+                                                this.setState({
+                                                    lndhubUrl: text,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For single character additions
+                                            if (
+                                                text.length ===
+                                                (lndhubUrl?.length || 0) + 1
+                                            ) {
+                                                const cleanedText =
+                                                    text.replace(
+                                                        new RegExp(
+                                                            `[^${SERVER_ADDRESS_CHARS}:/]`,
+                                                            'g'
+                                                        ),
+                                                        ''
+                                                    );
+                                                this.setState({
+                                                    lndhubUrl: cleanedText,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For pasted content
+                                            const trimmedText = text.trim();
+                                            this.setState({
+                                                lndhubUrl: trimmedText,
+                                                lndhubUrlError:
+                                                    !ValidationUtils.isValidServerAddress(
+                                                        trimmedText,
+                                                        { allowPort: true }
+                                                    ),
+                                                saved: false
+                                            });
+                                        }}
+                                        onBlur={() => {
+                                            if (lndhubUrl) {
+                                                this.setState({
+                                                    lndhubUrlError:
+                                                        !ValidationUtils.isValidServerAddress(
+                                                            lndhubUrl,
+                                                            { allowPort: true }
+                                                        )
+                                                });
+                                            }
+                                        }}
+                                        locked={loading}
+                                    />
+
+                                    <>
+                                        <Text
+                                            style={{
+                                                top: 20,
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                )
+                                            }}
+                                        >
+                                            {localeString(
+                                                'views.Settings.AddEditNode.existingAccount'
+                                            )}
+                                        </Text>
+                                        <Switch
+                                            value={existingAccount}
+                                            onValueChange={() =>
+                                                this.setState({
+                                                    existingAccount:
+                                                        !existingAccount
+                                                })
+                                            }
+                                        />
+                                    </>
+
+                                    {existingAccount && (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.username'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                placeholder={'...'}
+                                                textColor={
+                                                    usernameError
+                                                        ? themeColor('error')
+                                                        : themeColor('text')
+                                                }
+                                                value={username}
+                                                onFocus={() =>
+                                                    this.setState({
+                                                        usernameError: false
+                                                    })
+                                                }
+                                                onChangeText={(
+                                                    text: string
+                                                ) => {
+                                                    this.setState({
+                                                        usernameError: false
+                                                    });
+
+                                                    // Allow backspace/delete operations without validation
+                                                    if (
+                                                        text.length <
+                                                        (username?.length || 0)
+                                                    ) {
+                                                        this.setState({
+                                                            username: text,
+                                                            saved: false
+                                                        });
+                                                        return;
+                                                    }
+
+                                                    // For single character additions
+                                                    if (
+                                                        text.length ===
+                                                        (username?.length ||
+                                                            0) +
+                                                            1
+                                                    ) {
+                                                        const cleanedText =
+                                                            text.trim();
+                                                        this.setState({
+                                                            username:
+                                                                cleanedText,
+                                                            saved: false
+                                                        });
+                                                        return;
+                                                    }
+
+                                                    // For pasted content
+                                                    const trimmedText =
+                                                        text.trim();
+                                                    this.setState({
+                                                        username: trimmedText,
+                                                        usernameError:
+                                                            /\s/.test(
+                                                                trimmedText
+                                                            ),
+                                                        saved: false
+                                                    });
+                                                }}
+                                                locked={loading}
+                                                autoCorrect={false}
+                                                autoCapitalize="none"
+                                            />
+
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.password'
+                                                )}
+                                            </Text>
+                                            <View
+                                                style={{
+                                                    flexDirection: 'row',
+                                                    alignItems: 'center'
+                                                }}
+                                            >
+                                                <TextInput
+                                                    placeholder={'...'}
+                                                    value={password}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) =>
+                                                        this.setState({
+                                                            password:
+                                                                text.trim(),
+                                                            saved: false
+                                                        })
+                                                    }
+                                                    locked={loading}
+                                                    secureTextEntry={
+                                                        this.state.hidden
+                                                    }
+                                                    autoCorrect={false}
+                                                    autoCapitalize="none"
+                                                    style={{
+                                                        flex: 1,
+                                                        marginRight: 15
+                                                    }}
+                                                />
+                                                <ShowHideToggle
+                                                    onPress={() =>
+                                                        this.setState({
+                                                            hidden: !this.state
+                                                                .hidden
+                                                        })
+                                                    }
+                                                />
+                                            </View>
+
+                                            {saved && (
+                                                <CollapsedQR
+                                                    showText={localeString(
+                                                        'views.Settings.AddEditNode.showAccountQR'
+                                                    )}
+                                                    collapseText={localeString(
+                                                        'views.Settings.AddEditNode.hideAccountQR'
+                                                    )}
+                                                    value={
+                                                        `lndhub://${username}:${password}` +
+                                                        `@${lndhubUrl}`
+                                                    }
+                                                    hideText
+                                                />
+                                            )}
+                                        </>
+                                    )}
+                                </>
+                            )}
+                            {(implementation === 'lnd' ||
+                                implementation === 'cln-rest') && (
+                                <>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.serverAddress'
+                                        )}
+                                    </Text>
+                                    <TextInput
+                                        placeholder={'localhost'}
+                                        textColor={
+                                            hostError
+                                                ? themeColor('error')
+                                                : themeColor('text')
+                                        }
+                                        autoCorrect={false}
+                                        autoCapitalize="none"
+                                        keyboardType="url"
+                                        value={host}
+                                        onChangeText={(text: string) => {
+                                            this.setState({ hostError: false });
+
+                                            // Allow backspace/delete operations without validation
+                                            if (
+                                                text.length <
+                                                (host?.length || 0)
+                                            ) {
+                                                this.setState({
+                                                    host: text,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For single character additions
+                                            if (
+                                                text.length ===
+                                                (host?.length || 0) + 1
+                                            ) {
+                                                const cleanedText =
+                                                    text.replace(
+                                                        new RegExp(
+                                                            `[^${SERVER_ADDRESS_CHARS}:/]`,
+                                                            'g'
+                                                        ),
+                                                        ''
+                                                    );
+                                                this.setState({
+                                                    host: cleanedText,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For pasted content
+                                            const trimmedText = text.trim();
+                                            this.setState({
+                                                host: trimmedText,
+                                                hostError:
+                                                    !ValidationUtils.isValidServerAddress(
+                                                        trimmedText
+                                                    ),
+                                                saved: false
+                                            });
+                                        }}
+                                        onBlur={() => {
+                                            if (host) {
+                                                this.setState({
+                                                    hostError:
+                                                        !ValidationUtils.isValidServerAddress(
+                                                            host
+                                                        )
+                                                });
+                                            }
+                                        }}
+                                        locked={loading}
+                                    />
+
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.restPort'
+                                        )}
+                                    </Text>
+                                    <TextInput
+                                        keyboardType="numeric"
+                                        placeholder={'443/8080'}
+                                        textColor={
+                                            portError
+                                                ? themeColor('error')
+                                                : themeColor('text')
+                                        }
+                                        value={port}
+                                        onChangeText={(text: string) => {
+                                            this.setState({ portError: false });
+
+                                            // Allow backspace/delete operations without validation
+                                            if (
+                                                text.length <
+                                                (port?.length || 0)
+                                            ) {
+                                                this.setState({
+                                                    port: text,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For single character additions
+                                            if (
+                                                text.length ===
+                                                (port?.length || 0) + 1
+                                            ) {
+                                                const cleanedText = text
+                                                    .replace(/[^0-9]/g, '')
+                                                    .replace(/^0+/, '');
+                                                this.setState({
+                                                    port: cleanedText,
+                                                    saved: false
+                                                });
+                                                return;
+                                            }
+
+                                            // For pasted content
+                                            const trimmedText = text.trim();
+                                            this.setState({
+                                                port: trimmedText,
+                                                portError:
+                                                    !ValidationUtils.isValidPort(
+                                                        trimmedText
+                                                    ),
+                                                saved: false
+                                            });
+                                        }}
+                                        onBlur={() => {
+                                            if (port) {
+                                                this.setState({
+                                                    portError:
+                                                        !ValidationUtils.isValidPort(
+                                                            port
+                                                        )
+                                                });
+                                            }
+                                        }}
+                                        locked={loading}
+                                    />
+
+                                    {implementation === 'cln-rest' ? (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.rune'
+                                                )}
+                                            </Text>
+                                            <View
+                                                style={{
+                                                    flexDirection: 'row',
+                                                    alignItems: 'center'
+                                                }}
+                                            >
+                                                <TextInput
+                                                    placeholder={'Lt1c...'}
+                                                    textColor={
+                                                        runeError
+                                                            ? themeColor(
+                                                                  'error'
+                                                              )
+                                                            : themeColor('text')
+                                                    }
+                                                    autoCorrect={false}
+                                                    autoCapitalize="none"
+                                                    value={rune}
+                                                    secureTextEntry={
+                                                        this.state.hidden
+                                                    }
+                                                    style={{
+                                                        flex: 1,
+                                                        marginRight: 15
+                                                    }}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) => {
+                                                        this.setState({
+                                                            runeError: false
+                                                        });
+
+                                                        // Allow backspace/delete operations without validation
+                                                        if (
+                                                            text.length <
+                                                            (rune?.length || 0)
+                                                        ) {
+                                                            this.setState({
+                                                                rune: text,
+                                                                saved: false
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        // For single character additions
+                                                        if (
+                                                            text.length ===
+                                                            (rune?.length ||
+                                                                0) +
+                                                                1
+                                                        ) {
+                                                            const cleanedText =
+                                                                text.replace(
+                                                                    /[^A-Za-z0-9\-_=]/g,
+                                                                    ''
+                                                                );
+                                                            this.setState({
+                                                                rune: cleanedText,
+                                                                saved: false
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        // For pasted content
+                                                        const trimmedText =
+                                                            text.trim();
+                                                        this.setState({
+                                                            rune: trimmedText,
+                                                            runeError:
+                                                                !ValidationUtils.hasValidRuneChars(
+                                                                    trimmedText
+                                                                ),
+                                                            saved: false
+                                                        });
+                                                    }}
+                                                    locked={loading}
+                                                />
+                                                <ShowHideToggle
+                                                    onPress={() =>
+                                                        this.setState({
+                                                            hidden: !this.state
+                                                                .hidden
+                                                        })
+                                                    }
+                                                />
+                                            </View>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.macaroon'
+                                                )}
+                                            </Text>
+                                            <View
+                                                style={{
+                                                    flexDirection: 'row',
+                                                    alignItems: 'center'
+                                                }}
+                                            >
+                                                <TextInput
+                                                    placeholder={'0A...'}
+                                                    textColor={
+                                                        macaroonHexError
+                                                            ? themeColor(
+                                                                  'error'
+                                                              )
+                                                            : themeColor('text')
+                                                    }
+                                                    autoCorrect={false}
+                                                    autoCapitalize="none"
+                                                    value={macaroonHex}
+                                                    secureTextEntry={
+                                                        this.state.hidden
+                                                    }
+                                                    style={{
+                                                        flex: 1,
+                                                        marginRight: 15
+                                                    }}
+                                                    onChangeText={(
+                                                        text: string
+                                                    ) => {
+                                                        this.setState({
+                                                            macaroonHexError:
+                                                                false
+                                                        });
+
+                                                        // Allow backspace/delete operations without validation
+                                                        if (
+                                                            text.length <
+                                                            (macaroonHex?.length ||
+                                                                0)
+                                                        ) {
+                                                            this.setState({
+                                                                macaroonHex:
+                                                                    text,
+                                                                saved: false
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        // For single character additions
+                                                        if (
+                                                            text.length ===
+                                                            (macaroonHex?.length ||
+                                                                0) +
+                                                                1
+                                                        ) {
+                                                            const cleanedText =
+                                                                text.replace(
+                                                                    /[^0-9a-fA-F]/g,
+                                                                    ''
+                                                                );
+                                                            this.setState({
+                                                                macaroonHex:
+                                                                    cleanedText,
+                                                                saved: false
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        // For pasted content
+                                                        const trimmedText =
+                                                            text.trim();
+                                                        this.setState({
+                                                            macaroonHex:
+                                                                trimmedText,
+                                                            macaroonHexError:
+                                                                !ValidationUtils.hasValidMacaroonChars(
+                                                                    trimmedText
+                                                                ),
+                                                            saved: false
+                                                        });
+                                                    }}
+                                                    locked={loading}
+                                                />
+                                                <ShowHideToggle
+                                                    onPress={() =>
+                                                        this.setState({
+                                                            hidden: !this.state
+                                                                .hidden
+                                                        })
+                                                    }
+                                                />
+                                            </View>
+                                        </>
+                                    )}
+                                </>
+                            )}
+
+                            {implementation === 'lightning-node-connect' && (
+                                <>
+                                    <Mailbox />
+                                    {mailboxServer === 'custom-defined' && (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.customMailboxServer'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                placeholder={
+                                                    'my-custom.lnc.server:443'
+                                                }
+                                                textColor={
+                                                    customMailboxServerError
+                                                        ? themeColor('error')
+                                                        : themeColor('text')
+                                                }
+                                                autoCorrect={false}
+                                                autoCapitalize="none"
+                                                keyboardType="url"
+                                                value={customMailboxServer}
+                                                onChangeText={(
+                                                    text: string
+                                                ) => {
+                                                    this.setState({
+                                                        customMailboxServerError:
+                                                            false
+                                                    });
+
+                                                    // Allow backspace/delete operations without validation
+                                                    if (
+                                                        text.length <
+                                                        (customMailboxServer?.length ||
+                                                            0)
+                                                    ) {
+                                                        this.setState({
+                                                            customMailboxServer:
+                                                                text,
+                                                            saved: false
+                                                        });
+                                                        return;
+                                                    }
+
+                                                    // For single character additions
+                                                    if (
+                                                        text.length ===
+                                                        (customMailboxServer?.length ||
+                                                            0) +
+                                                            1
+                                                    ) {
+                                                        if (text.includes('::'))
+                                                            return;
+
+                                                        const cleanedText =
+                                                            text.replace(
+                                                                new RegExp(
+                                                                    `[^${SERVER_ADDRESS_CHARS}:/]`,
+                                                                    'g'
+                                                                ),
+                                                                ''
+                                                            );
+                                                        this.setState({
+                                                            customMailboxServer:
+                                                                cleanedText,
+                                                            saved: false
+                                                        });
+                                                        return;
+                                                    }
+
+                                                    // For pasted content
+                                                    const trimmedText =
+                                                        text.trim();
+                                                    this.setState({
+                                                        customMailboxServer:
+                                                            trimmedText,
+                                                        customMailboxServerError:
+                                                            !ValidationUtils.isValidServerAddress(
+                                                                trimmedText,
+                                                                {
+                                                                    allowPort:
+                                                                        true,
+                                                                    requireHttps:
+                                                                        true
+                                                                }
+                                                            ),
+                                                        saved: false
+                                                    });
+                                                }}
+                                                onBlur={() => {
+                                                    if (customMailboxServer) {
+                                                        this.setState({
+                                                            customMailboxServerError:
+                                                                !ValidationUtils.isValidServerAddress(
+                                                                    customMailboxServer,
+                                                                    {
+                                                                        allowPort:
+                                                                            true,
+                                                                        requireHttps:
+                                                                            true
+                                                                    }
+                                                                )
+                                                        });
+                                                    }
+                                                }}
+                                                locked={loading}
+                                            />
+                                        </>
+                                    )}
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.pairingPhrase'
+                                        )}
+                                    </Text>
+                                    <View
+                                        style={{
+                                            flexDirection: 'row',
+                                            alignItems: 'center'
+                                        }}
+                                    >
+                                        <TextInput
+                                            placeholder={
+                                                'cherry truth mask employ box silver mass bunker fiscal vote'
+                                            }
+                                            textColor={
+                                                pairingPhraseError
+                                                    ? themeColor('error')
+                                                    : themeColor('text')
+                                            }
+                                            autoCapitalize="none"
+                                            value={pairingPhrase}
+                                            secureTextEntry={this.state.hidden}
+                                            style={{
+                                                flex: 1,
+                                                marginRight: 15
+                                            }}
+                                            onChangeText={(text: string) => {
+                                                this.setState({
+                                                    pairingPhraseError: false
+                                                });
+
+                                                // Allow backspace/delete operations without validation
+                                                if (
+                                                    text.length <
+                                                    (pairingPhrase?.length || 0)
+                                                ) {
+                                                    this.setState({
+                                                        pairingPhrase: text,
+                                                        saved: false
+                                                    });
+                                                    return;
+                                                }
+
+                                                // For single character additions
+                                                if (
+                                                    text.length ===
+                                                    (pairingPhrase?.length ||
+                                                        0) +
+                                                        1
+                                                ) {
+                                                    if (text === ' ') return;
+                                                    if (text.includes('  '))
+                                                        return;
+
+                                                    const cleanedText =
+                                                        text.replace(
+                                                            /[^a-zA-Z\s]/g,
+                                                            ''
+                                                        );
+                                                    this.setState({
+                                                        pairingPhrase:
+                                                            cleanedText,
+                                                        saved: false
+                                                    });
+                                                    return;
+                                                }
+
+                                                // For pasted content
+                                                const normalizedPhrase = text
+                                                    .trim()
+                                                    .replace(/\s+/g, ' ');
+                                                this.setState({
+                                                    pairingPhrase:
+                                                        normalizedPhrase,
+                                                    pairingPhraseError:
+                                                        !ValidationUtils.hasValidPairingPhraseCharsAndWordcount(
+                                                            normalizedPhrase
+                                                        ),
+                                                    saved: false
+                                                });
+                                            }}
+                                            onBlur={() => {
+                                                const normalizedPhrase =
+                                                    pairingPhrase
+                                                        ?.trim()
+                                                        .replace(/\s+/g, ' ');
+                                                this.setState({
+                                                    pairingPhrase:
+                                                        normalizedPhrase,
+                                                    pairingPhraseError:
+                                                        !ValidationUtils.hasValidPairingPhraseCharsAndWordcount(
+                                                            normalizedPhrase
+                                                        ),
+                                                    saved: false
+                                                });
+                                            }}
+                                            locked={loading}
+                                        />
+                                        <ShowHideToggle
+                                            onPress={() =>
+                                                this.setState({
+                                                    hidden: !this.state.hidden
+                                                })
+                                            }
+                                        />
+                                    </View>
+
+                                    {!!localKey && (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                🔒{' '}
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.localKey'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                value={localKey}
+                                                secureTextEntry={
+                                                    this.state.hidden
+                                                }
+                                                locked={true}
+                                            />
+                                        </>
+                                    )}
+
+                                    {!!remoteKey && (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                🔒{' '}
+                                                {localeString(
+                                                    'views.Settings.AddEditNode.remoteKey'
+                                                )}
+                                            </Text>
+                                            <TextInput
+                                                value={remoteKey}
+                                                secureTextEntry={
+                                                    this.state.hidden
+                                                }
+                                                locked={true}
+                                            />
+                                        </>
+                                    )}
+                                </>
+                            )}
+
+                            {supportsTor && (
+                                <>
+                                    <Text
+                                        style={{
+                                            top: 20,
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.useTor'
+                                        )}
+                                    </Text>
+                                    <Switch
+                                        value={enableTor}
+                                        onValueChange={() =>
+                                            this.setState({
+                                                enableTor: !enableTor,
+                                                saved: false
+                                            })
+                                        }
+                                    />
+                                </>
+                            )}
+
+                            {supportsCertVerification && !enableTor && (
+                                <>
+                                    <Text
+                                        style={{
+                                            top: 20,
+                                            color: themeColor('secondaryText')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.AddEditNode.certificateVerification'
+                                        )}
+                                    </Text>
+                                    <Switch
+                                        value={certVerification}
+                                        onValueChange={() =>
+                                            this.setState({
+                                                certVerification:
+                                                    !certVerification,
+                                                saved: false
+                                            })
+                                        }
+                                    />
+                                </>
+                            )}
+                        </View>
+
+                        {implementation === 'ldk-node' && (
+                            <View style={{ ...styles.button }}>
+                                {!ldkNodeInitialized &&
+                                    !creatingWallet &&
+                                    !saved && (
+                                        <>
+                                            <View style={styles.button}>
+                                                <Button
+                                                    title={localeString(
+                                                        'views.Settings.NodeConfiguration.createWallet',
+                                                        {
+                                                            network:
+                                                                localeString(
+                                                                    EMBEDDED_NODE_NETWORK_KEYS.find(
+                                                                        (k) =>
+                                                                            k.value ===
+                                                                            (ldkNetwork ||
+                                                                                'mainnet')
+                                                                    )
+                                                                        ?.translateKey ||
+                                                                        'network.mainnet'
+                                                                )
+                                                        }
+                                                    )}
+                                                    onPress={async () => {
+                                                        await this.createLdkNodeNewWallet(
+                                                            ldkNetwork ||
+                                                                'mainnet'
+                                                        );
+                                                    }}
+                                                    tertiary
+                                                    disabled={
+                                                        loading ||
+                                                        !isVssServerValid(
+                                                            ldkVssServerSelected,
+                                                            ldkVssServerCustom
+                                                        )
+                                                    }
+                                                />
+                                            </View>
+                                            <View style={styles.button}>
+                                                <Button
+                                                    title={localeString(
+                                                        'views.Settings.NodeConfiguration.restoreWallet',
+                                                        {
+                                                            network:
+                                                                localeString(
+                                                                    EMBEDDED_NODE_NETWORK_KEYS.find(
+                                                                        (k) =>
+                                                                            k.value ===
+                                                                            (ldkNetwork ||
+                                                                                'mainnet')
+                                                                    )
+                                                                        ?.translateKey ||
+                                                                        'network.mainnet'
+                                                                )
+                                                        }
+                                                    )}
+                                                    onPress={() =>
+                                                        navigation.navigate(
+                                                            'LdkWalletRecoverySettings',
+                                                            {
+                                                                network:
+                                                                    ldkNetwork,
+                                                                nickname,
+                                                                photo
+                                                            }
+                                                        )
+                                                    }
+                                                    secondary
+                                                    disabled={loading}
+                                                />
+                                            </View>
+                                        </>
+                                    )}
+                            </View>
+                        )}
+
+                        {!existingAccount && implementation === 'lndhub' && (
+                            <View style={{ ...styles.button }}>
+                                <Button
+                                    title={localeString(
+                                        'views.Settings.AddEditNode.createLndhub'
+                                    )}
+                                    onPress={() => {
+                                        if (
+                                            CUSTODIAL_LNDHUBS.includes(
+                                                lndhubUrl
+                                            )
+                                        ) {
+                                            this.setState({
+                                                showLndHubModal: true
+                                            });
+                                        } else {
+                                            createAccount(
+                                                lndhubUrl,
+                                                certVerification,
+                                                enableTor
+                                            ).then((data: any) => {
+                                                if (data) {
+                                                    this.setState({
+                                                        username: data.login,
+                                                        password: data.password,
+                                                        existingAccount: true
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    }}
+                                    disabled={loading || !lndhubUrl}
+                                />
+                            </View>
+                        )}
+
+                        {((implementation === 'embedded-lnd' &&
+                            adminMacaroon) ||
+                            (implementation === 'ldk-node' &&
+                                ldkNodeInitialized)) && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Settings.WalletConfiguration.walletInterface'
+                                )}
+                                value={
+                                    INTERFACE_KEYS.find(
+                                        (k) => k.value === implementation
+                                    )?.key
+                                }
+                            />
+                        )}
+
+                        {implementation === 'embedded-lnd' && adminMacaroon && (
+                            <KeyValue
+                                keyValue={localeString('general.network')}
+                                value={embeddedLndNetwork}
+                            />
+                        )}
+
+                        {implementation === 'embedded-lnd' && adminMacaroon && (
+                            <KeyValue
+                                keyValue={localeString(
+                                    'views.Settings.WalletConfiguration.database'
+                                )}
+                                value={
+                                    isSqlite
+                                        ? `SQLite (${localeString(
+                                              'general.experimental'
+                                          )})`
+                                        : 'Bolt'
+                                }
+                            />
+                        )}
+
+                        {implementation === 'ldk-node' &&
+                            ldkNodeInitialized && (
+                                <KeyValue
+                                    keyValue={localeString('general.network')}
+                                    value={localeString(
+                                        EMBEDDED_NODE_NETWORK_KEYS.find(
+                                            (k) =>
+                                                k.value ===
+                                                (ldkNetwork || 'mainnet')
+                                        )?.translateKey || 'network.mainnet'
+                                    )}
+                                />
+                            )}
+
+                        {implementation === 'embedded-lnd' &&
+                            recoveryCipherSeed && (
+                                <WarningMessage
+                                    message={localeString(
+                                        'views.Settings.NodeConfiguration.restoreWarning'
+                                    )}
+                                />
+                            )}
+
+                        {active && (
+                            <View style={{ alignItems: 'center' }}>
+                                <Pill
+                                    title={localeString(
+                                        'views.Settings.WalletConfiguration.walletActive'
+                                    )}
+                                    backgroundColor="transparent"
+                                    width={'100%'}
+                                />
+                            </View>
+                        )}
+
+                        {((implementation === 'embedded-lnd' &&
+                            adminMacaroon &&
+                            this.state.seedPhrase?.length) ||
+                            (implementation === 'ldk-node' &&
+                                ldkNodeInitialized &&
+                                ldkMnemonic)) && (
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString(
+                                        'views.Settings.NodeConfiguration.backUpWallet'
+                                    )}
+                                    onPress={() => {
+                                        // SettingsStore only mirrors the active
+                                        // node. Pass this node's seed only when
+                                        // viewing an inactive wallet so active
+                                        // backup/export paths stay unchanged.
+                                        if (active) {
+                                            reAuthNavigation(
+                                                navigation,
+                                                'Seed',
+                                                implementation === 'ldk-node'
+                                                    ? {
+                                                          implementation:
+                                                              'ldk-node'
+                                                      }
+                                                    : undefined
+                                            );
+                                            return;
+                                        }
+                                        const walletSeedPhrase =
+                                            implementation === 'ldk-node'
+                                                ? (this.state.ldkMnemonic || '')
+                                                      .trim()
+                                                      .split(/\s+/)
+                                                : this.state.seedPhrase;
+                                        const walletNetwork =
+                                            implementation === 'ldk-node'
+                                                ? ldkNetwork
+                                                : embeddedLndNetwork;
+                                        const isTestNet =
+                                            (
+                                                walletNetwork || 'mainnet'
+                                            ).toLowerCase() !== 'mainnet';
+                                        reAuthNavigation(navigation, 'Seed', {
+                                            walletSeedPhrase,
+                                            implementation,
+                                            isTestNet
+                                        });
+                                    }}
+                                    secondary
+                                    disabled={loading}
+                                />
+                            </View>
+                        )}
+
+                        {implementation === 'embedded-lnd' && (
+                            <View style={{ ...styles.button }}>
+                                {!adminMacaroon && !creatingWallet && (
+                                    <>
+                                        <View style={styles.button}>
+                                            <Button
+                                                title={localeString(
+                                                    'views.Settings.NodeConfiguration.createWallet',
+                                                    {
+                                                        network: localeString(
+                                                            EMBEDDED_NODE_NETWORK_KEYS.find(
+                                                                (k) =>
+                                                                    k.value ===
+                                                                    (embeddedLndNetwork ||
+                                                                        'mainnet')
+                                                            )?.translateKey ||
+                                                                'network.mainnet'
+                                                        )
+                                                    }
+                                                )}
+                                                onPress={async () => {
+                                                    await this.createNewWallet(
+                                                        embeddedLndNetwork ===
+                                                            'mainnet'
+                                                            ? undefined
+                                                            : 'Testnet'
+                                                    );
+                                                }}
+                                                tertiary
+                                                disabled={loading}
+                                            />
+                                        </View>
+                                        <View style={styles.button}>
+                                            <Button
+                                                title={localeString(
+                                                    'views.Settings.NodeConfiguration.restoreWallet',
+                                                    {
+                                                        network: localeString(
+                                                            EMBEDDED_NODE_NETWORK_KEYS.find(
+                                                                (k) =>
+                                                                    k.value ===
+                                                                    (embeddedLndNetwork ||
+                                                                        'mainnet')
+                                                            )?.translateKey ||
+                                                                'network.mainnet'
+                                                        )
+                                                    }
+                                                )}
+                                                onPress={() =>
+                                                    navigation.navigate(
+                                                        'SeedRecovery',
+                                                        {
+                                                            network:
+                                                                embeddedLndNetwork,
+                                                            nickname,
+                                                            photo,
+                                                            isSqlite:
+                                                                isSqlite ??
+                                                                false
+                                                        }
+                                                    )
+                                                }
+                                                secondary
+                                                disabled={loading}
+                                            />
+                                        </View>
+                                    </>
+                                )}
+                            </View>
+                        )}
+
+                        {!creatingWallet &&
+                            !(
+                                (implementation === 'embedded-lnd' &&
+                                    !adminMacaroon) ||
+                                (implementation === 'ldk-node' &&
+                                    !ldkNodeInitialized)
+                            ) &&
+                            !saved && (
+                                <View style={{ ...styles.button }}>
+                                    <Button
+                                        title={localeString(
+                                            'views.Settings.WalletConfiguration.saveWallet'
+                                        )}
+                                        onPress={() => {
+                                            if (
+                                                !saved &&
+                                                !certVerification &&
+                                                !enableTor &&
+                                                !isLocalImpl &&
+                                                implementation !==
+                                                    'lightning-node-connect' &&
+                                                implementation !==
+                                                    'nostr-wallet-connect' &&
+                                                // The cert modal is about TLS
+                                                // trust; a cleartext http host
+                                                // has no cert, so skip straight
+                                                // to the cleartext warning.
+                                                !this.hasInsecureCleartextTransport()
+                                            ) {
+                                                this.setState({
+                                                    showCertModal: true
+                                                });
+                                            } else {
+                                                this.saveWalletConfiguration();
+                                            }
+                                        }}
+                                        // disable save button if processing, required input missing or input invalid
+                                        disabled={
+                                            processing ||
+                                            hostError ||
+                                            (host &&
+                                                !ValidationUtils.isValidServerAddress(
+                                                    host
+                                                )) ||
+                                            portError ||
+                                            (port &&
+                                                !ValidationUtils.isValidPort(
+                                                    port
+                                                )) ||
+                                            macaroonHexError ||
+                                            (macaroonHex &&
+                                                !ValidationUtils.hasValidMacaroonChars(
+                                                    macaroonHex
+                                                )) ||
+                                            runeError ||
+                                            (rune &&
+                                                !ValidationUtils.hasValidRuneChars(
+                                                    rune
+                                                )) ||
+                                            lndhubUrlError ||
+                                            (lndhubUrl &&
+                                                !ValidationUtils.isValidServerAddress(
+                                                    lndhubUrl,
+                                                    { allowPort: true }
+                                                )) ||
+                                            customMailboxServerError ||
+                                            (customMailboxServer &&
+                                                !ValidationUtils.isValidServerAddress(
+                                                    customMailboxServer,
+                                                    {
+                                                        allowPort: true,
+                                                        requireHttps: true
+                                                    }
+                                                )) ||
+                                            pairingPhraseError ||
+                                            (pairingPhrase &&
+                                                !ValidationUtils.hasValidPairingPhraseCharsAndWordcount(
+                                                    pairingPhrase
+                                                )) ||
+                                            nostrWalletConnectUrlInvalid ||
+                                            // Required input check
+                                            // Port is optional, it will fallback to 80 or 443
+                                            (implementation === 'lndhub' &&
+                                                !(
+                                                    lndhubUrl &&
+                                                    username &&
+                                                    password
+                                                )) ||
+                                            (implementation === 'lnd' &&
+                                                !(host && macaroonHex)) ||
+                                            (implementation === 'cln-rest' &&
+                                                !(host && rune)) ||
+                                            (implementation ===
+                                                'lightning-node-connect' &&
+                                                (!pairingPhrase ||
+                                                    (mailboxServer ===
+                                                        'custom-defined' &&
+                                                        !customMailboxServer)))
+                                        }
+                                    />
+                                </View>
+                            )}
+
+                        {creatingWallet && <LoadingIndicator />}
+
+                        {errorCreatingWallet && (
+                            <ErrorMessage
+                                message={localeString(
+                                    'views.Intro.errorCreatingWallet'
+                                )}
+                            />
+                        )}
+
+                        {!saved && certVerification && !enableTor && (
+                            <CertInstallInstructions />
+                        )}
+
+                        {saved && !active && !newEntry && (
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString(
+                                        'views.Settings.WalletConfiguration.setWalletActive'
+                                    )}
+                                    onPress={() =>
+                                        this.setWalletConfigurationAsActive()
+                                    }
+                                    disabled={processing}
+                                />
+                            </View>
+                        )}
+
+                        {saved &&
+                            implementation !== 'embedded-lnd' &&
+                            implementation !== 'ldk-node' && (
+                                <View style={styles.button}>
+                                    <Button
+                                        title={localeString(
+                                            'views.Settings.WalletConfiguration.duplicateWallet'
+                                        )}
+                                        onPress={() => {
+                                            /**
+                                             * Scrolls to the top of the screen when going to the node config
+                                             * page for the copied node. Without this, the user would have to
+                                             * manually scroll to the top to edit the copied node properties.
+                                             */
+                                            this.scrollViewRef.current?.scrollTo(
+                                                {
+                                                    x: 0,
+                                                    y: 0,
+                                                    animated: true
+                                                }
+                                            );
+                                            this.copyNodeConfig();
+                                        }}
+                                        secondary
+                                        disabled={processing}
+                                    />
+                                </View>
+                            )}
+
+                        {saved && (
+                            <View style={styles.button}>
+                                <Button
+                                    title={localeString(
+                                        'views.Settings.WalletConfiguration.deleteWallet'
+                                    )}
+                                    onPress={this.handleDeletePress}
+                                    warning
+                                    disabled={processing}
+                                />
+                            </View>
+                        )}
+
+                        {implementation === 'embedded-lnd' && !newEntry && (
+                            <>
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        textAlign: 'center',
+                                        marginTop: 20
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.Settings.NodeConfiguration.embeddedDelete2'
+                                    )}
+                                </Text>
+                            </>
+                        )}
+                    </ScrollView>
+                </KeyboardAvoidingView>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    whiteText: {
+        color: 'white',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    blackText: {
+        color: 'black',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    form: {
+        marginTop: 5,
+        width: '100%'
+    },
+    pickerWrapper: {
+        paddingLeft: 5,
+        paddingRight: 5
+    },
+    picker: {
+        height: 50
+    },
+    button: {
+        paddingVertical: 10,
+        width: 350,
+        alignSelf: 'center'
+    },
+    modal: {
+        margin: 20,
+        backgroundColor: 'white',
+        borderRadius: 20,
+        padding: 35,
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: {
+            width: 0,
+            height: 2
+        },
+        shadowOpacity: 0.25,
+        shadowRadius: 3.84,
+        elevation: 5
+    },
+    centeredView: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginTop: 22
+    },
+    container: {
+        flexDirection: 'row',
+        alignItems: 'center'
+    },
+    imageBackground: {
+        width: 50,
+        height: 50,
+        borderRadius: 25,
+        justifyContent: 'center'
+    },
+    photo: {
+        alignSelf: 'center',
+        width: 128,
+        height: 128,
+        borderRadius: 68
+    }
+});

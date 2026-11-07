@@ -1,0 +1,32 @@
+ZEUS is a mobile Bitcoin wallet with cutting edge Lightning functionality.
+
+Features:
+
+* Bitcoin only wallet
+* Non-custodial
+* No processing fees
+* No KYC
+* Fully open source (AGPLv3)
+* Connect to LND or Core Lightning remote nodes
+* Manage multiple lightning nodes at once
+* Connect via LNDHub instances
+* Lightning accounts
+* On-chain accounts
+* Easy to use activity menu
+* NFC payments and requests
+* PIN or passphrase encryption
+* Connect over Tor (built in)
+* Privacy mode - hide your sensitive data
+* Lightning address send
+* Full LNURL support (pay, withdraw, auth, channel)
+* Lighting channel management
+* Detailed routing reports
+* Set and manage routing fees
+* MPP/AMP support
+* Keysend support
+* SegWit support
+* Sign & verify messages
+* Fiat currency integrations
+* Various language support
+* Multi-theme
+* Taproot support

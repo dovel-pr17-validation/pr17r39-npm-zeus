@@ -1,0 +1,130 @@
+import * as React from 'react';
+
+import { FlatList, Platform, View } from 'react-native';
+import { Icon, ListItem } from '@rneui/themed';
+
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import Header from '../../components/Header';
+import Screen from '../../components/Screen';
+
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+import { openStoreForReview } from '../../utils/RatingUtils';
+
+import { nodeInfoStore, settingsStore } from '../../stores/Stores';
+
+interface SupportProps {
+    navigation: NativeStackNavigationProp<any, any>;
+}
+
+function Support(props: SupportProps) {
+    const { navigation } = props;
+
+    const renderSeparator = () => (
+        <View
+            style={{
+                height: 1,
+                backgroundColor: themeColor('separator')
+            }}
+        />
+    );
+
+    const haveActiveNode =
+        settingsStore?.settings?.nodes &&
+        settingsStore?.settings.nodes.length > 0;
+
+    const ABOUT_ITEMS = [
+        {
+            label: localeString('views.PaymentRequest.donateToZEUS'),
+            path: 'DonateToZEUS',
+            condition:
+                haveActiveNode &&
+                nodeInfoStore?.nodeInfo?.isMainNet &&
+                Platform.OS !== 'ios' &&
+                !settingsStore.isChannelMigrating
+        },
+        {
+            label: localeString('views.PaymentRequest.addATip'),
+            path: 'ChangeDonationSettings',
+            condition:
+                haveActiveNode &&
+                nodeInfoStore?.nodeInfo?.isMainNet &&
+                Platform.OS !== 'ios' &&
+                !settingsStore.isChannelMigrating
+        },
+        { label: localeString('views.Sponsors.title'), path: 'Sponsors' },
+        {
+            label: localeString('views.Settings.Support.store'),
+            url: 'https://store.zeusln.com'
+        },
+        {
+            label: localeString('views.Settings.SocialMedia.title'),
+            path: 'SocialMedia'
+        },
+        {
+            label: localeString('views.Settings.Support.reviewOnAppstore', {
+                storeName: localeString(
+                    Platform.OS === 'ios'
+                        ? 'general.appStore'
+                        : 'general.playStore'
+                )
+            }),
+            action: openStoreForReview
+        }
+    ];
+
+    return (
+        <Screen>
+            <Header
+                leftComponent="Back"
+                centerComponent={{
+                    text: localeString('views.Settings.Support.title'),
+                    style: {
+                        color: themeColor('text'),
+                        fontFamily: 'PPNeueMontreal-Book'
+                    }
+                }}
+                navigation={navigation}
+            />
+            <FlatList
+                data={ABOUT_ITEMS.filter((item) =>
+                    'condition' in item ? !!item.condition : true
+                )}
+                renderItem={({ item }) => (
+                    <ListItem
+                        containerStyle={{
+                            borderBottomWidth: 0,
+                            backgroundColor: 'transparent'
+                        }}
+                        onPress={() => {
+                            if (item.path) navigation.navigate(item.path);
+                            if (item.url) UrlUtils.goToUrl(item.url);
+                            if (item.action) item.action();
+                        }}
+                    >
+                        <ListItem.Content>
+                            <ListItem.Title
+                                style={{
+                                    color: themeColor('text'),
+                                    fontFamily: 'PPNeueMontreal-Book'
+                                }}
+                            >
+                                {item.label}
+                            </ListItem.Title>
+                        </ListItem.Content>
+                        <Icon
+                            name="keyboard-arrow-right"
+                            color={themeColor('secondaryText')}
+                        />
+                    </ListItem>
+                )}
+                keyExtractor={(item, index) => `${item.label}-${index}`}
+                ItemSeparatorComponent={renderSeparator}
+            />
+        </Screen>
+    );
+}
+
+export default Support;

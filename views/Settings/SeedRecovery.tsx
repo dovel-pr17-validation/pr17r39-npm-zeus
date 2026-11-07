@@ -1,0 +1,1725 @@
+import * as React from 'react';
+import {
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View,
+    TextInput as TextInputRN,
+    Keyboard,
+    Alert
+} from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { inject, observer } from 'mobx-react';
+import RNFS from 'react-native-fs';
+import {
+    pick,
+    types,
+    isErrorWithCode,
+    errorCodes
+} from '@react-native-documents/picker';
+import { Route } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { v4 as uuidv4 } from 'uuid';
+import RNRestart from 'react-native-restart';
+import { validateMnemonic } from '@scure/bip39';
+
+import {
+    ErrorMessage,
+    SuccessMessage
+} from '../../components/SuccessErrorMessage';
+
+import Button from '../../components/Button';
+import Header from '../../components/Header';
+import ModalBox from '../../components/ModalBox';
+import Screen from '../../components/Screen';
+import ZeusText from '../../components/Text';
+import TextInput from '../../components/TextInput';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import DropdownSetting from '../../components/DropdownSetting';
+import PreventRemove from '../../components/PreventRemove';
+
+import { IN_APP_RESTART } from '../../utils/InAppRestartUtils';
+import { restartNeeded } from '../../utils/RestartUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import {
+    restoreChannelBackupFromOlympus,
+    validateChannelBackupFile
+} from '../../utils/ChannelMigrationUtils';
+
+import ModalStore from '../../stores/ModalStore';
+
+import {
+    createLndWallet,
+    LndMobileEventEmitter,
+    optimizeNeutrinoPeers,
+    stopLnd,
+    waitForRpcReady,
+    STOP_LND_MAX_RETRIES,
+    STOP_LND_POLL_DELAY_MS
+} from '../../utils/LndMobileUtils';
+import { sleep } from '../../utils/SleepUtils';
+
+import {
+    createLdkNodeWallet,
+    stopLdkNode,
+    getDefaultEsploraServer,
+    getDefaultRgsServer,
+    DEFAULT_VSS_SERVER,
+    DEFAULT_SCORER_URL
+} from '../../utils/LdkNodeUtils';
+
+import { BIP39_WORD_LIST } from '../../utils/Bip39Utils';
+import { validateAezeedChecksum } from '../../utils/AezeedUtils';
+
+import SettingsStore, {
+    DEFAULT_SWAP_HOST_MAINNET,
+    DEFAULT_SWAP_HOST_TESTNET,
+    SWAP_HOST_KEYS_MAINNET,
+    SWAP_HOST_KEYS_TESTNET,
+    EMBEDDED_NODE_NETWORK_KEYS,
+    getLspConfigForNetwork,
+    Settings
+} from '../../stores/SettingsStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import SwapStore from '../../stores/SwapStore';
+import { SWAPS_RESCUE_KEY, isValidRescueKey } from '../../utils/SwapUtils';
+
+import Storage from '../../storage';
+
+interface SeedRecoveryProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    SettingsStore: SettingsStore;
+    NodeInfoStore: NodeInfoStore;
+    SwapStore: SwapStore;
+    ModalStore: ModalStore;
+    route: Route<
+        'SeedRecovery',
+        {
+            network: string;
+            implementation?: string;
+            restoreSwaps?: boolean;
+            restoreRescueKey?: boolean;
+            nickname?: string;
+            photo?: string;
+            isSqlite?: boolean;
+            wordCount?: 12 | 24;
+            vssServer?: string;
+        }
+    >;
+}
+
+interface SeedRecoveryState {
+    loading: boolean;
+    network: string;
+    selectedInputType: 'word' | 'scb' | null;
+    selectedWordIndex: number | null;
+    selectedText: string;
+    seedArray: string[];
+    filteredData: string[];
+    showSuggestions: boolean;
+    seedPhrase: string[];
+    walletPassword: string;
+    adminMacaroon: string;
+    embeddedLndNetwork: string;
+    lndDir: string;
+    recoveryCipherSeed: string;
+    channelBackupsBase64: string;
+    errorCreatingWallet: boolean;
+    errorMsg: string;
+    successMsg: string;
+    restoreSwaps?: boolean;
+    restoreRescueKey?: boolean;
+    rescueHost: string;
+    customRescueHost: string;
+    invalidInput: boolean;
+    showClipboardPrompt: boolean;
+    clipboardSeedArray: string[];
+    showValidation: boolean;
+    // LDK Node specific
+    implementation: string;
+    ldkMnemonic: string;
+    ldkPassphrase: string;
+    ldkNodeDir: string;
+    ldkWordCount: 12 | 24;
+    channelDbUri?: string;
+    channelDbFileName?: string;
+    olympusRestorePending: boolean;
+    embeddedLndIsSqlite: boolean;
+}
+
+@inject('NodeInfoStore', 'SettingsStore', 'SwapStore', 'ModalStore')
+@observer
+export default class SeedRecovery extends React.PureComponent<
+    SeedRecoveryProps,
+    SeedRecoveryState
+> {
+    textInput: React.RefObject<TextInputRN | null>;
+    constructor(props: SeedRecoveryProps) {
+        super(props);
+
+        const isTestnet = props.NodeInfoStore?.nodeInfo?.isTestNet;
+        const { settings } = props.SettingsStore;
+
+        this.textInput = React.createRef<TextInputRN>();
+        this.state = {
+            loading: false,
+            network: 'mainnet',
+            selectedInputType: null,
+            selectedWordIndex: null,
+            selectedText: '',
+            seedArray: [],
+            seedPhrase: [],
+            filteredData: [],
+            showSuggestions: false,
+            walletPassword: '',
+            adminMacaroon: '',
+            embeddedLndNetwork: 'mainnet',
+            lndDir: '',
+            recoveryCipherSeed: '',
+            channelBackupsBase64: '',
+            errorCreatingWallet: false,
+            errorMsg: '',
+            successMsg: '',
+            rescueHost: isTestnet
+                ? settings.swaps?.hostTestnet || DEFAULT_SWAP_HOST_TESTNET
+                : settings.swaps?.hostMainnet || DEFAULT_SWAP_HOST_MAINNET,
+            customRescueHost: settings.swaps?.customHost || '',
+            invalidInput: false,
+            showClipboardPrompt: false,
+            clipboardSeedArray: [],
+            showValidation: false,
+            // LDK Node defaults
+            implementation: 'embedded-lnd',
+            ldkMnemonic: '',
+            ldkPassphrase: '',
+            ldkNodeDir: '',
+            ldkWordCount: 12,
+            olympusRestorePending: false,
+            embeddedLndIsSqlite: false
+        };
+    }
+
+    private acceptedWordCounts(
+        params: SeedRecoveryProps['route']['params']
+    ): (12 | 24)[] {
+        const implementation = params?.implementation ?? 'embedded-lnd';
+        if (
+            params?.restoreSwaps === true ||
+            params?.restoreRescueKey === true
+        ) {
+            return [12];
+        }
+        if (implementation === 'ldk-node') {
+            return [12, 24];
+        }
+        return [24];
+    }
+
+    // Effective seed length for the current flow, read from state for rendering.
+    // LDK's value comes from the `wordCount` chosen on the
+    // LdkWalletRecoverySettings screen
+    private currentWordCount(): 12 | 24 {
+        const { implementation, restoreSwaps, restoreRescueKey, ldkWordCount } =
+            this.state;
+        if (restoreSwaps || restoreRescueKey) {
+            return 12;
+        }
+        if (implementation === 'ldk-node') {
+            return ldkWordCount;
+        }
+        return 24;
+    }
+
+    async componentDidMount() {
+        await this.initFromProps(this.props);
+
+        const { SettingsStore, route } = this.props;
+        const { settings } = SettingsStore;
+
+        if (settings.privacy && settings.privacy.clipboard) {
+            const clipboard = await Clipboard.getString();
+            const clipboardWords = clipboard.trim().split(/\s+/);
+            const acceptedWordCounts = this.acceptedWordCounts(route.params);
+
+            if (acceptedWordCounts.includes(clipboardWords.length as 12 | 24)) {
+                this.setState({
+                    showClipboardPrompt: true,
+                    clipboardSeedArray: clipboardWords
+                });
+            }
+        }
+    }
+
+    async componentDidUpdate(prevProps: SeedRecoveryProps) {
+        if (this.props.route.params !== prevProps.route.params) {
+            await this.initFromProps(this.props);
+        }
+    }
+
+    exitScbEntry = () => {
+        Keyboard.dismiss();
+        this.setState({
+            selectedInputType: null,
+            selectedText: ''
+        });
+    };
+
+    async initFromProps(props: SeedRecoveryProps) {
+        const network = props.route.params?.network ?? 'mainnet';
+        const implementation =
+            props.route.params?.implementation ?? 'embedded-lnd';
+        const restoreSwaps = props.route.params?.restoreSwaps ?? false;
+        const restoreRescueKey = props.route.params?.restoreRescueKey ?? false;
+        const isSqlite = props.route.params?.isSqlite ?? false;
+        const wordCount = props.route.params?.wordCount ?? 12;
+        this.setState({
+            embeddedLndIsSqlite: isSqlite,
+            network,
+            implementation,
+            restoreSwaps,
+            restoreRescueKey,
+            ldkWordCount: wordCount
+        });
+    }
+
+    finishRestoreWallet = (nodes: any) => {
+        const { SettingsStore, navigation } = this.props;
+        const { embeddedLndStarted, setConnectingStatus } = SettingsStore;
+        const { olympusRestorePending } = this.state;
+
+        if (olympusRestorePending) {
+            Alert.alert(
+                localeString('views.Tools.migration.import.restoreComplete'),
+                localeString(
+                    'views.Tools.migration.import.restoreComplete.text'
+                ),
+                [
+                    {
+                        text: localeString('views.Wallet.restart'),
+                        onPress: () => RNRestart.Restart(IN_APP_RESTART)
+                    }
+                ],
+                { cancelable: false }
+            );
+            return;
+        }
+
+        if (this.state.channelDbUri) {
+            Alert.alert(
+                localeString('views.Tools.migration.import.restoreComplete'),
+                localeString(
+                    'views.Tools.migration.import.restoreComplete.text'
+                ),
+                [
+                    {
+                        text: localeString('views.Wallet.restart'),
+                        onPress: () => RNRestart.Restart(IN_APP_RESTART)
+                    }
+                ],
+                { cancelable: false }
+            );
+            return;
+        }
+
+        if (nodes.length === 1) {
+            setConnectingStatus(true);
+            SettingsStore.triggerSettingsRefresh = true;
+            navigation.popTo('Wallet');
+        } else {
+            if (Platform.OS === 'android' && embeddedLndStarted) {
+                restartNeeded(true);
+            } else {
+                navigation.popTo('Wallets');
+            }
+        }
+    };
+
+    askForChannelBackupFirst = (onProceed: () => void) => {
+        const { embeddedLndIsSqlite } = this.state;
+        this.props.ModalStore.toggleRestoreChannelModal({
+            show: true,
+            ...(embeddedLndIsSqlite && {
+                onCheckOlympus: () => {
+                    this.handleImportChannelsFromOlympus(onProceed);
+                }
+            }),
+            onImportFile: () => {
+                this.handleImportFile(onProceed);
+            },
+            onContinueWithoutBackup: () => {
+                onProceed();
+            },
+            onCancel: () => {}
+        });
+    };
+
+    handleImportFile = async (onProceed: () => void) => {
+        try {
+            const [result] = await pick({
+                type: [types.allFiles],
+                mode: 'import'
+            });
+            if (result.uri) {
+                const fileName = result.name ?? 'graph-backup';
+                const validation = await validateChannelBackupFile(
+                    result.uri,
+                    fileName
+                );
+
+                if (!validation.valid) {
+                    Alert.alert(
+                        localeString('general.error'),
+                        validation.error
+                    );
+                    return;
+                }
+
+                this.setState(
+                    { channelDbUri: result.uri, channelDbFileName: fileName },
+                    () => onProceed()
+                );
+            } else {
+                this.askForChannelBackupFirst(onProceed);
+            }
+        } catch (e) {
+            if (
+                !isErrorWithCode(e) ||
+                e.code !== errorCodes.OPERATION_CANCELED
+            ) {
+                Alert.alert(localeString('general.error'));
+            }
+        }
+    };
+
+    handleImportChannelsFromOlympus = async (onProceed: () => void) => {
+        this.setState({ olympusRestorePending: true }, () => {
+            onProceed();
+        });
+    };
+
+    saveWalletConfiguration = (recoveryCipherSeed?: string) => {
+        const { SettingsStore, route } = this.props;
+        const {
+            walletPassword,
+            adminMacaroon,
+            embeddedLndNetwork,
+            seedPhrase,
+            lndDir,
+            embeddedLndIsSqlite
+        } = this.state;
+        const { updateSettings } = SettingsStore;
+
+        const nickname = route.params?.nickname;
+        const photo = route.params?.photo;
+
+        const node = {
+            nickname,
+            photo,
+            seedPhrase,
+            walletPassword,
+            adminMacaroon,
+            embeddedLndNetwork,
+            implementation: 'embedded-lnd',
+            lndDir,
+            isSqlite: embeddedLndIsSqlite
+        };
+
+        // Appended inside the queued update so a write still in the queue
+        // cannot be undone by a nodes array copied before it landed
+        let nodes: any[] = [];
+        updateSettings((current: Settings) => {
+            nodes = [...(current.nodes || []), node];
+            return {
+                nodes,
+                selectedNode: nodes.length - 1,
+                recovery: recoveryCipherSeed ? true : false,
+                initialLoad: false
+            };
+        }).then(async () => {
+            this.finishRestoreWallet(nodes);
+        });
+    };
+
+    saveLdkNodeWalletConfiguration = (
+        mnemonic: string,
+        nodeDir: string,
+        network: string
+    ) => {
+        const { SettingsStore, navigation, route } = this.props;
+        const { ldkPassphrase } = this.state;
+        const { setConnectingStatus, updateSettings } = SettingsStore;
+
+        const nickname = route.params?.nickname;
+        const photo = route.params?.photo;
+
+        const networkType = network as
+            | 'mainnet'
+            | 'testnet'
+            | 'signet'
+            | 'regtest';
+
+        const node = {
+            nickname,
+            photo,
+            implementation: 'ldk-node',
+            ldkNetwork: network,
+            ldkNodeDir: nodeDir,
+            ldkMnemonic: mnemonic,
+            ldkPassphrase,
+            ldkEsploraServer: getDefaultEsploraServer(networkType),
+            ldkRgsServer: getDefaultRgsServer(networkType),
+            ldkVssServer: route.params?.vssServer || DEFAULT_VSS_SERVER
+        };
+
+        let nodes: any[] = [];
+        updateSettings((current: Settings) => {
+            nodes = [...(current.nodes || []), node];
+            return {
+                nodes,
+                selectedNode: nodes.length - 1,
+                recovery: true
+            };
+        }).then(async () => {
+            setConnectingStatus(true);
+            if (nodes.length === 1) {
+                navigation.popTo('Wallet');
+            } else {
+                navigation.popTo('Wallets');
+            }
+        });
+    };
+
+    render() {
+        const { navigation, NodeInfoStore, SwapStore } = this.props;
+        const {
+            loading,
+            network,
+            selectedWordIndex,
+            selectedInputType,
+            selectedText,
+            seedArray,
+            channelBackupsBase64,
+            showSuggestions,
+            filteredData,
+            errorMsg,
+            successMsg,
+            restoreSwaps,
+            restoreRescueKey,
+            rescueHost,
+            customRescueHost,
+            showValidation,
+            implementation
+        } = this.state;
+
+        const wordCount = this.currentWordCount();
+        const isLdkNode = implementation === 'ldk-node';
+
+        const invalidWordIndices: number[] = showValidation
+            ? seedArray.reduce((acc: number[], word, i) => {
+                  if (!BIP39_WORD_LIST.includes(word?.toLowerCase()?.trim())) {
+                      acc.push(i);
+                  }
+                  return acc;
+              }, [])
+            : [];
+
+        const isTestnet = NodeInfoStore?.nodeInfo?.isTestNet;
+
+        const filterData = (text: string) =>
+            BIP39_WORD_LIST.filter((val: string) =>
+                val?.toLowerCase()?.startsWith(text?.toLowerCase())
+            );
+
+        const RecoveryLabel = ({
+            type,
+            index,
+            text
+        }: {
+            type: 'mnemonicWord' | 'scb';
+            index?: number;
+            text?: string;
+        }) => {
+            return (
+                <TouchableOpacity
+                    onPress={() => {
+                        if (showSuggestions) {
+                            if (type === 'scb') {
+                                this.setState({
+                                    channelBackupsBase64: text || '',
+                                    selectedText: text || ''
+                                });
+                            } else if (selectedWordIndex != null) {
+                                seedArray[selectedWordIndex] = text || '';
+                                this.setState({ seedArray } as any);
+                                if (selectedWordIndex < wordCount - 1) {
+                                    this.setState({
+                                        selectedWordIndex:
+                                            selectedWordIndex + 1,
+                                        selectedText:
+                                            seedArray[selectedWordIndex + 1]
+                                    });
+                                } else {
+                                    this.setState({
+                                        selectedText: text || ''
+                                    });
+                                    Keyboard.dismiss();
+                                }
+                            }
+                        } else {
+                            this.setState({ selectedText: text || '' });
+                            if (index != null) {
+                                this.setState({
+                                    selectedInputType: 'word',
+                                    selectedWordIndex: index
+                                });
+                            } else {
+                                this.setState({ selectedInputType: 'scb' });
+                            }
+                        }
+
+                        if (type === 'scb') {
+                            this.setState({
+                                showSuggestions: false,
+                                selectedWordIndex: null
+                            });
+                        } else {
+                            this.setState({
+                                showSuggestions: false
+                            });
+                        }
+
+                        // set focus
+                        if (!Keyboard.isVisible()) {
+                            this.textInput?.current?.blur();
+                            this.textInput?.current?.focus();
+                        }
+                    }}
+                    style={{
+                        padding: 8,
+                        backgroundColor: themeColor('secondary'),
+                        borderRadius: 5,
+                        marginTop: 4,
+                        marginBottom: 4,
+                        marginLeft: 6,
+                        marginRight: 6,
+                        flexDirection: 'row',
+                        maxHeight: type === 'scb' ? 60 : undefined,
+                        ...(!showSuggestions &&
+                            index != null &&
+                            invalidWordIndices.includes(index) && {
+                                borderWidth: 1,
+                                borderColor: themeColor('warning')
+                            })
+                    }}
+                >
+                    {!showSuggestions && index != null && (
+                        <View>
+                            <Text
+                                style={{
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    color:
+                                        selectedInputType === 'word' &&
+                                        selectedWordIndex === index
+                                            ? themeColor('highlight')
+                                            : themeColor('secondaryText'),
+                                    fontSize: 18,
+                                    alignSelf: 'flex-start'
+                                }}
+                            >
+                                {index + 1}
+                            </Text>
+                        </View>
+                    )}
+                    {!showSuggestions && type === 'scb' && (
+                        <Text
+                            style={{
+                                fontFamily: 'PPNeueMontreal-Book',
+                                color:
+                                    selectedInputType === 'scb'
+                                        ? themeColor('highlight')
+                                        : themeColor('secondaryText'),
+                                fontSize: 18,
+                                alignSelf: 'flex-start'
+                            }}
+                        >
+                            {localeString(
+                                'views.Settings.AddEditNode.disasterRecoveryBase64'
+                            )}
+                        </Text>
+                    )}
+                    <Text
+                        style={{
+                            flex: 1,
+                            fontFamily: 'PPNeueMontreal-Medium',
+                            color:
+                                !showSuggestions && type === 'scb'
+                                    ? text
+                                        ? themeColor('highlight')
+                                        : themeColor('secondaryText')
+                                    : themeColor('text'),
+                            fontSize: 18,
+                            alignSelf:
+                                type === 'mnemonicWord'
+                                    ? 'flex-end'
+                                    : undefined,
+                            margin: 0,
+                            marginLeft: showSuggestions ? 0 : 10,
+                            padding: 0
+                        }}
+                    >
+                        {index != null &&
+                        text &&
+                        !(
+                            selectedInputType === 'word' &&
+                            selectedWordIndex === index
+                        )
+                            ? '********'
+                            : !showSuggestions && type === 'scb'
+                            ? text
+                                ? localeString('general.set')
+                                : localeString('general.notSet')
+                            : text}
+                    </Text>
+                </TouchableOpacity>
+            );
+        };
+
+        const halfwayThrough = Math.ceil(filteredData.length / 2);
+        const suggestionsOne = filteredData.slice(0, halfwayThrough);
+        const suggestionsTwo = filteredData.slice(
+            halfwayThrough,
+            filteredData.length
+        );
+
+        // Typed words keep the user's raw casing/spacing for display, but
+        // checksums and key derivation are case- and whitespace-sensitive,
+        // so everything that validates, restores, or persists a seed must
+        // use this canonical form.
+        const normalizedSeedArray = seedArray.map(
+            (word: string) => word?.toLowerCase()?.trim() || ''
+        );
+
+        const restore = async () => {
+            this.setState({
+                errorCreatingWallet: false,
+                errorMsg: '',
+                successMsg: ''
+            });
+
+            // Validate all seed words against BIP39 wordlist before attempting restore
+            const invalidWords: number[] = [];
+            normalizedSeedArray.forEach((word: string, i: number) => {
+                if (!BIP39_WORD_LIST.includes(word)) {
+                    invalidWords.push(i + 1); // 1-based index to match UI
+                }
+            });
+            if (invalidWords.length > 0) {
+                this.setState({
+                    errorMsg: `${localeString(
+                        'views.Settings.NodeConfiguration.invalidSeedWord'
+                    )}: #${invalidWords.join(', #')}`
+                });
+                return;
+            }
+
+            // Check for a duplicate wallet with the same seed.
+            const { SettingsStore } = this.props;
+            const { settings } = SettingsStore;
+            const existingNodes = settings.nodes || [];
+            const seedWords = normalizedSeedArray.join(' ');
+            const duplicateNode = existingNodes.find((node: any) => {
+                if (node.implementation === 'embedded-lnd' && node.seedPhrase) {
+                    return (
+                        node.seedPhrase
+                            .map((w: string) => w?.toLowerCase()?.trim())
+                            .join(' ') === seedWords
+                    );
+                }
+                if (node.implementation === 'ldk-node' && node.ldkMnemonic) {
+                    return node.ldkMnemonic.toLowerCase().trim() === seedWords;
+                }
+                return false;
+            });
+            if (duplicateNode) {
+                this.setState({
+                    errorMsg: localeString(
+                        'views.Settings.SeedRecovery.duplicateWallet'
+                    )
+                });
+                return;
+            }
+
+            this.setState({ loading: true });
+
+            if (implementation === 'ldk-node') {
+                // LDK Node restore
+                const mnemonic = normalizedSeedArray.join(' ');
+
+                // LDK seeds are BIP39, so verify the checksum up front.
+                if (!validateMnemonic(mnemonic, BIP39_WORD_LIST)) {
+                    this.setState({
+                        loading: false,
+                        errorMsg: localeString(
+                            'views.Settings.SeedRecovery.invalidChecksum'
+                        )
+                    });
+                    return;
+                }
+
+                await stopLdkNode();
+
+                const nodeDir = uuidv4();
+
+                try {
+                    // Get LSPS1 config from settings based on network
+                    const { SettingsStore } = this.props;
+                    const { settings } = SettingsStore;
+                    const lspConfig = getLspConfigForNetwork(
+                        settings,
+                        network || 'mainnet'
+                    );
+                    const lsps1Token = settings.lsps1Token;
+
+                    const lsps1Config =
+                        lspConfig.lsps1Pubkey && lspConfig.lsps1Host
+                            ? {
+                                  nodeId: lspConfig.lsps1Pubkey,
+                                  address: lspConfig.lsps1Host,
+                                  token: lsps1Token || null
+                              }
+                            : undefined;
+
+                    // Always include Flow LSP pubkey as trusted 0-conf peer
+                    const flowLspPubkey = lspConfig.defaultPubkey;
+
+                    const trustedPeers = [flowLspPubkey];
+                    if (
+                        lsps1Config?.nodeId &&
+                        lsps1Config.nodeId !== flowLspPubkey
+                    ) {
+                        trustedPeers.push(lsps1Config.nodeId);
+                    }
+
+                    const networkType = network as
+                        | 'mainnet'
+                        | 'testnet'
+                        | 'signet'
+                        | 'regtest'
+                        | 'mutinynet';
+
+                    await createLdkNodeWallet({
+                        nodeDir,
+                        seedMnemonic: mnemonic,
+                        network: networkType,
+                        esploraServerUrl: getDefaultEsploraServer(networkType),
+                        rgsServerUrl: getDefaultRgsServer(networkType),
+                        scorerUrl: DEFAULT_SCORER_URL,
+                        lsps1Config,
+                        trustedPeers0conf: trustedPeers,
+                        vssServerUrl:
+                            this.props.route.params?.vssServer ||
+                            DEFAULT_VSS_SERVER,
+                        // A restore that can't reach VSS must fail loudly:
+                        // falling back to an empty local store would look
+                        // like a successful restore with no channels
+                        failOnVssError: true
+                    });
+
+                    // Node is already built — tell Wallet.tsx to skip re-init
+                    SettingsStore.walletJustCreated = true;
+
+                    this.saveLdkNodeWalletConfiguration(
+                        mnemonic,
+                        nodeDir,
+                        network
+                    );
+                } catch (e: any) {
+                    const rawError = e?.message || e.toString();
+                    const isVssError =
+                        e?.code === 'vss_error' ||
+                        rawError.includes('VSS') ||
+                        rawError.includes('Dual store');
+                    this.setState({
+                        errorCreatingWallet: true,
+                        errorMsg: isVssError
+                            ? `${localeString(
+                                  'views.Settings.SeedRecovery.vssRestoreFailed'
+                              )}\n\n${rawError}`
+                            : e.toString(),
+                        successMsg: '',
+                        loading: false
+                    });
+                }
+            } else {
+                // Embedded LND restore
+
+                // Aezeed carries its own version byte and CRC32 checksum, so
+                // a typo can be caught right here; without this gate it only
+                // surfaces minutes later as a raw InitWallet error, after
+                // LND has been stopped and restarted with a fresh lndDir.
+                try {
+                    validateAezeedChecksum(normalizedSeedArray);
+                } catch (e) {
+                    this.setState({
+                        loading: false,
+                        errorMsg: localeString(
+                            'views.Settings.SeedRecovery.invalidChecksum'
+                        )
+                    });
+                    return;
+                }
+
+                // Only stop LND if it's actually running — calling
+                // stopLnd when the daemon isn't up causes
+                // LndmobileStopDaemon to never call back, stalling
+                // the restore flow indefinitely.
+                if (this.props.SettingsStore.embeddedLndStarted) {
+                    this.setState({
+                        successMsg: localeString(
+                            'views.Tools.migration.export.stoppingLnd'
+                        )
+                    });
+                    try {
+                        await stopLnd(
+                            STOP_LND_MAX_RETRIES,
+                            STOP_LND_POLL_DELAY_MS,
+                            true
+                        );
+                    } catch (e: any) {
+                        console.log(
+                            'stopLnd during restore (expected):',
+                            e?.message || e
+                        );
+                    }
+
+                    // Clean up stale event listeners and give the Go
+                    // LND process time to fully shut down before
+                    // starting a new instance.
+                    LndMobileEventEmitter.removeAllListeners('SubscribeState');
+                    await sleep(Platform.OS === 'ios' ? 2000 : 4000);
+                }
+
+                this.setState({
+                    successMsg: localeString(
+                        'views.Tools.migration.status.optimizingPeers'
+                    )
+                });
+                await optimizeNeutrinoPeers(network === 'testnet');
+
+                const recoveryCipherSeed = normalizedSeedArray.join(' ');
+
+                const lndDir = uuidv4();
+
+                const { channelDbUri, channelDbFileName, embeddedLndIsSqlite } =
+                    this.state;
+
+                try {
+                    const response = await createLndWallet({
+                        lndDir,
+                        seedMnemonic: recoveryCipherSeed,
+                        isTestnet: network === 'testnet',
+                        channelBackupsBase64,
+                        channelDbUri,
+                        channelDbFileName,
+                        isSqlite: embeddedLndIsSqlite,
+                        setStatus: (msg) =>
+                            this.setState({
+                                successMsg: msg || ''
+                            })
+                    });
+
+                    const { wallet, seed, randomBase64 }: any = response;
+
+                    if (wallet && wallet.admin_macaroon) {
+                        let olympusRestoreSuccess = true;
+
+                        if (this.state.olympusRestorePending) {
+                            try {
+                                this.setState({
+                                    successMsg: localeString(
+                                        'views.Tools.migration.import.waitingForLnd'
+                                    )
+                                });
+
+                                const nodeInfo = await waitForRpcReady();
+
+                                this.setState({
+                                    successMsg: localeString(
+                                        'views.Tools.migration.import.downloadingFromOlympus'
+                                    )
+                                });
+
+                                const restored =
+                                    await restoreChannelBackupFromOlympus(
+                                        lndDir,
+                                        nodeInfo.testnet,
+                                        nodeInfo.identity_pubkey,
+                                        recoveryCipherSeed
+                                    );
+                                if (!restored) {
+                                    this.setState({
+                                        olympusRestorePending: false
+                                    });
+                                }
+                            } catch (e: any) {
+                                olympusRestoreSuccess = false;
+                                this.setState({
+                                    errorCreatingWallet: true,
+                                    errorMsg: localeString(
+                                        'views.Tools.migration.import.olympusRestoreFailed',
+                                        {
+                                            error: e.message || e.toString()
+                                        }
+                                    ),
+                                    successMsg: '',
+                                    loading: false
+                                });
+                            }
+                        }
+
+                        if (olympusRestoreSuccess) {
+                            this.setState(
+                                {
+                                    adminMacaroon: wallet.admin_macaroon,
+                                    seedPhrase: seed.cipher_seed_mnemonic,
+                                    walletPassword: randomBase64,
+                                    embeddedLndNetwork:
+                                        network.charAt(0).toUpperCase() +
+                                        network.slice(1),
+                                    lndDir
+                                },
+                                () => {
+                                    this.saveWalletConfiguration(
+                                        recoveryCipherSeed
+                                    );
+                                }
+                            );
+                        }
+                    } else {
+                        this.setState({
+                            loading: false,
+                            errorCreatingWallet: true,
+                            successMsg: ''
+                        });
+                    }
+                } catch (e: any) {
+                    this.setState({
+                        errorCreatingWallet: true,
+                        errorMsg: e.toString(),
+                        successMsg: '',
+                        loading: false
+                    });
+                }
+            }
+        };
+
+        return (
+            <Screen>
+                {/* Backing out of SCB entry (header arrow, iOS swipe, Android
+                    hardware back) must return to the seed grid, not pop the
+                    screen and discard the hand-entered seed */}
+                <PreventRemove
+                    enabled={selectedInputType === 'scb'}
+                    onAttempt={this.exitScbEntry}
+                />
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: restoreSwaps
+                            ? localeString(
+                                  'views.Swaps.SwapsPane.swapsRecovery'
+                              )
+                            : restoreRescueKey
+                            ? localeString('views.Swaps.rescueKey.recovery')
+                            : localeString('views.Settings.SeedRecovery.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    navigation={navigation}
+                />
+                {errorMsg && <ErrorMessage message={errorMsg} dismissable />}
+                {invalidWordIndices.length > 0 && (
+                    <ErrorMessage
+                        message={`${localeString(
+                            'views.Settings.NodeConfiguration.invalidSeedWord'
+                        )}: #${invalidWordIndices
+                            .map((i) => i + 1)
+                            .join(', #')}`}
+                    />
+                )}
+                {!loading && successMsg && (
+                    <SuccessMessage message={successMsg} />
+                )}
+                {loading && (
+                    <View
+                        style={{
+                            flex: 1,
+                            justifyContent: 'center',
+                            alignItems: 'center'
+                        }}
+                    >
+                        <LoadingIndicator />
+                        {!!successMsg && (
+                            <Text
+                                style={{
+                                    color: themeColor('text'),
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    fontSize: 15,
+                                    marginTop: 20
+                                }}
+                            >
+                                {successMsg}
+                            </Text>
+                        )}
+                    </View>
+                )}
+                {!loading && (
+                    <View style={{ flex: 1, justifyContent: 'center' }}>
+                        <View>
+                            {selectedInputType != null && (
+                                <TextInput
+                                    ref={this.textInput}
+                                    onFocus={() => {
+                                        if (
+                                            selectedText?.length === 0 &&
+                                            selectedInputType !== 'scb'
+                                        ) {
+                                            this.setState({
+                                                showSuggestions: true
+                                            });
+                                        }
+                                    }}
+                                    value={selectedText}
+                                    prefix={
+                                        selectedInputType === 'word'
+                                            ? (selectedWordIndex as number) + 1
+                                            : 'SCB'
+                                    }
+                                    prefixStyle={{
+                                        color: themeColor('highlight')
+                                    }}
+                                    textColor={
+                                        this.state.invalidInput
+                                            ? themeColor('error')
+                                            : undefined
+                                    }
+                                    style={{
+                                        margin: 20,
+                                        marginLeft: 10,
+                                        marginRight: 10,
+                                        width: '90%',
+                                        alignSelf: 'center',
+                                        ...(selectedInputType === 'scb' && {
+                                            maxHeight: 200,
+                                            padding: 10,
+                                            paddingRight: 20
+                                        })
+                                    }}
+                                    multiline={selectedInputType === 'scb'}
+                                    autoCapitalize="none"
+                                    autoCorrect={false}
+                                    autoFocus
+                                    onChangeText={(text: string) => {
+                                        this.setState({
+                                            errorMsg: '',
+                                            selectedText: text
+                                        });
+
+                                        if (selectedInputType === 'word') {
+                                            this.setState({
+                                                showSuggestions:
+                                                    text.length > 0
+                                                        ? true
+                                                        : false
+                                            });
+                                        } else if (
+                                            selectedInputType === 'scb'
+                                        ) {
+                                            this.setState({
+                                                showSuggestions: false
+                                            });
+                                        }
+
+                                        if (text.length > 0) {
+                                            const filtered = filterData(text);
+                                            this.setState({
+                                                filteredData: filtered,
+                                                invalidInput:
+                                                    selectedInputType ===
+                                                        'word' &&
+                                                    filtered.length === 0
+                                            });
+                                        } else {
+                                            this.setState({
+                                                filteredData: BIP39_WORD_LIST,
+                                                invalidInput: false
+                                            });
+                                        }
+
+                                        if (selectedInputType === 'scb') {
+                                            this.setState({
+                                                channelBackupsBase64: text
+                                            });
+                                        }
+                                        if (
+                                            (restoreSwaps ||
+                                                restoreRescueKey ||
+                                                isLdkNode) &&
+                                            (selectedWordIndex == null ||
+                                                selectedWordIndex >= wordCount)
+                                        ) {
+                                            return;
+                                        } else if (selectedWordIndex != null) {
+                                            seedArray[selectedWordIndex] = text;
+                                            this.setState({ seedArray });
+                                        }
+                                    }}
+                                />
+                            )}
+                            {selectedInputType === 'word' &&
+                                this.state.invalidInput && (
+                                    <Text
+                                        style={{
+                                            color: themeColor('error'),
+                                            fontFamily: 'PPNeueMontreal-Book',
+                                            fontSize: 14,
+                                            marginTop: 5,
+                                            marginLeft: 30
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.NodeConfiguration.invalidSeedWord'
+                                        )}
+                                    </Text>
+                                )}
+                        </View>
+                        {!showSuggestions && (
+                            <>
+                                {selectedInputType !== 'scb' && (
+                                    <ScrollView
+                                        contentContainerStyle={{
+                                            flexGrow: 1,
+                                            flexDirection: 'row'
+                                        }}
+                                        keyboardShouldPersistTaps="handled"
+                                    >
+                                        {[
+                                            Array.from(
+                                                { length: wordCount / 2 },
+                                                (_, i) => i
+                                            ),
+                                            Array.from(
+                                                { length: wordCount / 2 },
+                                                (_, i) => i + wordCount / 2
+                                            )
+                                        ].map((columnIndices, columnKey) => (
+                                            <View
+                                                key={columnKey}
+                                                style={{
+                                                    ...styles.column,
+                                                    alignSelf:
+                                                        !selectedInputType
+                                                            ? 'center'
+                                                            : undefined
+                                                }}
+                                            >
+                                                {columnIndices.map(
+                                                    (index: number) => (
+                                                        <RecoveryLabel
+                                                            key={index}
+                                                            type="mnemonicWord"
+                                                            index={index}
+                                                            text={
+                                                                seedArray[index]
+                                                            }
+                                                        />
+                                                    )
+                                                )}
+                                            </View>
+                                        ))}
+                                    </ScrollView>
+                                )}
+
+                                {!(
+                                    restoreSwaps ||
+                                    restoreRescueKey ||
+                                    implementation === 'ldk-node'
+                                ) &&
+                                    selectedInputType !== 'scb' && (
+                                        <View
+                                            style={{
+                                                flexGrow: 1,
+                                                flexDirection: 'row'
+                                            }}
+                                        >
+                                            <View style={styles.scb}>
+                                                <RecoveryLabel
+                                                    type="scb"
+                                                    text={channelBackupsBase64}
+                                                />
+                                            </View>
+                                        </View>
+                                    )}
+                                {selectedInputType === 'scb' && (
+                                    <View
+                                        style={{
+                                            marginTop: 10,
+                                            width: '100%',
+                                            paddingHorizontal: 6
+                                        }}
+                                    >
+                                        <Button
+                                            title={localeString(
+                                                'general.confirm'
+                                            )}
+                                            onPress={() => this.exitScbEntry()}
+                                            secondary
+                                        />
+                                    </View>
+                                )}
+                            </>
+                        )}
+                        {showSuggestions && (
+                            <ScrollView
+                                contentContainerStyle={{
+                                    flexGrow: 1,
+                                    flexDirection: 'row'
+                                }}
+                                keyboardShouldPersistTaps="handled"
+                            >
+                                <View style={styles.column}>
+                                    {suggestionsOne.map((key) => {
+                                        return (
+                                            <RecoveryLabel
+                                                key={key}
+                                                type="mnemonicWord"
+                                                text={key}
+                                            />
+                                        );
+                                    })}
+                                </View>
+                                <View style={styles.column}>
+                                    {suggestionsTwo.map((key) => {
+                                        return (
+                                            <RecoveryLabel
+                                                key={key}
+                                                type="mnemonicWord"
+                                                text={key}
+                                            />
+                                        );
+                                    })}
+                                </View>
+                            </ScrollView>
+                        )}
+                        {!showSuggestions && (
+                            <>
+                                {restoreSwaps && (
+                                    <View style={{ paddingHorizontal: 20 }}>
+                                        <DropdownSetting
+                                            title={localeString(
+                                                'general.serviceProvider'
+                                            )}
+                                            selectedValue={rescueHost}
+                                            onValueChange={async (
+                                                value: string
+                                            ) => {
+                                                this.setState({
+                                                    rescueHost: value,
+                                                    errorMsg: ''
+                                                });
+                                            }}
+                                            values={(isTestnet
+                                                ? SWAP_HOST_KEYS_TESTNET
+                                                : SWAP_HOST_KEYS_MAINNET
+                                            ).filter(
+                                                (provider) =>
+                                                    provider.supportsRescue
+                                            )}
+                                        />
+                                        {rescueHost === 'Custom' && (
+                                            <>
+                                                <Text
+                                                    style={{
+                                                        color: themeColor(
+                                                            'secondaryText'
+                                                        ),
+                                                        fontFamily:
+                                                            'PPNeueMontreal-Book'
+                                                    }}
+                                                >
+                                                    {localeString(
+                                                        'views.OpenChannel.host'
+                                                    )}
+                                                </Text>
+                                                <TextInput
+                                                    value={customRescueHost}
+                                                    placeholder={
+                                                        isTestnet
+                                                            ? DEFAULT_SWAP_HOST_TESTNET
+                                                            : DEFAULT_SWAP_HOST_MAINNET
+                                                    }
+                                                    onChangeText={async (
+                                                        text: string
+                                                    ) => {
+                                                        this.setState({
+                                                            customRescueHost:
+                                                                text
+                                                        });
+                                                    }}
+                                                    autoCapitalize="none"
+                                                    autoCorrect={false}
+                                                    keyboardType="url"
+                                                    error={!customRescueHost}
+                                                />
+                                            </>
+                                        )}
+                                    </View>
+                                )}
+                                {(restoreSwaps || restoreRescueKey) && (
+                                    <Button
+                                        title={localeString(
+                                            'views.Swaps.rescueKey.upload'
+                                        )}
+                                        secondary
+                                        onPress={async () => {
+                                            this.setState({
+                                                errorMsg: '',
+                                                seedArray: [],
+                                                selectedText: '',
+                                                selectedInputType: null,
+                                                selectedWordIndex: null
+                                            });
+                                            try {
+                                                const [res] = await pick({
+                                                    type: [types.allFiles]
+                                                });
+
+                                                const content =
+                                                    await RNFS.readFile(
+                                                        res.uri,
+                                                        'utf8'
+                                                    );
+                                                const importedData =
+                                                    JSON.parse(content);
+
+                                                if (importedData.mnemonic) {
+                                                    const words =
+                                                        importedData.mnemonic
+                                                            .trim()
+                                                            .split(/\s+/);
+                                                    if (
+                                                        isValidRescueKey(
+                                                            words.join(' ')
+                                                        )
+                                                    ) {
+                                                        this.setState({
+                                                            seedArray: words
+                                                        });
+                                                    } else {
+                                                        Alert.alert(
+                                                            localeString(
+                                                                'views.Swaps.rescueKey.invalid'
+                                                            )
+                                                        );
+                                                    }
+                                                } else {
+                                                    Alert.alert(
+                                                        localeString(
+                                                            'general.error'
+                                                        ),
+                                                        localeString(
+                                                            'views.Tools.nodeConfigExportImport.importError'
+                                                        )
+                                                    );
+                                                }
+                                            } catch (err) {
+                                                if (
+                                                    isErrorWithCode(err) &&
+                                                    err.code ===
+                                                        errorCodes.OPERATION_CANCELED
+                                                ) {
+                                                    this.setState({
+                                                        loading: false
+                                                    });
+                                                } else {
+                                                    Alert.alert(
+                                                        localeString(
+                                                            'general.error'
+                                                        ),
+                                                        localeString(
+                                                            'views.Tools.nodeConfigExportImport.importError'
+                                                        )
+                                                    );
+                                                }
+                                            }
+                                        }}
+                                    />
+                                )}
+                            </>
+                        )}
+                        {!showSuggestions && selectedInputType !== 'scb' && (
+                            <View
+                                style={{
+                                    alignSelf: 'center',
+                                    marginTop: 45,
+                                    bottom: 35,
+                                    backgroundColor: themeColor('background'),
+                                    width: '100%'
+                                }}
+                            >
+                                <Button
+                                    onPress={async () => {
+                                        if (restoreSwaps) {
+                                            this.setState(
+                                                { loading: true },
+                                                async () => {
+                                                    this.setState({
+                                                        errorMsg: ''
+                                                    });
+                                                    const result =
+                                                        await SwapStore.getRescuableSwaps(
+                                                            {
+                                                                seedArray:
+                                                                    normalizedSeedArray,
+                                                                host:
+                                                                    rescueHost ===
+                                                                    'Custom'
+                                                                        ? customRescueHost
+                                                                        : rescueHost
+                                                            }
+                                                        );
+                                                    this.setState({
+                                                        loading: false
+                                                    });
+                                                    if (result?.success) {
+                                                        navigation.navigate(
+                                                            'SwapsPane'
+                                                        );
+                                                    } else {
+                                                        this.setState({
+                                                            errorMsg:
+                                                                result?.error ||
+                                                                ''
+                                                        });
+                                                    }
+                                                }
+                                            );
+                                        } else if (restoreRescueKey) {
+                                            const mnemonic =
+                                                normalizedSeedArray.join(' ');
+
+                                            if (!isValidRescueKey(mnemonic)) {
+                                                this.setState({
+                                                    errorMsg: localeString(
+                                                        'views.Settings.SeedRecovery.invalidChecksum'
+                                                    )
+                                                });
+                                                return;
+                                            }
+
+                                            await Storage.setItem(
+                                                SWAPS_RESCUE_KEY,
+                                                mnemonic
+                                            );
+
+                                            navigation.goBack();
+                                        } else if (
+                                            implementation === 'ldk-node'
+                                        ) {
+                                            restore();
+                                        } else {
+                                            this.askForChannelBackupFirst(
+                                                restore
+                                            );
+                                        }
+                                    }}
+                                    title={
+                                        restoreSwaps
+                                            ? localeString(
+                                                  'views.Swaps.SwapsPane.restoreSwaps'
+                                              )
+                                            : restoreRescueKey
+                                            ? localeString(
+                                                  'views.Swaps.rescueKey.restore'
+                                              )
+                                            : localeString(
+                                                  'views.Settings.NodeConfiguration.restoreWallet',
+                                                  {
+                                                      network: localeString(
+                                                          EMBEDDED_NODE_NETWORK_KEYS.find(
+                                                              (k) =>
+                                                                  k.value ===
+                                                                  (network ||
+                                                                      'mainnet')
+                                                          )?.translateKey ||
+                                                              'network.mainnet'
+                                                      )
+                                                  }
+                                              )
+                                    }
+                                    disabled={
+                                        ((restoreSwaps || restoreRescueKey) &&
+                                            rescueHost === 'Custom' &&
+                                            !customRescueHost) ||
+                                        seedArray.length !== wordCount ||
+                                        seedArray.some(
+                                            (seed) =>
+                                                !BIP39_WORD_LIST.includes(
+                                                    seed?.toLowerCase()?.trim()
+                                                )
+                                        )
+                                    }
+                                />
+                            </View>
+                        )}
+                    </View>
+                )}
+                <ModalBox
+                    isOpen={this.state.showClipboardPrompt}
+                    style={{ backgroundColor: 'transparent' }}
+                    swipeToClose
+                    backButtonClose
+                    onClosed={() =>
+                        this.setState({
+                            showClipboardPrompt: false,
+                            clipboardSeedArray: []
+                        })
+                    }
+                >
+                    <View style={styles.modalWrapper}>
+                        <View
+                            style={{
+                                backgroundColor: themeColor('modalBackground'),
+                                borderRadius: 30,
+                                padding: 30,
+                                width: '85%'
+                            }}
+                        >
+                            <ZeusText style={styles.modalTitle}>
+                                {localeString(
+                                    'views.Settings.SeedRecovery.clipboardSeedWords'
+                                )}
+                            </ZeusText>
+                            <ZeusText style={styles.modalBody}>
+                                {localeString(
+                                    'views.Settings.SeedRecovery.clipboardSeedWordsPrompt'
+                                )}
+                            </ZeusText>
+                            <View style={{ marginBottom: 12 }}>
+                                <Button
+                                    title={localeString('general.yes')}
+                                    onPress={() => {
+                                        const {
+                                            clipboardSeedArray,
+                                            implementation
+                                        } = this.state;
+                                        this.setState({
+                                            seedArray: clipboardSeedArray.map(
+                                                (w) => w.toLowerCase().trim()
+                                            ),
+                                            showClipboardPrompt: false,
+                                            clipboardSeedArray: [],
+                                            showValidation: true
+                                        });
+                                        if (implementation === 'ldk-node') {
+                                            this.setState({
+                                                ldkWordCount:
+                                                    clipboardSeedArray.length as
+                                                        | 12
+                                                        | 24
+                                            });
+                                        }
+                                    }}
+                                    tertiary
+                                />
+                            </View>
+                            <Button
+                                title={localeString('general.cancel')}
+                                onPress={() =>
+                                    this.setState({
+                                        showClipboardPrompt: false
+                                    })
+                                }
+                            />
+                        </View>
+                    </View>
+                </ModalBox>
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    text: {
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    whiteText: {
+        color: 'white',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    blackText: {
+        color: 'black',
+        fontFamily: 'PPNeueMontreal-Book'
+    },
+    button: {
+        paddingTop: 10,
+        paddingBottom: 10,
+        width: 350,
+        alignSelf: 'center'
+    },
+    modal: {
+        margin: 20,
+        backgroundColor: 'white',
+        borderRadius: 35,
+        padding: 35,
+        alignItems: 'center',
+        shadowColor: '#000',
+        shadowOffset: {
+            width: 0,
+            height: 2
+        },
+        shadowOpacity: 0.25,
+        shadowRadius: 3.84,
+        elevation: 5
+    },
+    centeredView: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center',
+        marginTop: 22
+    },
+    column: {
+        marginTop: 8,
+        flexWrap: 'wrap',
+        alignItems: 'flex-start',
+        flexDirection: 'row',
+        width: '50%'
+    },
+    scb: {
+        alignItems: 'flex-start',
+        flexDirection: 'column',
+        marginTop: 8,
+        width: '100%',
+        lineHeight: 1
+    },
+    modalWrapper: {
+        flex: 1,
+        justifyContent: 'center',
+        alignItems: 'center'
+    },
+    modalTitle: {
+        textAlign: 'center',
+        fontSize: 20,
+        marginBottom: 12
+    },
+    modalBody: {
+        textAlign: 'center',
+        fontSize: 16,
+        marginBottom: 24
+    }
+});

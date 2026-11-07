@@ -1,0 +1,440 @@
+import * as React from 'react';
+import { Text, View, ScrollView } from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+
+import { Icon, ListItem } from '@rneui/themed';
+
+import Button from '../../components/Button';
+import Header from '../../components/Header';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import AmountInput from '../../components/AmountInput';
+
+import Screen from '../../components/Screen';
+import Switch from '../../components/Switch';
+
+import CashuStore from '../../stores/CashuStore';
+import ChannelsStore from '../../stores/ChannelsStore';
+import SettingsStore from '../../stores/SettingsStore';
+
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import UrlUtils from '../../utils/UrlUtils';
+
+interface EcashSettingsProps {
+    navigation: NativeStackNavigationProp<any, any>;
+    CashuStore: CashuStore;
+    ChannelsStore: ChannelsStore;
+    SettingsStore: SettingsStore;
+}
+
+interface EcashSettingsState {
+    loading: boolean;
+    enableCashu: boolean;
+    enableMultiMint: boolean;
+    automaticallySweep: boolean;
+    sweepThresholdSats: string;
+}
+
+@inject('CashuStore', 'ChannelsStore', 'SettingsStore')
+@observer
+export default class EcashSettings extends React.Component<
+    EcashSettingsProps,
+    EcashSettingsState
+> {
+    state = {
+        loading: false,
+        enableCashu: false,
+        enableMultiMint: false,
+        automaticallySweep: false,
+        sweepThresholdSats: '0'
+    };
+
+    async componentDidMount() {
+        const { SettingsStore } = this.props;
+        const { getSettings } = SettingsStore;
+        const settings = await getSettings();
+
+        this.setState({
+            enableCashu:
+                settings?.ecash?.enableCashu !== null &&
+                settings?.ecash?.enableCashu !== undefined
+                    ? settings.ecash.enableCashu
+                    : false,
+            enableMultiMint:
+                settings?.ecash?.enableMultiMint !== null &&
+                settings?.ecash?.enableMultiMint !== undefined
+                    ? settings.ecash.enableMultiMint
+                    : false,
+            automaticallySweep:
+                settings?.ecash?.automaticallySweep !== null &&
+                settings?.ecash?.automaticallySweep !== undefined
+                    ? settings.ecash.automaticallySweep
+                    : false,
+            sweepThresholdSats: settings?.ecash?.sweepThresholdSats
+                ? settings.ecash.sweepThresholdSats.toString()
+                : '10000'
+        });
+    }
+
+    handleThresholdChange = (amount: string, satAmount: string | number) => {
+        const threshold =
+            typeof satAmount === 'number' ? satAmount : parseInt(satAmount, 10);
+        const finalThreshold =
+            isNaN(threshold) || threshold < 0 ? 0 : threshold;
+
+        this.setState({ sweepThresholdSats: amount });
+
+        // Called on every keystroke, so the write is debounced
+        this.props.SettingsStore.updateSettingsGroupDebounced('ecash', {
+            sweepThresholdSats: finalThreshold
+        });
+    };
+
+    componentWillUnmount() {
+        // Persist a threshold typed just before leaving
+        this.props.SettingsStore.flushPendingSettings();
+    }
+
+    render() {
+        const { navigation, CashuStore, ChannelsStore, SettingsStore } =
+            this.props;
+        const {
+            loading,
+            enableCashu,
+            enableMultiMint,
+            automaticallySweep,
+            sweepThresholdSats
+        } = this.state;
+        const { updateSettingsGroup } = SettingsStore;
+        const hasOpenChannels = ChannelsStore.channels.length > 0;
+
+        return (
+            <Screen>
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Settings.Ecash.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <View
+                            style={{
+                                flexDirection: 'row',
+                                alignItems: 'center'
+                            }}
+                        >
+                            {loading && <LoadingIndicator size={30} />}
+                        </View>
+                    }
+                    navigation={navigation}
+                />
+                <ScrollView
+                    style={{
+                        flex: 1,
+                        paddingHorizontal: 15,
+                        marginTop: 5
+                    }}
+                >
+                    <View style={{ flexDirection: 'row', marginTop: 20 }}>
+                        <View
+                            style={{
+                                flex: 1,
+                                justifyContent: 'center'
+                            }}
+                        >
+                            <Text
+                                style={{
+                                    color: themeColor('text'),
+                                    fontSize: 17
+                                }}
+                            >
+                                {localeString(
+                                    'views.Settings.Ecash.enableEcash'
+                                )}
+                            </Text>
+                        </View>
+                        <View
+                            style={{
+                                alignSelf: 'center',
+                                marginLeft: 5
+                            }}
+                        >
+                            <Switch
+                                value={enableCashu}
+                                onValueChange={async (value: boolean) => {
+                                    this.setState({
+                                        enableCashu: value,
+                                        loading: true
+                                    });
+                                    await updateSettingsGroup('ecash', {
+                                        enableCashu: value,
+                                        enableMultiMint: value
+                                            ? enableMultiMint
+                                            : false
+                                    });
+                                    if (value) {
+                                        await CashuStore.initializeWallets();
+                                    }
+                                    this.setState({
+                                        enableMultiMint: value
+                                            ? enableMultiMint
+                                            : false,
+                                        loading: false
+                                    });
+                                }}
+                                disabled={loading}
+                            />
+                        </View>
+                    </View>
+
+                    <View style={{ flexDirection: 'row', marginTop: 20 }}>
+                        <View
+                            style={{
+                                flex: 1,
+                                justifyContent: 'center',
+                                marginRight: 10
+                            }}
+                        >
+                            <Text
+                                style={{
+                                    color: enableCashu
+                                        ? themeColor('text')
+                                        : 'gray',
+                                    fontSize: 17
+                                }}
+                            >
+                                {localeString(
+                                    'views.Settings.Ecash.enableMultiMintSends'
+                                )}
+                            </Text>
+                        </View>
+                        <View
+                            style={{
+                                alignSelf: 'center',
+                                marginLeft: 5
+                            }}
+                        >
+                            <Switch
+                                value={enableMultiMint}
+                                onValueChange={async (value: boolean) => {
+                                    this.setState({
+                                        enableMultiMint: value,
+                                        loading: true
+                                    });
+
+                                    await updateSettingsGroup('ecash', {
+                                        enableMultiMint: value
+                                    });
+
+                                    this.setState({
+                                        loading: false
+                                    });
+                                }}
+                                disabled={!enableCashu || loading}
+                            />
+                        </View>
+                    </View>
+
+                    <View
+                        style={{
+                            marginTop: 20,
+                            marginBottom: 10
+                        }}
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('secondaryText'),
+                                fontSize: 16
+                            }}
+                        >
+                            {localeString(
+                                'views.Settings.Ecash.enableEcash.subtitle1'
+                            )}
+                        </Text>
+                    </View>
+                    <View
+                        style={{
+                            marginTop: 10,
+                            marginBottom: 10
+                        }}
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('secondaryText'),
+                                fontSize: 16
+                            }}
+                        >
+                            {localeString(
+                                'views.Settings.Ecash.enableEcash.subtitle2'
+                            )}
+                        </Text>
+                    </View>
+                    <View
+                        style={{
+                            marginTop: 10,
+                            marginBottom: 10
+                        }}
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('secondaryText'),
+                                fontSize: 16
+                            }}
+                        >
+                            {localeString(
+                                'views.Settings.Ecash.enableEcash.subtitle3'
+                            )}
+                        </Text>
+                    </View>
+                    <View style={{ marginTop: 25 }}>
+                        <Button
+                            title={localeString(
+                                'views.Settings.Ecash.enableEcash.learnMore'
+                            )}
+                            onPress={() => {
+                                UrlUtils.goToUrl(
+                                    'https://docs.zeusln.app/cashu'
+                                );
+                            }}
+                        />
+                    </View>
+                    <View style={{ marginTop: 25 }}>
+                        <Button
+                            title={localeString(
+                                'views.Settings.Ecash.cashuTroubleshooting'
+                            )}
+                            onPress={() => {
+                                UrlUtils.goToUrl(
+                                    'https://docs.zeusln.app/cashu#i-get-an-error-saying-outputs-have-already-been-signed-before-or-already-spent-what-should-i-do'
+                                );
+                            }}
+                            icon={{
+                                name: 'life-buoy',
+                                type: 'feather',
+                                size: 25
+                            }}
+                            secondary
+                        />
+                    </View>
+
+                    {enableCashu && (
+                        <ListItem
+                            containerStyle={{
+                                borderBottomWidth: 0,
+                                backgroundColor: 'transparent',
+                                paddingHorizontal: 0,
+                                marginTop: 25
+                            }}
+                            onPress={() => navigation.navigate('Mints')}
+                        >
+                            <ListItem.Content>
+                                <ListItem.Title
+                                    style={{
+                                        color: themeColor('secondaryText'),
+                                        fontFamily: 'PPNeueMontreal-Book'
+                                    }}
+                                >
+                                    {localeString('cashu.cashuMints')}
+                                </ListItem.Title>
+                            </ListItem.Content>
+                            <Icon
+                                name="keyboard-arrow-right"
+                                color={themeColor('secondaryText')}
+                            />
+                        </ListItem>
+                    )}
+
+                    {hasOpenChannels && enableCashu && (
+                        <View style={{ marginTop: 20 }}>
+                            <View
+                                style={{ flexDirection: 'row', marginTop: 20 }}
+                            >
+                                <View
+                                    style={{
+                                        flex: 1,
+                                        justifyContent: 'center'
+                                    }}
+                                >
+                                    <Text
+                                        style={{
+                                            color: themeColor('text'),
+                                            fontSize: 17
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.Ecash.automaticallySweep'
+                                        )}
+                                    </Text>
+                                </View>
+                                <View
+                                    style={{
+                                        alignSelf: 'center',
+                                        marginLeft: 5
+                                    }}
+                                >
+                                    <Switch
+                                        value={automaticallySweep}
+                                        onValueChange={async (
+                                            value: boolean
+                                        ) => {
+                                            this.setState({
+                                                loading: true
+                                            });
+                                            await updateSettingsGroup('ecash', {
+                                                automaticallySweep: value
+                                            });
+                                            this.setState({
+                                                automaticallySweep: value,
+                                                loading: false
+                                            });
+                                        }}
+                                        disabled={loading}
+                                    />
+                                </View>
+                            </View>
+                            {automaticallySweep && (
+                                <>
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText'),
+                                            fontSize: 17,
+                                            marginTop: 10
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.Ecash.sweepThresholdSatsTitle'
+                                        )}
+                                    </Text>
+                                    <AmountInput
+                                        amount={sweepThresholdSats}
+                                        onAmountChange={
+                                            this.handleThresholdChange
+                                        }
+                                        forceUnit="sats"
+                                        hideConversion={true}
+                                        hideUnitChangeButton={true}
+                                    />
+                                    <Text
+                                        style={{
+                                            color: themeColor('secondaryText'),
+                                            fontSize: 16,
+                                            marginBottom: 15
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.Settings.Ecash.sweepThresholdSatsTitle.description'
+                                        )}
+                                    </Text>
+                                </>
+                            )}
+                        </View>
+                    )}
+                </ScrollView>
+            </Screen>
+        );
+    }
+}

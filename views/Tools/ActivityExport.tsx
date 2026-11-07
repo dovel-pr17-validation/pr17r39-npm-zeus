@@ -1,0 +1,787 @@
+import * as React from 'react';
+import {
+    View,
+    TouchableOpacity,
+    StyleSheet,
+    Alert,
+    ScrollView,
+    Modal,
+    Platform,
+    KeyboardAvoidingView
+} from 'react-native';
+import Feather from '@react-native-vector-icons/feather';
+import { inject, observer } from 'mobx-react';
+import DateTimePicker from '@react-native-community/datetimepicker';
+import { CheckBox } from '@rneui/themed';
+
+import Header from '../../components/Header';
+import Screen from '../../components/Screen';
+import Button from '../../components/Button';
+import TextInput from '../../components/TextInput';
+import Text from '../../components/Text';
+import LoadingIndicator from '../../components/LoadingIndicator';
+
+import { localeString } from '../../utils/LocaleUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import {
+    getFormattedDateTime,
+    convertActivityToCsv,
+    saveCsvFile,
+    CSV_KEYS
+} from '../.././utils/ActivityCsvUtils';
+
+import ActivityStore from '../../stores/ActivityStore';
+import SettingsStore from '../../stores/SettingsStore';
+
+import Invoice from '../../models/Invoice';
+import Payment from '../../models/Payment';
+import Transaction from '../../models/Transaction';
+import CashuInvoice from '../../models/CashuInvoice';
+import CashuPayment from '../../models/CashuPayment';
+
+interface ActivityExportProps {
+    navigation: any;
+    ActivityStore: ActivityStore;
+    SettingsStore: SettingsStore;
+}
+
+interface ActivityExportState {
+    isCsvLoading: boolean;
+    isActivityFetching: boolean;
+    filteredActivity: any;
+    isModalVisible: boolean;
+    showInfoModal: boolean;
+    customFileName: string;
+    fromDate: any;
+    toDate: any;
+    exportType: any;
+    downloadCompleteData: boolean;
+    showFromDatePicker: boolean;
+    showToDatePicker: boolean;
+}
+
+@inject('ActivityStore', 'SettingsStore')
+@observer
+export default class ActivityExport extends React.Component<
+    ActivityExportProps,
+    ActivityExportState
+> {
+    constructor(props: ActivityExportProps) {
+        super(props);
+        this.state = {
+            isCsvLoading: false,
+            isActivityFetching: true,
+            filteredActivity: [],
+            isModalVisible: false,
+            showInfoModal: false,
+            customFileName: '',
+            fromDate: null,
+            toDate: null,
+            exportType: '',
+            downloadCompleteData: false,
+            showFromDatePicker: false,
+            showToDatePicker: false
+        };
+    }
+
+    componentDidMount() {
+        this.fetchAndFilterActivity();
+    }
+
+    fetchAndFilterActivity = async () => {
+        const { SettingsStore, ActivityStore } = this.props;
+        const { locale } = SettingsStore.settings;
+
+        try {
+            // Call getActivityAndFilter to fetch and filter activity data
+            await ActivityStore.getActivityAndFilter(locale);
+
+            // Update filteredActivity in state
+            this.setState({
+                filteredActivity: ActivityStore.filteredActivity,
+                isActivityFetching: false
+            });
+        } catch (err) {
+            console.error('Failed to fetch activity data:', err);
+            this.setState({ isActivityFetching: false });
+            Alert.alert(localeString('general.error'));
+        }
+    };
+
+    filterDataByDate = (data: any) => {
+        const { fromDate, toDate, downloadCompleteData } = this.state;
+        if (!fromDate && !toDate) return data;
+
+        if (downloadCompleteData) return data;
+
+        return data.filter((item: any) => {
+            const itemDate = new Date(item.getDate);
+            if (isNaN(itemDate.getTime())) return false;
+            if (fromDate && itemDate < fromDate) return false;
+            if (toDate && itemDate > toDate) return false;
+            return true;
+        });
+    };
+
+    downloadCsv = async (type: 'invoice' | 'payment' | 'transaction') => {
+        this.setState({ isCsvLoading: true }, async () => {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            let { filteredActivity } = this.state;
+
+            if (!filteredActivity || filteredActivity.length === 0) {
+                Alert.alert(
+                    localeString(
+                        'views.ActivityExport.noDataAvailableForSelection'
+                    )
+                );
+                this.setState({ isCsvLoading: false });
+                return;
+            }
+
+            let filteredData: any;
+
+            filteredData = filteredActivity.filter((item: any) => {
+                if (type === 'invoice')
+                    return (
+                        item instanceof Invoice || item instanceof CashuInvoice
+                    );
+                if (type === 'payment')
+                    return (
+                        item instanceof Payment || item instanceof CashuPayment
+                    );
+                if (type === 'transaction') return item instanceof Transaction;
+                return false;
+            });
+            filteredData = this.filterDataByDate(filteredData);
+
+            if (!filteredData || filteredData.length === 0) {
+                Alert.alert(
+                    localeString('views.ActivityExport.noDataForSelectedDates')
+                );
+                this.setState({ isCsvLoading: false });
+                return;
+            }
+
+            const csvData = await convertActivityToCsv(
+                filteredData,
+                CSV_KEYS[type]
+            );
+
+            if (!csvData) {
+                Alert.alert(
+                    localeString('views.ActivityExport.noValidDataForDownload')
+                );
+                this.setState({ isCsvLoading: false });
+                return;
+            }
+
+            try {
+                const dateTime = getFormattedDateTime();
+                const baseFileName = this.state.customFileName
+                    ? `${this.state.customFileName}.csv`
+                    : `zeus_${dateTime}_${type}.csv`;
+
+                await saveCsvFile(baseFileName, csvData);
+
+                this.setState({ isModalVisible: false });
+
+                this.closeAndClearInput();
+
+                Alert.alert(
+                    localeString('general.success'),
+                    localeString('views.ActivityToCsv.csvDownloaded')
+                );
+            } catch (err) {
+                console.error('Failed to save CSV file:', err);
+                Alert.alert(
+                    localeString('general.error'),
+                    localeString('views.ActivityToCsv.csvDownloadFailed')
+                );
+            } finally {
+                this.setState({ isCsvLoading: false });
+            }
+        });
+    };
+
+    closeAndClearInput = () => {
+        this.setState({
+            isModalVisible: false,
+            customFileName: '',
+            fromDate: new Date(),
+            toDate: new Date(),
+            downloadCompleteData: false,
+            showFromDatePicker: false,
+            showToDatePicker: false
+        });
+    };
+
+    openModal = (type: 'invoice' | 'transaction' | 'payment') => {
+        let earliestDate = new Date(
+            new Date().setMonth(new Date().getMonth() - 1)
+        ); // Default to 1 month ago
+
+        this.setState({
+            isModalVisible: true,
+            exportType: type,
+            fromDate: earliestDate,
+            toDate: new Date()
+        });
+    };
+
+    renderModal = () => {
+        const {
+            isModalVisible,
+            isCsvLoading,
+            customFileName,
+            fromDate,
+            toDate,
+            downloadCompleteData
+        } = this.state;
+        return (
+            <Modal
+                visible={isModalVisible}
+                transparent={true}
+                animationType="slide"
+                onRequestClose={this.closeAndClearInput}
+            >
+                <KeyboardAvoidingView
+                    behavior={Platform.OS === 'android' ? 'padding' : undefined}
+                    style={styles.modalOverlay}
+                >
+                    <View
+                        style={{
+                            width: '80%',
+                            backgroundColor: themeColor('background'),
+                            padding: 20,
+                            borderRadius: 10,
+                            alignItems: 'center'
+                        }}
+                    >
+                        {isCsvLoading ? (
+                            <LoadingIndicator />
+                        ) : (
+                            <>
+                                <Text
+                                    style={{
+                                        color: themeColor('text'),
+                                        fontSize: 18
+                                    }}
+                                >
+                                    {localeString(
+                                        'views.ActivityExport.dateRange'
+                                    )}
+                                </Text>
+                                <View style={{ alignItems: 'center' }}>
+                                    <View
+                                        style={{
+                                            flexDirection: 'row',
+                                            alignItems: 'center',
+                                            marginBottom: 10
+                                        }}
+                                    >
+                                        <CheckBox
+                                            title={localeString(
+                                                'views.ActivityExport.downloadCompleteData'
+                                            )}
+                                            checked={
+                                                this.state.downloadCompleteData
+                                            }
+                                            onPress={() =>
+                                                this.setState({
+                                                    downloadCompleteData:
+                                                        !downloadCompleteData,
+                                                    fromDate:
+                                                        !downloadCompleteData
+                                                            ? null
+                                                            : fromDate,
+                                                    toDate: !downloadCompleteData
+                                                        ? null
+                                                        : toDate
+                                                })
+                                            }
+                                            containerStyle={{
+                                                backgroundColor: 'transparent',
+                                                borderWidth: 0
+                                            }}
+                                            textStyle={{
+                                                color: themeColor('text')
+                                            }}
+                                            checkedColor="green"
+                                        />
+                                    </View>
+                                    {!downloadCompleteData && (
+                                        <>
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    )
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.ActivityExport.fromDate'
+                                                )}
+                                            </Text>
+                                            {Platform.OS === 'ios' ? (
+                                                <DateTimePicker
+                                                    mode="date"
+                                                    display="compact"
+                                                    value={
+                                                        fromDate || new Date()
+                                                    }
+                                                    onChange={(
+                                                        _event,
+                                                        date
+                                                    ) => {
+                                                        if (date) {
+                                                            this.setState({
+                                                                fromDate: date
+                                                            });
+                                                            if (
+                                                                toDate &&
+                                                                date > toDate
+                                                            ) {
+                                                                this.setState({
+                                                                    toDate: date
+                                                                });
+                                                            }
+                                                        }
+                                                    }}
+                                                    style={{
+                                                        marginTop: 10,
+                                                        marginBottom: 10,
+                                                        alignSelf: 'center'
+                                                    }}
+                                                    maximumDate={new Date()}
+                                                    accentColor={themeColor(
+                                                        'highlight'
+                                                    )}
+                                                    themeVariant={themeColor(
+                                                        'generalStyle'
+                                                    )}
+                                                />
+                                            ) : (
+                                                <TouchableOpacity
+                                                    onPress={() =>
+                                                        this.setState({
+                                                            showFromDatePicker:
+                                                                true
+                                                        })
+                                                    }
+                                                    style={{
+                                                        backgroundColor:
+                                                            themeColor(
+                                                                'secondary'
+                                                            ),
+                                                        paddingHorizontal: 20,
+                                                        paddingVertical: 10,
+                                                        borderRadius: 6,
+                                                        marginTop: 10,
+                                                        marginBottom: 10
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'text'
+                                                            ),
+                                                            fontSize: 16
+                                                        }}
+                                                    >
+                                                        {(
+                                                            fromDate ||
+                                                            new Date()
+                                                        ).toLocaleDateString()}
+                                                    </Text>
+                                                </TouchableOpacity>
+                                            )}
+                                            <Text
+                                                style={{
+                                                    color: themeColor(
+                                                        'secondaryText'
+                                                    ),
+                                                    marginBottom: 5
+                                                }}
+                                            >
+                                                {localeString(
+                                                    'views.ActivityExport.toDate'
+                                                )}
+                                            </Text>
+                                            {Platform.OS === 'ios' ? (
+                                                <DateTimePicker
+                                                    mode="date"
+                                                    display="compact"
+                                                    value={toDate || new Date()}
+                                                    onChange={(
+                                                        _event,
+                                                        date
+                                                    ) => {
+                                                        if (date) {
+                                                            if (
+                                                                fromDate &&
+                                                                date < fromDate
+                                                            ) {
+                                                                Alert.alert(
+                                                                    'Invalid Date'
+                                                                );
+                                                            } else {
+                                                                this.setState({
+                                                                    toDate: date
+                                                                });
+                                                            }
+                                                        }
+                                                    }}
+                                                    style={{
+                                                        marginTop: 10,
+                                                        marginBottom: 10,
+                                                        alignSelf: 'center'
+                                                    }}
+                                                    maximumDate={new Date()}
+                                                    accentColor={themeColor(
+                                                        'highlight'
+                                                    )}
+                                                    themeVariant={themeColor(
+                                                        'generalStyle'
+                                                    )}
+                                                />
+                                            ) : (
+                                                <TouchableOpacity
+                                                    onPress={() =>
+                                                        this.setState({
+                                                            showToDatePicker:
+                                                                true
+                                                        })
+                                                    }
+                                                    style={{
+                                                        backgroundColor:
+                                                            themeColor(
+                                                                'secondary'
+                                                            ),
+                                                        paddingHorizontal: 20,
+                                                        paddingVertical: 10,
+                                                        borderRadius: 6,
+                                                        marginTop: 10,
+                                                        marginBottom: 10
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'text'
+                                                            ),
+                                                            fontSize: 16
+                                                        }}
+                                                    >
+                                                        {(
+                                                            toDate || new Date()
+                                                        ).toLocaleDateString()}
+                                                    </Text>
+                                                </TouchableOpacity>
+                                            )}
+                                        </>
+                                    )}
+                                </View>
+
+                                <TextInput
+                                    placeholder={localeString(
+                                        'views.ActivityToCsv.textInputPlaceholder'
+                                    )}
+                                    value={customFileName}
+                                    onChangeText={(text: string) =>
+                                        this.setState({
+                                            customFileName: text
+                                        })
+                                    }
+                                    style={{ marginHorizontal: 12 }}
+                                />
+                                <View style={styles.buttonContainer}>
+                                    <Button
+                                        title={localeString(
+                                            'views.ActivityToCsv.downloadButton'
+                                        )}
+                                        onPress={() =>
+                                            this.downloadCsv(
+                                                this.state.exportType
+                                            )
+                                        }
+                                        buttonStyle={{
+                                            marginBottom: 10
+                                        }}
+                                    />
+                                    <Button
+                                        title={localeString('general.close')}
+                                        onPress={this.closeAndClearInput}
+                                        secondary
+                                    />
+                                </View>
+                            </>
+                        )}
+                    </View>
+                </KeyboardAvoidingView>
+            </Modal>
+        );
+    };
+
+    renderInfoModal = () => {
+        const { showInfoModal } = this.state;
+        return (
+            <Modal
+                animationType="slide"
+                transparent
+                visible={showInfoModal}
+                onRequestClose={() => this.setState({ showInfoModal: false })}
+            >
+                <View
+                    style={{
+                        flex: 1,
+                        justifyContent: 'center',
+                        alignItems: 'center'
+                    }}
+                >
+                    <View
+                        style={{
+                            backgroundColor: themeColor('secondary'),
+                            borderRadius: 24,
+                            padding: 20,
+                            alignItems: 'center'
+                        }}
+                    >
+                        <Text
+                            style={{
+                                fontFamily: 'PPNeueMontreal-Book',
+                                color: themeColor('text'),
+                                fontSize: 20,
+                                marginBottom: 20
+                            }}
+                        >
+                            {Platform.OS === 'android'
+                                ? localeString(
+                                      'views.ActivityExport.explainerAndroid'
+                                  )
+                                : localeString(
+                                      'views.ActivityExport.explaineriOS'
+                                  )}
+                        </Text>
+                        <Button
+                            title={localeString('general.close')}
+                            onPress={() =>
+                                this.setState({ showInfoModal: false })
+                            }
+                            secondary
+                        />
+                    </View>
+                </View>
+            </Modal>
+        );
+    };
+
+    render() {
+        const {
+            isActivityFetching,
+            showFromDatePicker,
+            showToDatePicker,
+            fromDate,
+            toDate
+        } = this.state;
+
+        return (
+            <Screen>
+                <ScrollView>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString('views.ActivityExport.title'),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        rightComponent={
+                            isActivityFetching ? (
+                                <></>
+                            ) : (
+                                <TouchableOpacity
+                                    // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                                    style={{ marginRight: 4, marginTop: -4 }}
+                                    onPress={() =>
+                                        this.setState({ showInfoModal: true })
+                                    }
+                                >
+                                    <Text style={{ fontSize: 24 }}>ⓘ</Text>
+                                </TouchableOpacity>
+                            )
+                        }
+                        navigation={this.props.navigation}
+                    />
+                    {this.renderModal()}
+                    {this.renderInfoModal()}
+
+                    <View
+                        style={{
+                            ...styles.container
+                        }}
+                    >
+                        {isActivityFetching ? (
+                            <LoadingIndicator />
+                        ) : (
+                            <>
+                                <TouchableOpacity
+                                    style={{
+                                        ...styles.optionButton,
+                                        backgroundColor: themeColor('secondary')
+                                    }}
+                                    onPress={() => this.openModal('invoice')}
+                                >
+                                    <Feather
+                                        name="upload"
+                                        size={24}
+                                        color={themeColor('text')}
+                                    />
+                                    <Text
+                                        style={{
+                                            ...styles.optionText,
+                                            color: themeColor('text')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.ActivityExport.exportInvoices'
+                                        )}
+                                    </Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                    style={{
+                                        ...styles.optionButton,
+                                        backgroundColor: themeColor('secondary')
+                                    }}
+                                    onPress={() => this.openModal('payment')}
+                                >
+                                    <Feather
+                                        name="upload"
+                                        size={24}
+                                        color={themeColor('text')}
+                                    />
+                                    <Text
+                                        style={{
+                                            ...styles.optionText,
+                                            color: themeColor('text')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.ActivityExport.exportPayments'
+                                        )}
+                                    </Text>
+                                </TouchableOpacity>
+
+                                <TouchableOpacity
+                                    style={{
+                                        ...styles.optionButton,
+                                        backgroundColor: themeColor('secondary')
+                                    }}
+                                    onPress={() =>
+                                        this.openModal('transaction')
+                                    }
+                                >
+                                    <Feather
+                                        name="upload"
+                                        size={24}
+                                        color={themeColor('text')}
+                                    />
+                                    <Text
+                                        style={{
+                                            ...styles.optionText,
+                                            color: themeColor('text')
+                                        }}
+                                    >
+                                        {localeString(
+                                            'views.ActivityExport.exportTransactions'
+                                        )}
+                                    </Text>
+                                </TouchableOpacity>
+                            </>
+                        )}
+                    </View>
+                </ScrollView>
+
+                {Platform.OS === 'android' && showFromDatePicker && (
+                    <DateTimePicker
+                        value={fromDate || new Date()}
+                        mode="date"
+                        display="default"
+                        maximumDate={new Date()}
+                        onChange={(event, date) => {
+                            if (event.type === 'dismissed') {
+                                this.setState({ showFromDatePicker: false });
+                                return;
+                            }
+                            if (date) {
+                                this.setState({
+                                    fromDate: date,
+                                    showFromDatePicker: false
+                                });
+                                if (toDate && date > toDate) {
+                                    this.setState({ toDate: date });
+                                }
+                            }
+                        }}
+                    />
+                )}
+
+                {Platform.OS === 'android' && showToDatePicker && (
+                    <DateTimePicker
+                        value={toDate || new Date()}
+                        mode="date"
+                        display="default"
+                        minimumDate={fromDate || undefined}
+                        maximumDate={new Date()}
+                        onChange={(event, date) => {
+                            if (event.type === 'dismissed') {
+                                this.setState({ showToDatePicker: false });
+                                return;
+                            }
+                            if (date) {
+                                if (fromDate && date < fromDate) {
+                                    Alert.alert('Invalid Date');
+                                    this.setState({ showToDatePicker: false });
+                                } else {
+                                    this.setState({
+                                        toDate: date,
+                                        showToDatePicker: false
+                                    });
+                                }
+                            }
+                        }}
+                    />
+                )}
+            </Screen>
+        );
+    }
+}
+
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+        padding: 20
+    },
+    optionButton: {
+        flexDirection: 'row',
+        alignItems: 'center',
+        padding: 15,
+        marginVertical: 10,
+        borderRadius: 10
+    },
+    optionText: {
+        marginLeft: 15,
+        fontSize: 16
+    },
+    modalOverlay: {
+        flex: 1,
+        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+        justifyContent: 'center',
+        alignItems: 'center'
+    },
+    buttonContainer: {
+        width: '100%',
+        marginTop: 4
+    }
+});

@@ -1,0 +1,2581 @@
+import * as React from 'react';
+import {
+    KeyboardAvoidingView,
+    Platform,
+    TouchableOpacity,
+    View,
+    ScrollView
+} from 'react-native';
+import { inject, observer } from 'mobx-react';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { RouteProp } from '@react-navigation/native';
+import BigNumber from 'bignumber.js';
+import { initEccLib } from 'bitcoinjs-lib';
+import { ECPairFactory } from 'ecpair';
+import ecc from '@bitcoinerlab/secp256k1';
+
+import Amount from '../../components/Amount';
+import Button from '../../components/Button';
+import Header from '../../components/Header';
+import KeyValue from '../../components/KeyValue';
+import { Row } from '../../components/layout/Row';
+import Screen from '../../components/Screen';
+import Text from '../../components/Text';
+import AddressInput from '../../components/AddressInput';
+import AmountInput from '../../components/AmountInput';
+import LoadingIndicator from '../../components/LoadingIndicator';
+import {
+    ErrorMessage,
+    SuccessMessage
+} from '../../components/SuccessErrorMessage';
+import OnchainFeeInput from '../../components/OnchainFeeInput';
+import ModalBox from '../../components/ModalBox';
+import Switch from '../../components/Switch';
+
+import { font } from '../../utils/FontUtils';
+import { isPlausibleSatPerVbyte } from '../../utils/FeeUtils';
+import { localeString } from '../../utils/LocaleUtils';
+import { reAuthNavigation } from '../../utils/NavigationUtils';
+import { themeColor } from '../../utils/ThemeUtils';
+import { SATS_PER_BTC } from '../../utils/UnitsUtils';
+import AddressUtils from '../../utils/AddressUtils';
+import BackendUtils from '../../utils/BackendUtils';
+import {
+    bigCeil,
+    calculateReceiveAmount,
+    calculateServiceFeeOnSend,
+    calculateSendAmount,
+    calculateLimit,
+    quoteSwapAmounts,
+    SWAPS_RESCUE_KEY
+} from '../../utils/SwapUtils';
+
+import SwapStore from '../../stores/SwapStore';
+import UnitsStore from '../../stores/UnitsStore';
+import InvoicesStore from '../../stores/InvoicesStore';
+import FiatStore from '../../stores/FiatStore';
+import SettingsStore from '../../stores/SettingsStore';
+import FeeStore from '../../stores/FeeStore';
+import NodeInfoStore from '../../stores/NodeInfoStore';
+import LSPStore from '../../stores/LSPStore';
+
+import ArrowDown from '../../assets/images/SVG/Arrow_down.svg';
+import CaretDown from '../../assets/images/SVG/Caret Down.svg';
+import CaretRight from '../../assets/images/SVG/Caret Right.svg';
+import ExchangeBitcoinSVG from '../../assets/images/SVG/ExchangeBitcoin.svg';
+import ExchangeFiatSVG from '../../assets/images/SVG/ExchangeFiat.svg';
+import OnChainSvg from '../../components/SVG/OnChainSvg';
+import LightningSvg from '../../components/SVG/LightningSvg';
+import History from '../../assets/images/SVG/History.svg';
+import { Icon } from '@rneui/themed';
+import KeyIcon from '../../assets/images/SVG/Key.svg';
+
+import Storage from '../../storage';
+
+interface SwapProps {
+    navigation: NativeStackNavigationProp<any, 'Swaps'>;
+    route: RouteProp<any, 'Swaps'>;
+    SwapStore: SwapStore;
+    UnitsStore: UnitsStore;
+    InvoicesStore: InvoicesStore;
+    FiatStore: FiatStore;
+    SettingsStore: SettingsStore;
+    FeeStore: FeeStore;
+    NodeInfoStore: NodeInfoStore;
+    LSPStore: LSPStore;
+}
+
+interface SwapState {
+    reverse: boolean;
+    serviceFeeSats: number | BigNumber;
+    inputSats: number | BigNumber;
+    outputSats: number | BigNumber;
+    inputDisplay: string;
+    outputDisplay: string;
+    invoice: string;
+    isValid: boolean;
+    error: string;
+    apiUpdates: any;
+    response: any;
+    fetchingInvoice: boolean;
+    fee: string;
+    feeSettingToggle: boolean;
+    paramsProcessed?: boolean;
+    lastUsedKey?: number;
+    seedPhrase?: string[];
+    isModalVisible: boolean;
+    isIntroModalVisible: boolean;
+    showRescueKeyBtn: boolean;
+    enableLSP: boolean;
+    flowLspNotConfigured: boolean;
+    // the amount field the user set last, kept when the network fee changes
+    lastEditedAmount: 'input' | 'output';
+    // a mempool rate lookup has finished, so an empty rate is now missing
+    // rather than still on its way
+    feeRateLookupDone: boolean;
+}
+
+@inject(
+    'SwapStore',
+    'UnitsStore',
+    'InvoicesStore',
+    'FiatStore',
+    'SettingsStore',
+    'FeeStore',
+    'NodeInfoStore',
+    'LSPStore'
+)
+@observer
+export default class Swap extends React.PureComponent<SwapProps, SwapState> {
+    constructor(props: SwapProps) {
+        super(props);
+        props.SwapStore.clearError();
+    }
+    state = {
+        reverse: false,
+        serviceFeeSats: 0,
+        inputSats: 0,
+        outputSats: 0,
+        inputDisplay: '',
+        outputDisplay: '',
+        invoice: '',
+        isValid: false,
+        apiUpdates: '',
+        error: '',
+        response: null,
+        fetchingInvoice: false,
+        fee: '',
+        feeSettingToggle: false,
+        paramsProcessed: false,
+        lastUsedKey: 0,
+        seedPhrase: [],
+        isModalVisible: false,
+        isIntroModalVisible: false,
+        showRescueKeyBtn: false,
+        enableLSP: true,
+        flowLspNotConfigured: true,
+        lastEditedAmount: 'input' as 'input' | 'output',
+        feeRateLookupDone: false
+    };
+
+    private isNavigatingAway = false;
+    private _unsubscribe?: () => void;
+    // the network fee the current amounts were worked out with
+    private amountsNetworkFee?: number;
+
+    // The claim fee createReverseSwap will store at the rate set below.
+    // Without a usable rate the swap cannot start, and the quote is shown.
+    reverseClaimFeeShown = (): number =>
+        this.props.SwapStore.getReverseClaimMinerFee(this.state.fee) ??
+        (this.props.SwapStore.reverseInfo?.fees?.minerFees?.claim || 0);
+
+    // The miner fees taken from the amount: for a reverse swap the claim
+    // fee above plus the host's lockup fee
+    networkFeeSats = (reverse: boolean): number => {
+        const { subInfo, reverseInfo } = this.props.SwapStore;
+        return reverse
+            ? new BigNumber(this.reverseClaimFeeShown())
+                  .plus(reverseInfo?.fees?.minerFees?.lockup || 0)
+                  .toNumber()
+            : new BigNumber(subInfo?.fees?.minerFees || 0).toNumber();
+    };
+
+    satsDisplay = (sats: BigNumber): string => {
+        if (!sats.isGreaterThan(0)) return '';
+        const { units } = this.props.UnitsStore;
+        if (units === 'fiat') {
+            const { fiat } = this.props.SettingsStore.settings;
+            const { fiatRates } = this.props.FiatStore;
+            const fiatEntry =
+                fiat && fiatRates
+                    ? fiatRates.filter((entry: any) => entry.code === fiat)[0]
+                    : null;
+            const rate = fiatEntry ? fiatEntry.rate : 0;
+            return sats.div(SATS_PER_BTC).times(rate).toFixed(2);
+        }
+        if (units === 'BTC') return sats.div(SATS_PER_BTC).toFixed(8);
+        if (units === 'sats') return sats.toFixed(0);
+        return '';
+    };
+
+    // Works out the amount the user did not set again, keeping the one they
+    // set, after the network fee changed: a new fee rate, or a mempool rate
+    // or host quote that arrived after the amount was entered
+    recalculateAmounts = () => {
+        const { reverse, lastEditedAmount, inputSats, outputSats } = this.state;
+        const { subInfo, reverseInfo } = this.props.SwapStore;
+        const info: any = reverse ? reverseInfo : subInfo;
+        const serviceFeePct = info?.fees?.percentage || 0;
+        const networkFee = this.networkFeeSats(reverse);
+
+        if (lastEditedAmount === 'output') {
+            const output = new BigNumber(outputSats || 0);
+            const input = calculateSendAmount(
+                output,
+                serviceFeePct,
+                networkFee,
+                reverse
+            );
+            this.setState({
+                inputSats: input,
+                inputDisplay: this.satsDisplay(input),
+                serviceFeeSats: bigCeil(
+                    (reverse ? input : output).times(serviceFeePct).div(100)
+                )
+            });
+        } else {
+            const input = new BigNumber(inputSats || 0);
+            const output = calculateReceiveAmount(
+                input,
+                serviceFeePct,
+                networkFee,
+                reverse
+            );
+            this.setState({
+                outputSats: output,
+                outputDisplay: this.satsDisplay(output),
+                serviceFeeSats: calculateServiceFeeOnSend(
+                    input,
+                    serviceFeePct,
+                    networkFee,
+                    reverse
+                )
+            });
+        }
+    };
+
+    checkIsValid = () => {
+        const { reverse, invoice, inputSats, outputSats } = this.state;
+        const { SwapStore } = this.props;
+
+        if (SwapStore.loading || !SwapStore.subInfo || !SwapStore.reverseInfo) {
+            if (this.state.isValid) {
+                this.setState({ isValid: false });
+            }
+            return;
+        }
+
+        const { subInfo, reverseInfo } = SwapStore;
+        const info: any = reverse ? reverseInfo : subInfo;
+
+        const serviceFeePct = info?.fees?.percentage || 0;
+        const networkFee = this.networkFeeSats(this.state.reverse);
+
+        const minThreshold = info?.limits?.minimal || 0;
+        const maxThreshold = info?.limits?.maximal || 0;
+
+        const minSendAmount = calculateLimit(
+            minThreshold,
+            serviceFeePct,
+            networkFee,
+            reverse
+        );
+        const maxSendAmount = calculateLimit(
+            maxThreshold,
+            serviceFeePct,
+            networkFee,
+            reverse
+        );
+
+        const currentInputSatsBN = new BigNumber(inputSats || 0);
+        const currentOutputSatsBN = new BigNumber(outputSats || 0);
+
+        let invoiceAddressValid = false;
+        if (invoice && invoice.trim() !== '') {
+            if (reverse) {
+                invoiceAddressValid =
+                    AddressUtils.isValidBitcoinAddressForNode(invoice);
+            } else {
+                invoiceAddressValid =
+                    AddressUtils.isValidLightningPaymentRequest(invoice);
+            }
+        }
+
+        const inputGreaterThanZero = currentInputSatsBN.isGreaterThan(0);
+        const outputGreaterThanZero = currentOutputSatsBN.isGreaterThan(0);
+
+        const inputAmountValidAndWithinLimits =
+            inputGreaterThanZero &&
+            currentInputSatsBN.isGreaterThanOrEqualTo(minSendAmount) &&
+            (maxSendAmount === 0
+                ? true
+                : currentInputSatsBN.isLessThanOrEqualTo(maxSendAmount));
+
+        // The reverse claim is broadcast without asking, so its fee is
+        // decided before the swap starts, from the host's quote and a
+        // usable rate from the fee section above
+        const feeRateUsable =
+            !reverse ||
+            SwapStore.getReverseClaimMinerFee(this.state.fee) !== undefined;
+
+        const newIsValid =
+            invoiceAddressValid &&
+            inputAmountValidAndWithinLimits &&
+            outputGreaterThanZero &&
+            feeRateUsable;
+
+        if (this.state.isValid !== newIsValid) {
+            this.setState({ isValid: newIsValid });
+        }
+    };
+
+    // createReverseSwap refetched the quote because the provider's fees
+    // changed. Keep the amount the user sends and recompute what they
+    // receive, so a retry is not made against the old receive amount.
+    refreshAmountsForNewQuote = () => {
+        const { SwapStore, UnitsStore, FiatStore, SettingsStore } = this.props;
+        const { reverse, inputSats } = this.state;
+        const info: any = reverse ? SwapStore.reverseInfo : SwapStore.subInfo;
+        const { units } = UnitsStore;
+        const { fiatRates } = FiatStore;
+        const { fiat } = SettingsStore.settings;
+        const fiatEntry =
+            fiat && fiatRates
+                ? fiatRates.filter((entry: any) => entry.code === fiat)[0]
+                : null;
+        const rate = fiat && fiatRates && fiatEntry ? fiatEntry.rate : 0;
+
+        const { receiveAmount, serviceFee } = quoteSwapAmounts(
+            new BigNumber(inputSats || 0),
+            info,
+            reverse
+        );
+
+        let outputDisplay = '';
+        if (receiveAmount.isGreaterThan(0)) {
+            if (units === 'fiat' && rate > 0) {
+                outputDisplay = receiveAmount
+                    .div(SATS_PER_BTC)
+                    .times(rate)
+                    .toFixed(2);
+            } else if (units === 'BTC') {
+                outputDisplay = receiveAmount.div(SATS_PER_BTC).toFixed(8);
+            } else if (units === 'sats') {
+                outputDisplay = receiveAmount.toFixed(0);
+            }
+        }
+
+        this.setState(
+            {
+                outputSats: receiveAmount,
+                outputDisplay,
+                serviceFeeSats: serviceFee
+            },
+            () => this.checkIsValid()
+        );
+    };
+
+    async componentDidMount() {
+        const { SettingsStore, NodeInfoStore, SwapStore } = this.props;
+
+        // Swaps are mainnet only: no Boltz-compatible testnet provider is
+        // currently available, so render() shows an unavailable message
+        // instead of the form. The menu hides this screen on testnet, but
+        // deep links and SwapsQRScanner can still land here. The message
+        // needs none of the mount work below, and some of it must not run:
+        // SwapStore.loading only turns false once rates are fetched, so
+        // checkAndShowModal would reschedule itself every 100ms forever, and
+        // the focus listener could fetch rates from the dead testnet host.
+        if (NodeInfoStore.testnet) return;
+
+        const { getSettings } = SettingsStore;
+        const settings = await getSettings();
+
+        const { flowLspNotConfigured } = NodeInfoStore.flowLspNotConfigured();
+
+        this.props.SwapStore.getSwapFees();
+        this.setState({
+            enableLSP: settings?.enableLSP,
+            flowLspNotConfigured
+        });
+
+        const checkAndShowModal = async () => {
+            if (!SwapStore.loading) {
+                const mnemonic = await Storage.getItem(SWAPS_RESCUE_KEY);
+
+                if (mnemonic) {
+                    this.setState({
+                        showRescueKeyBtn: true,
+                        seedPhrase: mnemonic.split(' '),
+                        isModalVisible: false,
+                        isIntroModalVisible: false
+                    });
+                } else {
+                    this.setState({
+                        isIntroModalVisible: true,
+                        isModalVisible: false,
+                        showRescueKeyBtn: false
+                    });
+                }
+            } else {
+                setTimeout(checkAndShowModal, 100);
+            }
+        };
+
+        checkAndShowModal();
+
+        initEccLib(ecc);
+        SwapStore.ECPair = ECPairFactory(ecc);
+
+        const unsubBlur = this.props.navigation.addListener('blur', () => {
+            if (this.isNavigatingAway) {
+                this.isNavigatingAway = false;
+                return;
+            }
+            this.resetFields();
+        });
+        const unsubFocus = this.props.navigation.addListener(
+            'focus',
+            async () => {
+                // re-fetch rates if the swap host changed since the
+                // last fetch (e.g. returning from Swap Settings) or
+                // the last fetch failed (fetchedRatesHost stays unset)
+                if (
+                    !SwapStore.loading &&
+                    SwapStore.fetchedRatesHost !== SwapStore.getHost
+                ) {
+                    SwapStore.getSwapFees();
+                }
+
+                const mnemonic = await Storage.getItem(SWAPS_RESCUE_KEY);
+
+                if (mnemonic) {
+                    this.setState({
+                        isModalVisible: false,
+                        isIntroModalVisible: false,
+                        showRescueKeyBtn: true,
+                        seedPhrase: mnemonic.split(' ')
+                    });
+                } else {
+                    this.setState({
+                        isIntroModalVisible: true,
+                        isModalVisible: false,
+                        showRescueKeyBtn: false
+                    });
+                }
+            }
+        );
+
+        this._unsubscribe = () => {
+            unsubBlur();
+            unsubFocus();
+        };
+    }
+
+    async componentDidUpdate(
+        prevProps: Readonly<SwapProps>,
+        prevState: Readonly<SwapState>
+    ): Promise<void> {
+        const {
+            FeeStore,
+            SettingsStore,
+            SwapStore,
+            route,
+            UnitsStore,
+            FiatStore
+        } = this.props;
+        const { settings } = SettingsStore;
+
+        // Reset paramsProcessed when route params change
+        if (
+            this.state.paramsProcessed &&
+            route.params &&
+            prevProps.route.params !== route.params
+        ) {
+            this.setState({ paramsProcessed: false });
+            return;
+        }
+
+        const networkFee = this.networkFeeSats(this.state.reverse);
+        const networkFeeChanged =
+            this.amountsNetworkFee !== undefined &&
+            networkFee !== this.amountsNetworkFee &&
+            prevState.reverse === this.state.reverse;
+        this.amountsNetworkFee = networkFee;
+        if (
+            networkFeeChanged &&
+            (new BigNumber(this.state.inputSats || 0).isGreaterThan(0) ||
+                new BigNumber(this.state.outputSats || 0).isGreaterThan(0))
+        ) {
+            this.recalculateAmounts();
+        }
+
+        // Existing fee fetching logic
+        if (!prevState.reverse && this.state.reverse) {
+            try {
+                const feesObj: { [key: string]: number } | undefined =
+                    await FeeStore.getOnchainFeesviaMempool();
+
+                const preferredMempoolRate =
+                    settings?.payments?.preferredMempoolRate || 'fastestFee';
+
+                const feeRate =
+                    feesObj?.[preferredMempoolRate] ?? feesObj?.fastestFee;
+
+                if (feeRate !== undefined) {
+                    this.setState({ fee: feeRate.toString() });
+                }
+            } catch (error) {
+                console.error('Failed to fetch mempool fees:', error);
+            } finally {
+                this.setState({ feeRateLookupDone: true });
+            }
+        }
+
+        // Logic for handling route params
+        if (!SwapStore.loading && !this.state.paramsProcessed && route.params) {
+            const { initialInvoice, initialAmountSats, initialReverse } =
+                route.params;
+
+            if (
+                initialReverse !== undefined &&
+                initialInvoice === undefined &&
+                initialAmountSats === undefined
+            ) {
+                this.setState({
+                    paramsProcessed: true,
+                    reverse: initialReverse
+                });
+            } else if (
+                initialInvoice !== undefined &&
+                initialReverse !== undefined
+            ) {
+                if (initialAmountSats === undefined) {
+                    this.setState(
+                        {
+                            paramsProcessed: true,
+                            invoice: initialInvoice,
+                            reverse: initialReverse
+                        },
+                        () => this.checkIsValid()
+                    );
+                } else {
+                    this.setState({ paramsProcessed: true }, async () => {
+                        // Use callback to ensure paramsProcessed is set before further calcs
+                        const { units } = UnitsStore;
+                        const { fiatRates } = FiatStore;
+                        const { fiat } = settings;
+                        const fiatEntry =
+                            fiat && fiatRates
+                                ? fiatRates.filter(
+                                      (entry: any) => entry.code === fiat
+                                  )[0]
+                                : null;
+                        const rate =
+                            fiat && fiatRates && fiatEntry ? fiatEntry.rate : 0;
+
+                        const info: any = initialReverse
+                            ? SwapStore.reverseInfo
+                            : SwapStore.subInfo;
+                        const serviceFeePct = info?.fees?.percentage || 0;
+                        const networkFee = this.networkFeeSats(initialReverse);
+
+                        const newOutputSats = new BigNumber(
+                            initialAmountSats || 0
+                        );
+                        let newOutputDisplay = '';
+                        if (newOutputSats.isGreaterThan(0)) {
+                            if (units === 'fiat' && rate > 0) {
+                                newOutputDisplay = newOutputSats
+                                    .div(SATS_PER_BTC)
+                                    .times(rate)
+                                    .toFixed(2);
+                            } else if (units === 'BTC') {
+                                newOutputDisplay = newOutputSats
+                                    .div(SATS_PER_BTC)
+                                    .toFixed(8);
+                            } else if (units === 'sats') {
+                                newOutputDisplay = newOutputSats.toFixed(0);
+                            }
+                        }
+
+                        const newInputSats = calculateSendAmount(
+                            newOutputSats,
+                            serviceFeePct,
+                            networkFee,
+                            this.state.reverse
+                        );
+                        let newInputDisplay = '';
+                        if (newInputSats.isGreaterThan(0)) {
+                            if (units === 'fiat' && rate > 0) {
+                                newInputDisplay = newInputSats
+                                    .div(SATS_PER_BTC)
+                                    .times(rate)
+                                    .toFixed(2);
+                            } else if (units === 'BTC') {
+                                newInputDisplay = newInputSats
+                                    .div(SATS_PER_BTC)
+                                    .toFixed(8);
+                            } else if (units === 'sats') {
+                                newInputDisplay = newInputSats.toFixed(0);
+                            }
+                        }
+
+                        const newServiceFeeSats = calculateServiceFeeOnSend(
+                            newInputSats,
+                            serviceFeePct,
+                            networkFee,
+                            this.state.reverse
+                        );
+
+                        this.setState(
+                            {
+                                invoice: initialInvoice,
+                                reverse: initialReverse,
+                                lastEditedAmount: 'output',
+                                outputSats: newOutputSats,
+                                outputDisplay: newOutputDisplay,
+                                inputSats: newInputSats,
+                                inputDisplay: newInputDisplay,
+                                serviceFeeSats: newServiceFeeSats
+                            },
+                            () => this.checkIsValid()
+                        );
+                    });
+                }
+            }
+        }
+        // Call checkIsValid whenever relevant state that it depends on might have changed.
+        // This ensures `isValid` is kept up-to-date.
+        if (
+            prevState.inputSats !== this.state.inputSats ||
+            prevState.outputSats !== this.state.outputSats ||
+            prevState.invoice !== this.state.invoice ||
+            prevState.reverse !== this.state.reverse ||
+            prevState.fee !== this.state.fee
+        ) {
+            this.checkIsValid();
+        }
+
+        if (
+            (prevState.outputSats !== this.state.outputSats ||
+                prevState.enableLSP !== this.state.enableLSP) &&
+            this.state.enableLSP &&
+            !this.state.reverse &&
+            !this.state.flowLspNotConfigured
+        ) {
+            const { LSPStore } = this.props;
+            const outputSats = new BigNumber(this.state.outputSats);
+            if (outputSats.isGreaterThan(0)) {
+                // errors are surfaced through LSPStore.flow_error
+                LSPStore.getZeroConfFee(outputSats.toNumber() * 1000).catch(
+                    () => {}
+                );
+            } else {
+                LSPStore.resetFee();
+            }
+        } else if (prevState.enableLSP && !this.state.enableLSP) {
+            this.props.LSPStore.resetFee();
+        }
+    }
+
+    componentWillUnmount() {
+        this._unsubscribe?.();
+    }
+
+    // The amount keypad and the fee editor are screens of their own:
+    // opening one blurs this one, which must not reset the form
+    markNavigatingAway = () => {
+        this.isNavigatingAway = true;
+    };
+
+    resetFields = () => {
+        this.setState(
+            {
+                inputSats: 0,
+                outputSats: 0,
+                isValid: false,
+                inputDisplay: '',
+                outputDisplay: '',
+                invoice: '',
+                error: ''
+            },
+            () => this.checkIsValid()
+        );
+    };
+
+    renderIntroModal = () => {
+        const { isIntroModalVisible } = this.state;
+        const { navigation } = this.props;
+
+        return (
+            <ModalBox
+                isOpen={isIntroModalVisible}
+                style={{
+                    backgroundColor: 'transparent'
+                }}
+                onClosed={() => {
+                    this.setState({
+                        isIntroModalVisible: false
+                    });
+                }}
+                position="center"
+                backdropPressToClose={false}
+                swipeToClose={false}
+            >
+                <View
+                    style={{
+                        flex: 1,
+                        justifyContent: 'center',
+                        alignItems: 'center'
+                    }}
+                >
+                    <View
+                        style={{
+                            backgroundColor: themeColor('modalBackground'),
+                            borderRadius: 24,
+                            padding: 20,
+                            alignItems: 'center',
+                            width: '90%'
+                        }}
+                    >
+                        <Text
+                            style={{
+                                fontFamily: font('marlideBold'),
+                                marginBottom: 12,
+                                fontSize: 32,
+                                textAlign: 'center'
+                            }}
+                        >
+                            {localeString('views.Swaps.title')}
+                        </Text>
+                        <Text
+                            style={{
+                                fontFamily: 'PPNeueMontreal-Book',
+                                color: themeColor('text'),
+                                marginBottom: 12,
+                                fontSize: 18,
+                                textAlign: 'left'
+                            }}
+                        >
+                            {localeString('views.Swaps.intro.description')}
+                        </Text>
+
+                        <Row
+                            justify="space-between"
+                            style={{ marginTop: 16, width: '100%' }}
+                        >
+                            <Button
+                                title={localeString('general.goBack')}
+                                onPress={() => {
+                                    this.setState({
+                                        isIntroModalVisible: false
+                                    });
+                                    navigation.goBack();
+                                }}
+                                containerStyle={{ flex: 1, marginRight: 8 }}
+                                secondary
+                            />
+                            <Button
+                                title={localeString(
+                                    'views.Swaps.intro.continue'
+                                )}
+                                onPress={() => {
+                                    this.setState({
+                                        isIntroModalVisible: false,
+                                        isModalVisible: true
+                                    });
+                                }}
+                                containerStyle={{ flex: 1, marginLeft: 8 }}
+                                tertiary
+                            />
+                        </Row>
+                    </View>
+                </View>
+            </ModalBox>
+        );
+    };
+
+    renderRescueKeyModal = () => {
+        const { isModalVisible } = this.state;
+
+        const { SwapStore, navigation } = this.props;
+
+        const { generateRescueKey } = SwapStore;
+
+        return (
+            <ModalBox
+                isOpen={isModalVisible}
+                style={{
+                    backgroundColor: 'transparent'
+                }}
+                onClosed={() => {
+                    this.setState({
+                        isModalVisible: false
+                    });
+                }}
+                position="center"
+            >
+                <View
+                    style={{
+                        flex: 1,
+                        justifyContent: 'center',
+                        alignItems: 'center'
+                    }}
+                >
+                    <View
+                        style={{
+                            backgroundColor: themeColor('background'),
+                            borderRadius: 24,
+                            padding: 20,
+                            alignItems: 'center',
+                            width: '90%'
+                        }}
+                    >
+                        <>
+                            <Text
+                                style={{
+                                    fontFamily: font('marlideBold'),
+                                    marginBottom: 12,
+                                    fontSize: 32,
+                                    textAlign: 'center'
+                                }}
+                            >
+                                {localeString('views.Swaps.rescueKey')}
+                            </Text>
+                            <Text
+                                style={{
+                                    fontFamily: 'PPNeueMontreal-Book',
+                                    color: themeColor('text'),
+                                    marginBottom: 12,
+                                    fontSize: 18,
+                                    textAlign: 'left'
+                                }}
+                            >
+                                {`${localeString(
+                                    'views.Swaps.rescueKey.modal.text1'
+                                )}\n\n${localeString(
+                                    'views.Swaps.rescueKey.modal.text2'
+                                )}\n\n${localeString(
+                                    'views.Swaps.rescueKey.modal.text3'
+                                )}`}
+                            </Text>
+                        </>
+
+                        <Button
+                            title={localeString('views.Swaps.rescueKey.create')}
+                            onPress={async () => {
+                                const mnemonic = await generateRescueKey();
+                                if (!mnemonic) return;
+
+                                this.setState({
+                                    seedPhrase: mnemonic.split(' '),
+                                    isModalVisible: false,
+                                    showRescueKeyBtn: true
+                                });
+
+                                navigation.navigate('Seed', {
+                                    seedPhrase: mnemonic.split(' ')
+                                });
+                            }}
+                            containerStyle={{ marginTop: 16, marginBottom: 16 }}
+                            tertiary
+                        />
+
+                        <Button
+                            title={localeString(
+                                'views.Swaps.rescueKey.restore'
+                            )}
+                            onPress={() => {
+                                this.setState({
+                                    isModalVisible: false,
+                                    isIntroModalVisible: false
+                                });
+                                navigation.navigate('SeedRecovery', {
+                                    restoreRescueKey: true
+                                });
+                            }}
+                            secondary
+                        />
+                    </View>
+                </View>
+            </ModalBox>
+        );
+    };
+
+    render() {
+        const { NodeInfoStore, navigation } = this.props;
+
+        // Defense in depth: this screen is unreachable from the menu on
+        // testnet (Menu.tsx), but a deep link or SwapsQRScanner could still
+        // land here directly.
+        if (NodeInfoStore.testnet) {
+            return (
+                <Screen>
+                    <Header
+                        leftComponent="Back"
+                        centerComponent={{
+                            text: localeString('views.Swaps.title'),
+                            style: {
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book'
+                            }
+                        }}
+                        navigation={navigation}
+                    />
+                    <View
+                        style={{
+                            flex: 1,
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            margin: 20
+                        }}
+                    >
+                        <Text
+                            style={{
+                                color: themeColor('text'),
+                                fontFamily: 'PPNeueMontreal-Book',
+                                fontSize: 16,
+                                textAlign: 'center'
+                            }}
+                        >
+                            {localeString('views.Swaps.notAvailableOnTestnet')}
+                        </Text>
+                    </View>
+                </Screen>
+            );
+        }
+
+        const {
+            SwapStore,
+            UnitsStore,
+            InvoicesStore,
+            FiatStore,
+            SettingsStore,
+            LSPStore
+        } = this.props;
+        const {
+            reverse,
+            serviceFeeSats,
+            inputSats,
+            outputSats,
+            inputDisplay,
+            outputDisplay,
+            error,
+            apiUpdates,
+            invoice,
+            isValid,
+            fetchingInvoice,
+            fee,
+            feeSettingToggle,
+            showRescueKeyBtn,
+            enableLSP,
+            flowLspNotConfigured,
+            feeRateLookupDone
+        } = this.state;
+        const { subInfo, reverseInfo, loading, apiError, clearError } =
+            SwapStore;
+        const info: any = reverse ? reverseInfo : subInfo;
+        const { units } = UnitsStore;
+        const { zeroConfFee } = LSPStore;
+
+        const { fiatRates } = FiatStore;
+        const { settings, updateSettings } = SettingsStore;
+        const { fiat } = settings;
+
+        const fiatEntry =
+            fiat && fiatRates
+                ? fiatRates.filter((entry: any) => entry.code === fiat)[0]
+                : null;
+
+        const rate = fiat && fiatRates && fiatEntry ? fiatEntry.rate : 0;
+
+        const serviceFeePct = info?.fees?.percentage || 0;
+        const networkFee = this.networkFeeSats(reverse);
+
+        const SwapsPaneBtn = () => (
+            <TouchableOpacity
+                // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                style={{ marginTop: -10 }}
+                onPress={() => {
+                    navigation.navigate('SwapsPane');
+                }}
+                accessibilityLabel={localeString('general.add')}
+            >
+                <History
+                    fill={themeColor('text')}
+                    width="40"
+                    height="40"
+                    style={{ alignSelf: 'center' }}
+                />
+            </TouchableOpacity>
+        );
+
+        const SettingsBtn = () => (
+            <TouchableOpacity
+                // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                style={{ marginTop: -10, marginRight: 6 }}
+                onPress={() => {
+                    this.props.navigation.navigate('SwapSettings');
+                }}
+            >
+                <Icon name="settings" color={themeColor('text')} size={33} />
+            </TouchableOpacity>
+        );
+
+        const RescueKeyPhrase = () => {
+            return (
+                // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                <TouchableOpacity style={{ marginTop: -10, marginRight: 6 }}>
+                    <KeyIcon
+                        onPress={() => {
+                            reAuthNavigation(navigation, 'Seed', {
+                                seedPhrase: this.state.seedPhrase
+                            });
+                        }}
+                        underlayColor="transparent"
+                        fill={themeColor('text')}
+                        width={36}
+                        height={36}
+                    />
+                </TouchableOpacity>
+            );
+        };
+
+        const min = calculateLimit(
+            info?.limits?.minimal || 0,
+            serviceFeePct,
+            networkFee,
+            reverse
+        );
+        const max = calculateLimit(
+            info?.limits?.maximal || 0,
+            serviceFeePct,
+            networkFee,
+            reverse
+        );
+
+        const currentInputSats = new BigNumber(inputSats || 0);
+        const errorInput =
+            (currentInputSats.isGreaterThan(0) &&
+                currentInputSats.isLessThan(min)) ||
+            currentInputSats.isGreaterThan(max);
+        const errorOutput = new BigNumber(outputSats || 0).isLessThan(0);
+        const errorMsg = errorInput || errorOutput;
+
+        return (
+            <Screen>
+                {this.renderIntroModal()}
+                {this.renderRescueKeyModal()}
+                <Header
+                    leftComponent="Back"
+                    centerComponent={{
+                        text: localeString('views.Swaps.title'),
+                        style: {
+                            color: themeColor('text'),
+                            fontFamily: 'PPNeueMontreal-Book'
+                        }
+                    }}
+                    rightComponent={
+                        <Row>
+                            {!loading && (
+                                <>
+                                    {showRescueKeyBtn ? (
+                                        <RescueKeyPhrase />
+                                    ) : (
+                                        <></>
+                                    )}
+                                    <SettingsBtn />
+                                    <SwapsPaneBtn />
+                                </>
+                            )}
+                        </Row>
+                    }
+                    onBack={() => {
+                        clearError();
+                    }}
+                    navigation={navigation}
+                />
+                <KeyboardAvoidingView
+                    style={{ flex: 1 }}
+                    behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+                >
+                    <ScrollView
+                        contentContainerStyle={{ flexGrow: 1 }}
+                        keyboardShouldPersistTaps="handled"
+                    >
+                        <View style={{ flex: 1, margin: 10 }}>
+                            {loading && <LoadingIndicator />}
+                            {!loading && (
+                                <>
+                                    {(error || apiError) && (
+                                        <ErrorMessage
+                                            message={error || apiError}
+                                            dismissable
+                                        />
+                                    )}
+
+                                    {apiUpdates && (
+                                        <SuccessMessage
+                                            message={apiUpdates}
+                                            dismissable
+                                        />
+                                    )}
+
+                                    <View style={{ alignItems: 'center' }}>
+                                        <Text
+                                            style={{
+                                                fontFamily:
+                                                    'PPNeueMontreal-Book',
+                                                fontSize: 20
+                                            }}
+                                        >
+                                            {localeString('views.Swaps.create')}
+                                        </Text>
+                                        <Text
+                                            style={{
+                                                fontFamily:
+                                                    'PPNeueMontreal-Book',
+                                                color: themeColor(
+                                                    'secondaryText'
+                                                ),
+                                                fontSize: 14,
+                                                marginTop: 4,
+                                                marginBottom: 20
+                                            }}
+                                            numberOfLines={1}
+                                            ellipsizeMode="middle"
+                                        >
+                                            {`${localeString(
+                                                'general.serviceProvider'
+                                            )}: ${
+                                                SwapStore.getServiceProvider
+                                            }`}
+                                        </Text>
+                                    </View>
+
+                                    <View
+                                        style={{
+                                            flex: 1
+                                        }}
+                                    >
+                                        <Row>
+                                            <View
+                                                style={{
+                                                    flexDirection: 'column',
+                                                    width: '89%'
+                                                }}
+                                            >
+                                                <Row
+                                                    style={{
+                                                        zIndex: 1,
+                                                        marginBottom: 10,
+                                                        marginRight: 5
+                                                    }}
+                                                >
+                                                    <AmountInput
+                                                        onNavigateAway={
+                                                            this
+                                                                .markNavigatingAway
+                                                        }
+                                                        prefix={
+                                                            <TouchableOpacity
+                                                                onPress={() => {
+                                                                    this.setState(
+                                                                        {
+                                                                            reverse:
+                                                                                !reverse,
+                                                                            inputSats: 0,
+                                                                            outputSats: 0,
+                                                                            inputDisplay:
+                                                                                '',
+                                                                            outputDisplay:
+                                                                                '',
+                                                                            serviceFeeSats: 0,
+                                                                            invoice:
+                                                                                ''
+                                                                        },
+                                                                        () =>
+                                                                            this.checkIsValid()
+                                                                    );
+                                                                }}
+                                                                style={{
+                                                                    // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                                                                    marginLeft:
+                                                                        -10
+                                                                }}
+                                                            >
+                                                                {reverse ? (
+                                                                    <LightningSvg
+                                                                        width={
+                                                                            60
+                                                                        }
+                                                                        circle={
+                                                                            false
+                                                                        }
+                                                                    />
+                                                                ) : (
+                                                                    <OnChainSvg
+                                                                        width={
+                                                                            60
+                                                                        }
+                                                                        circle={
+                                                                            false
+                                                                        }
+                                                                    />
+                                                                )}
+                                                            </TouchableOpacity>
+                                                        }
+                                                        onAmountChange={(
+                                                            amount,
+                                                            satAmount:
+                                                                | string
+                                                                | number
+                                                        ) => {
+                                                            this.setState(
+                                                                (
+                                                                    prevState
+                                                                ) => ({
+                                                                    error: '',
+                                                                    invoice:
+                                                                        prevState.reverse
+                                                                            ? prevState.invoice
+                                                                            : ''
+                                                                })
+                                                            );
+
+                                                            if (
+                                                                !satAmount ||
+                                                                satAmount ===
+                                                                    '0'
+                                                            ) {
+                                                                this.setState({
+                                                                    serviceFeeSats: 0,
+                                                                    outputSats: 0
+                                                                });
+                                                            }
+
+                                                            const satAmountNew =
+                                                                new BigNumber(
+                                                                    satAmount ||
+                                                                        0
+                                                                );
+
+                                                            const outputSats =
+                                                                calculateReceiveAmount(
+                                                                    satAmountNew,
+                                                                    serviceFeePct,
+                                                                    networkFee,
+                                                                    reverse
+                                                                );
+
+                                                            let newOutputDisplayString =
+                                                                '';
+                                                            if (
+                                                                outputSats.isGreaterThan(
+                                                                    0
+                                                                )
+                                                            ) {
+                                                                if (
+                                                                    units ===
+                                                                    'fiat'
+                                                                ) {
+                                                                    newOutputDisplayString =
+                                                                        outputSats
+                                                                            .div(
+                                                                                SATS_PER_BTC
+                                                                            )
+                                                                            .times(
+                                                                                rate
+                                                                            )
+                                                                            .toFixed(
+                                                                                2
+                                                                            );
+                                                                } else if (
+                                                                    units ===
+                                                                    'BTC'
+                                                                ) {
+                                                                    newOutputDisplayString =
+                                                                        outputSats
+                                                                            .div(
+                                                                                SATS_PER_BTC
+                                                                            )
+                                                                            .toFixed(
+                                                                                8
+                                                                            );
+                                                                } else if (
+                                                                    units ===
+                                                                    'sats'
+                                                                ) {
+                                                                    newOutputDisplayString =
+                                                                        outputSats.toFixed(
+                                                                            0
+                                                                        );
+                                                                }
+                                                            }
+
+                                                            this.setState(
+                                                                {
+                                                                    serviceFeeSats:
+                                                                        calculateServiceFeeOnSend(
+                                                                            satAmountNew,
+                                                                            serviceFeePct,
+                                                                            networkFee,
+                                                                            reverse
+                                                                        ),
+                                                                    lastEditedAmount:
+                                                                        'input',
+                                                                    inputSats:
+                                                                        satAmountNew.toNumber(),
+                                                                    outputSats,
+                                                                    inputDisplay:
+                                                                        amount &&
+                                                                        amount.toString(),
+                                                                    outputDisplay:
+                                                                        newOutputDisplayString
+                                                                },
+                                                                () =>
+                                                                    this.checkIsValid()
+                                                            );
+                                                        }}
+                                                        amount={inputDisplay}
+                                                        hideConversion
+                                                        hideUnitChangeButton
+                                                        error={errorInput}
+                                                    />
+                                                </Row>
+                                                <TouchableOpacity
+                                                    style={{
+                                                        alignSelf: 'center',
+                                                        position: 'absolute',
+                                                        zIndex: 100,
+                                                        top: 50
+                                                    }}
+                                                    onPress={() => {
+                                                        this.setState({
+                                                            reverse: !reverse,
+                                                            inputSats: 0,
+                                                            outputSats: 0,
+                                                            inputDisplay: '',
+                                                            outputDisplay: '',
+                                                            serviceFeeSats: 0,
+                                                            invoice: ''
+                                                        });
+                                                    }}
+                                                >
+                                                    <View
+                                                        style={{
+                                                            backgroundColor:
+                                                                themeColor(
+                                                                    'background'
+                                                                ),
+                                                            borderRadius: 30,
+                                                            padding: 10,
+                                                            position: 'absolute'
+                                                        }}
+                                                    >
+                                                        <ArrowDown
+                                                            fill={themeColor(
+                                                                'text'
+                                                            )}
+                                                            height="30"
+                                                            width="30"
+                                                        />
+                                                    </View>
+                                                </TouchableOpacity>
+                                                <View style={{ zIndex: 2 }}>
+                                                    <Row
+                                                        style={{
+                                                            zIndex: 1,
+                                                            // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                                                            top: -20,
+                                                            marginRight: 5
+                                                        }}
+                                                    >
+                                                        <AmountInput
+                                                            onNavigateAway={
+                                                                this
+                                                                    .markNavigatingAway
+                                                            }
+                                                            prefix={
+                                                                <TouchableOpacity
+                                                                    onPress={() => {
+                                                                        this.setState(
+                                                                            {
+                                                                                reverse:
+                                                                                    !reverse,
+                                                                                inputSats: 0,
+                                                                                outputSats: 0,
+                                                                                inputDisplay:
+                                                                                    '',
+                                                                                outputDisplay:
+                                                                                    '',
+                                                                                serviceFeeSats: 0,
+                                                                                invoice:
+                                                                                    ''
+                                                                            },
+                                                                            () =>
+                                                                                this.checkIsValid()
+                                                                        );
+                                                                    }}
+                                                                    style={{
+                                                                        // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                                                                        marginLeft:
+                                                                            -10
+                                                                    }}
+                                                                >
+                                                                    {reverse ? (
+                                                                        <OnChainSvg
+                                                                            width={
+                                                                                60
+                                                                            }
+                                                                            circle={
+                                                                                false
+                                                                            }
+                                                                        />
+                                                                    ) : (
+                                                                        <LightningSvg
+                                                                            width={
+                                                                                60
+                                                                            }
+                                                                            circle={
+                                                                                false
+                                                                            }
+                                                                        />
+                                                                    )}
+                                                                </TouchableOpacity>
+                                                            }
+                                                            onAmountChange={(
+                                                                amount,
+                                                                satAmount:
+                                                                    | string
+                                                                    | number
+                                                            ) => {
+                                                                this.setState(
+                                                                    (
+                                                                        prevState
+                                                                    ) => ({
+                                                                        error: '',
+                                                                        invoice:
+                                                                            prevState.reverse
+                                                                                ? prevState.invoice
+                                                                                : ''
+                                                                    })
+                                                                );
+
+                                                                if (
+                                                                    !satAmount ||
+                                                                    satAmount ===
+                                                                        '0'
+                                                                ) {
+                                                                    this.setState(
+                                                                        {
+                                                                            serviceFeeSats: 0,
+                                                                            inputSats: 0
+                                                                        }
+                                                                    );
+                                                                }
+
+                                                                const satAmountNew =
+                                                                    new BigNumber(
+                                                                        satAmount ||
+                                                                            0
+                                                                    );
+
+                                                                let input: any;
+                                                                if (
+                                                                    satAmountNew.isEqualTo(
+                                                                        0
+                                                                    )
+                                                                ) {
+                                                                    input = 0;
+                                                                } else
+                                                                    input =
+                                                                        calculateSendAmount(
+                                                                            satAmountNew,
+                                                                            serviceFeePct,
+                                                                            networkFee,
+                                                                            reverse
+                                                                        );
+
+                                                                const newInputSatsBN =
+                                                                    new BigNumber(
+                                                                        input ||
+                                                                            0
+                                                                    );
+                                                                let newInputDisplayString =
+                                                                    '';
+                                                                if (
+                                                                    newInputSatsBN.isGreaterThan(
+                                                                        0
+                                                                    )
+                                                                ) {
+                                                                    if (
+                                                                        units ===
+                                                                        'fiat'
+                                                                    ) {
+                                                                        newInputDisplayString =
+                                                                            newInputSatsBN
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .times(
+                                                                                    rate
+                                                                                )
+                                                                                .toFixed(
+                                                                                    2
+                                                                                );
+                                                                    } else if (
+                                                                        units ===
+                                                                        'BTC'
+                                                                    ) {
+                                                                        newInputDisplayString =
+                                                                            newInputSatsBN
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .toFixed(
+                                                                                    8
+                                                                                );
+                                                                    } else if (
+                                                                        units ===
+                                                                        'sats'
+                                                                    ) {
+                                                                        newInputDisplayString =
+                                                                            newInputSatsBN.toFixed(
+                                                                                0
+                                                                            );
+                                                                    }
+                                                                }
+
+                                                                const serviceFeeSats =
+                                                                    reverse &&
+                                                                    input
+                                                                        ? input
+                                                                              .times(
+                                                                                  serviceFeePct
+                                                                              )
+                                                                              .div(
+                                                                                  100
+                                                                              )
+                                                                        : satAmountNew
+                                                                              .times(
+                                                                                  serviceFeePct
+                                                                              )
+                                                                              .div(
+                                                                                  100
+                                                                              );
+
+                                                                this.setState(
+                                                                    {
+                                                                        serviceFeeSats:
+                                                                            bigCeil(
+                                                                                serviceFeeSats
+                                                                            ),
+                                                                        lastEditedAmount:
+                                                                            'output',
+                                                                        inputSats:
+                                                                            input,
+                                                                        outputSats:
+                                                                            satAmountNew.toNumber(),
+                                                                        inputDisplay:
+                                                                            newInputDisplayString,
+                                                                        outputDisplay:
+                                                                            amount &&
+                                                                            amount.toString()
+                                                                    },
+                                                                    () =>
+                                                                        this.checkIsValid()
+                                                                );
+                                                            }}
+                                                            amount={
+                                                                outputDisplay
+                                                            }
+                                                            hideConversion
+                                                            hideUnitChangeButton
+                                                            error={errorOutput}
+                                                        />
+                                                    </Row>
+                                                </View>
+                                            </View>
+                                            <View
+                                                style={{
+                                                    flexDirection: 'column',
+                                                    width: '11%'
+                                                }}
+                                            >
+                                                <TouchableOpacity
+                                                    onPress={() => {
+                                                        const {
+                                                            FiatStore,
+                                                            SettingsStore
+                                                        } = this.props;
+                                                        const { fiatRates } =
+                                                            FiatStore;
+                                                        const { settings } =
+                                                            SettingsStore;
+                                                        const { fiat } =
+                                                            settings;
+
+                                                        const fiatEntry =
+                                                            fiat && fiatRates
+                                                                ? fiatRates.filter(
+                                                                      (entry) =>
+                                                                          entry.code ===
+                                                                          fiat
+                                                                  )[0]
+                                                                : null;
+                                                        const rate =
+                                                            fiat &&
+                                                            fiatRates &&
+                                                            fiatEntry
+                                                                ? fiatEntry.rate
+                                                                : 0;
+
+                                                        UnitsStore.changeUnits();
+                                                        const newUnit =
+                                                            UnitsStore.units;
+
+                                                        this.setState(
+                                                            (prevState) => {
+                                                                const currentInputSats =
+                                                                    new BigNumber(
+                                                                        prevState.inputSats ||
+                                                                            0
+                                                                    );
+                                                                const currentOutputSats =
+                                                                    new BigNumber(
+                                                                        prevState.outputSats ||
+                                                                            0
+                                                                    );
+                                                                let newInputDisplayAmount =
+                                                                    '';
+                                                                let newOutputDisplayAmount =
+                                                                    '';
+
+                                                                if (
+                                                                    newUnit ===
+                                                                        'fiat' &&
+                                                                    rate > 0
+                                                                ) {
+                                                                    if (
+                                                                        currentInputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newInputDisplayAmount =
+                                                                            currentInputSats
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .times(
+                                                                                    rate
+                                                                                )
+                                                                                .toFixed(
+                                                                                    2
+                                                                                );
+                                                                    }
+                                                                    if (
+                                                                        currentOutputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newOutputDisplayAmount =
+                                                                            currentOutputSats
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .times(
+                                                                                    rate
+                                                                                )
+                                                                                .toFixed(
+                                                                                    2
+                                                                                );
+                                                                    }
+                                                                } else if (
+                                                                    newUnit ===
+                                                                    'BTC'
+                                                                ) {
+                                                                    if (
+                                                                        currentInputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newInputDisplayAmount =
+                                                                            currentInputSats
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .toFixed(
+                                                                                    8
+                                                                                );
+                                                                    }
+                                                                    if (
+                                                                        currentOutputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newOutputDisplayAmount =
+                                                                            currentOutputSats
+                                                                                .div(
+                                                                                    SATS_PER_BTC
+                                                                                )
+                                                                                .toFixed(
+                                                                                    8
+                                                                                );
+                                                                    }
+                                                                } else if (
+                                                                    newUnit ===
+                                                                    'sats'
+                                                                ) {
+                                                                    if (
+                                                                        currentInputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newInputDisplayAmount =
+                                                                            currentInputSats.toFixed(
+                                                                                0
+                                                                            );
+                                                                    }
+                                                                    if (
+                                                                        currentOutputSats.isGreaterThan(
+                                                                            0
+                                                                        )
+                                                                    ) {
+                                                                        newOutputDisplayAmount =
+                                                                            currentOutputSats.toFixed(
+                                                                                0
+                                                                            );
+                                                                    }
+                                                                }
+
+                                                                return {
+                                                                    inputDisplay:
+                                                                        newInputDisplayAmount,
+                                                                    outputDisplay:
+                                                                        newOutputDisplayAmount
+                                                                };
+                                                            }
+                                                        );
+                                                    }}
+                                                    style={{
+                                                        marginLeft: 10,
+                                                        // eslint-disable-next-line zeus/no-negative-layout-offset -- TODO #2794
+                                                        top: -10
+                                                    }}
+                                                >
+                                                    {UnitsStore!.getNextUnit() ===
+                                                    'fiat' ? (
+                                                        <ExchangeFiatSVG
+                                                            fill={themeColor(
+                                                                'text'
+                                                            )}
+                                                            width="35"
+                                                            height="35"
+                                                        />
+                                                    ) : (
+                                                        <ExchangeBitcoinSVG
+                                                            fill={themeColor(
+                                                                'text'
+                                                            )}
+                                                            width="35"
+                                                            height="35"
+                                                        />
+                                                    )}
+                                                </TouchableOpacity>
+                                            </View>
+                                        </Row>
+
+                                        <Row justify="space-between">
+                                            <View>
+                                                <Row>
+                                                    <Text
+                                                        style={{
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book'
+                                                        }}
+                                                    >
+                                                        {`${localeString(
+                                                            'views.Swaps.networkFee'
+                                                        )}: `}
+                                                    </Text>
+                                                    <Amount sats={networkFee} />
+                                                </Row>
+                                                <Row>
+                                                    <Text
+                                                        style={{
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book'
+                                                        }}
+                                                    >
+                                                        {`${localeString(
+                                                            'views.Swaps.serviceFee'
+                                                        )}: `}
+                                                    </Text>
+                                                    <Amount
+                                                        sats={serviceFeeSats}
+                                                    />
+                                                    <Text
+                                                        style={{
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book'
+                                                        }}
+                                                    >
+                                                        {` (${serviceFeePct}%)`}
+                                                    </Text>
+                                                </Row>
+                                            </View>
+                                            <View>
+                                                <TouchableOpacity
+                                                    onPress={() => {
+                                                        this.setState({
+                                                            error: ''
+                                                        });
+
+                                                        const satAmountNew =
+                                                            new BigNumber(
+                                                                min || 0
+                                                            );
+
+                                                        let inputDisplay = '';
+                                                        if (
+                                                            satAmountNew.isGreaterThan(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            if (
+                                                                units === 'fiat'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .times(
+                                                                            rate
+                                                                        )
+                                                                        .toFixed(
+                                                                            2
+                                                                        );
+                                                            } else if (
+                                                                units === 'BTC'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .toFixed(
+                                                                            8
+                                                                        );
+                                                            } else if (
+                                                                units === 'sats'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew.toFixed(
+                                                                        0
+                                                                    );
+                                                            }
+                                                        }
+
+                                                        if (
+                                                            satAmountNew.isEqualTo(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            this.setState({
+                                                                serviceFeeSats: 0,
+                                                                outputSats: 0
+                                                            });
+                                                        }
+
+                                                        const outputSats =
+                                                            calculateReceiveAmount(
+                                                                satAmountNew,
+                                                                serviceFeePct,
+                                                                networkFee,
+                                                                reverse
+                                                            );
+
+                                                        let outputDisplay = '';
+                                                        if (
+                                                            outputSats.isGreaterThan(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            if (
+                                                                units === 'fiat'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .times(
+                                                                            rate
+                                                                        )
+                                                                        .toFixed(
+                                                                            2
+                                                                        );
+                                                            } else if (
+                                                                units === 'BTC'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .toFixed(
+                                                                            8
+                                                                        );
+                                                            } else if (
+                                                                units === 'sats'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats.toFixed(
+                                                                        0
+                                                                    );
+                                                            }
+                                                        }
+
+                                                        this.setState({
+                                                            serviceFeeSats:
+                                                                calculateServiceFeeOnSend(
+                                                                    satAmountNew,
+                                                                    serviceFeePct,
+                                                                    networkFee,
+                                                                    reverse
+                                                                ),
+                                                            lastEditedAmount:
+                                                                'input',
+                                                            inputSats:
+                                                                satAmountNew.toNumber(),
+                                                            outputSats,
+                                                            inputDisplay,
+                                                            outputDisplay
+                                                        });
+                                                    }}
+                                                >
+                                                    <Row>
+                                                        <Text
+                                                            style={{
+                                                                fontFamily:
+                                                                    'PPNeueMontreal-Book'
+                                                            }}
+                                                        >
+                                                            {`${localeString(
+                                                                'general.min'
+                                                            )}: `}
+                                                        </Text>
+                                                        <Amount sats={min} />
+                                                    </Row>
+                                                </TouchableOpacity>
+                                                <TouchableOpacity
+                                                    onPress={() => {
+                                                        this.setState({
+                                                            error: ''
+                                                        });
+
+                                                        const satAmountNew =
+                                                            new BigNumber(
+                                                                max || 0
+                                                            );
+
+                                                        let inputDisplay = '';
+                                                        if (
+                                                            satAmountNew.isGreaterThan(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            if (
+                                                                units === 'fiat'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .times(
+                                                                            rate
+                                                                        )
+                                                                        .toFixed(
+                                                                            2
+                                                                        );
+                                                            } else if (
+                                                                units === 'BTC'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .toFixed(
+                                                                            8
+                                                                        );
+                                                            } else if (
+                                                                units === 'sats'
+                                                            ) {
+                                                                inputDisplay =
+                                                                    satAmountNew.toFixed(
+                                                                        0
+                                                                    );
+                                                            }
+                                                        }
+
+                                                        if (
+                                                            satAmountNew.isEqualTo(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            this.setState({
+                                                                serviceFeeSats: 0,
+                                                                outputSats: 0
+                                                            });
+                                                        }
+
+                                                        const outputSats =
+                                                            calculateReceiveAmount(
+                                                                satAmountNew,
+                                                                serviceFeePct,
+                                                                networkFee,
+                                                                reverse
+                                                            );
+
+                                                        let outputDisplay = '';
+                                                        if (
+                                                            outputSats.isGreaterThan(
+                                                                0
+                                                            )
+                                                        ) {
+                                                            if (
+                                                                units === 'fiat'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .times(
+                                                                            rate
+                                                                        )
+                                                                        .toFixed(
+                                                                            2
+                                                                        );
+                                                            } else if (
+                                                                units === 'BTC'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats
+                                                                        .div(
+                                                                            SATS_PER_BTC
+                                                                        )
+                                                                        .toFixed(
+                                                                            8
+                                                                        );
+                                                            } else if (
+                                                                units === 'sats'
+                                                            ) {
+                                                                outputDisplay =
+                                                                    outputSats.toFixed(
+                                                                        0
+                                                                    );
+                                                            }
+                                                        }
+
+                                                        this.setState({
+                                                            serviceFeeSats:
+                                                                calculateServiceFeeOnSend(
+                                                                    satAmountNew,
+                                                                    serviceFeePct,
+                                                                    networkFee,
+                                                                    reverse
+                                                                ),
+                                                            lastEditedAmount:
+                                                                'input',
+                                                            inputSats:
+                                                                satAmountNew.toNumber(),
+                                                            outputSats,
+                                                            inputDisplay,
+                                                            outputDisplay
+                                                        });
+                                                    }}
+                                                >
+                                                    <Row>
+                                                        <Text
+                                                            style={{
+                                                                fontFamily:
+                                                                    'PPNeueMontreal-Book'
+                                                            }}
+                                                        >
+                                                            {`${localeString(
+                                                                'general.max'
+                                                            )}: `}
+                                                        </Text>
+                                                        <Amount sats={max} />
+                                                    </Row>
+                                                </TouchableOpacity>
+                                            </View>
+                                        </Row>
+                                    </View>
+                                    {BackendUtils.supportsFlowLSP() &&
+                                        !flowLspNotConfigured &&
+                                        !reverse && (
+                                            <View
+                                                style={{
+                                                    paddingHorizontal: 20,
+                                                    flexDirection: 'column',
+                                                    marginBottom: 15
+                                                }}
+                                            >
+                                                <View
+                                                    style={{
+                                                        flex: 1,
+                                                        gap: 10,
+                                                        flexDirection: 'row',
+                                                        justifyContent:
+                                                            'space-between',
+                                                        alignItems: 'center',
+                                                        marginBottom:
+                                                            zeroConfFee !==
+                                                                undefined &&
+                                                            invoice &&
+                                                            enableLSP
+                                                                ? 8
+                                                                : 0
+                                                    }}
+                                                >
+                                                    <Text
+                                                        style={{
+                                                            fontFamily:
+                                                                'PPNeueMontreal-Book',
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            ),
+                                                            fontSize: 16
+                                                        }}
+                                                        infoModalText={[
+                                                            localeString(
+                                                                'views.Receive.lspSwitchExplainer1'
+                                                            ),
+                                                            localeString(
+                                                                'views.Receive.lspSwitchExplainer2'
+                                                            )
+                                                        ]}
+                                                        infoModalAdditionalButtons={[
+                                                            {
+                                                                title: localeString(
+                                                                    'general.learnMore'
+                                                                ),
+                                                                callback: () =>
+                                                                    navigation.navigate(
+                                                                        'LspExplanationOverview'
+                                                                    )
+                                                            }
+                                                        ]}
+                                                    >
+                                                        {localeString(
+                                                            'views.Settings.LSP.enableLSP'
+                                                        )}
+                                                    </Text>
+
+                                                    <Switch
+                                                        value={enableLSP}
+                                                        onValueChange={async () => {
+                                                            this.setState({
+                                                                enableLSP:
+                                                                    !enableLSP,
+                                                                invoice: '',
+                                                                error: ''
+                                                            });
+                                                            SwapStore.apiError =
+                                                                '';
+                                                            await updateSettings(
+                                                                {
+                                                                    enableLSP:
+                                                                        !enableLSP
+                                                                }
+                                                            );
+                                                        }}
+                                                    />
+                                                </View>
+                                                {zeroConfFee !== undefined &&
+                                                    enableLSP &&
+                                                    invoice && (
+                                                        <TouchableOpacity
+                                                            onPress={() => {
+                                                                this.isNavigatingAway =
+                                                                    true;
+                                                                navigation.navigate(
+                                                                    new BigNumber(
+                                                                        zeroConfFee
+                                                                    ).gt(1000)
+                                                                        ? 'LspExplanationFees'
+                                                                        : 'LspExplanationRouting'
+                                                                );
+                                                            }}
+                                                        >
+                                                            <View
+                                                                style={{
+                                                                    backgroundColor:
+                                                                        themeColor(
+                                                                            'secondary'
+                                                                        ),
+                                                                    borderRadius: 10,
+                                                                    top: 10,
+                                                                    padding: 15,
+                                                                    borderWidth: 0.5
+                                                                }}
+                                                            >
+                                                                <Text
+                                                                    style={{
+                                                                        fontFamily:
+                                                                            'PPNeueMontreal-Medium',
+                                                                        color: themeColor(
+                                                                            'text'
+                                                                        ),
+                                                                        marginBottom: 5
+                                                                    }}
+                                                                >
+                                                                    {localeString(
+                                                                        new BigNumber(
+                                                                            zeroConfFee
+                                                                        ).gt(
+                                                                            1000
+                                                                        )
+                                                                            ? 'views.Receive.lspExplainer'
+                                                                            : 'views.Receive.lspExplainerRouting'
+                                                                    )}
+                                                                </Text>
+                                                                <Amount
+                                                                    sats={
+                                                                        zeroConfFee
+                                                                    }
+                                                                    fixedUnits="sats"
+                                                                />
+                                                                <Text
+                                                                    style={{
+                                                                        fontFamily:
+                                                                            'PPNeueMontreal-Medium',
+                                                                        color: themeColor(
+                                                                            'secondaryText'
+                                                                        ),
+                                                                        fontSize: 15,
+                                                                        top: 5,
+                                                                        textAlign:
+                                                                            'right'
+                                                                    }}
+                                                                >
+                                                                    {localeString(
+                                                                        'general.tapToLearnMore'
+                                                                    )}
+                                                                </Text>
+                                                            </View>
+                                                        </TouchableOpacity>
+                                                    )}
+                                            </View>
+                                        )}
+
+                                    <AddressInput
+                                        value={invoice}
+                                        onChangeText={(text: string) => {
+                                            this.setState(
+                                                {
+                                                    invoice: text,
+                                                    error: '',
+                                                    apiUpdates: ''
+                                                },
+                                                () => this.checkIsValid()
+                                            );
+                                        }}
+                                        onScan={() => {
+                                            this.isNavigatingAway = true;
+                                            navigation.navigate(
+                                                'SwapsQRScanner'
+                                            );
+                                        }}
+                                        placeholder={
+                                            fetchingInvoice
+                                                ? ''
+                                                : reverse
+                                                ? localeString(
+                                                      'views.Settings.AddContact.onchainAddress'
+                                                  )
+                                                : localeString(
+                                                      'views.PaymentRequest.title'
+                                                  )
+                                        }
+                                        loading={fetchingInvoice}
+                                        style={{ marginHorizontal: 20 }}
+                                    />
+
+                                    <View
+                                        style={{
+                                            marginVertical: 5
+                                        }}
+                                    >
+                                        {!(
+                                            reverse &&
+                                            !BackendUtils.supportsOnchainSends()
+                                        ) && (
+                                            <Button
+                                                onPress={async () => {
+                                                    this.setState({
+                                                        invoice: '',
+                                                        fetchingInvoice: true
+                                                    });
+                                                    try {
+                                                        if (!outputSats) {
+                                                            this.setState({
+                                                                error: localeString(
+                                                                    'views.Swaps.missingAmount'
+                                                                ),
+                                                                fetchingInvoice:
+                                                                    false
+                                                            });
+                                                            return;
+                                                        }
+
+                                                        await InvoicesStore.createUnifiedInvoice(
+                                                            {
+                                                                memo: '',
+                                                                value:
+                                                                    outputSats.toString() ||
+                                                                    '0',
+                                                                expirySeconds:
+                                                                    settings
+                                                                        ?.invoices
+                                                                        ?.expirySeconds ||
+                                                                    '3600',
+                                                                // only where the LSP switch and fee are shown
+                                                                useLsp:
+                                                                    !!enableLSP &&
+                                                                    BackendUtils.supportsFlowLSP() &&
+                                                                    !flowLspNotConfigured &&
+                                                                    !reverse
+                                                            }
+                                                        );
+
+                                                        if (reverse) {
+                                                            if (
+                                                                InvoicesStore.onChainAddress
+                                                            ) {
+                                                                this.setState(
+                                                                    {
+                                                                        invoice:
+                                                                            InvoicesStore.onChainAddress,
+                                                                        error: ''
+                                                                    },
+                                                                    () =>
+                                                                        this.checkIsValid()
+                                                                );
+                                                            } else {
+                                                                this.setState({
+                                                                    error: localeString(
+                                                                        'views.Swaps.generateOnchainAddressFailed'
+                                                                    ),
+                                                                    fetchingInvoice:
+                                                                        false
+                                                                });
+                                                            }
+                                                        } else {
+                                                            if (
+                                                                InvoicesStore.payment_request
+                                                            ) {
+                                                                this.setState(
+                                                                    {
+                                                                        invoice:
+                                                                            InvoicesStore.payment_request,
+                                                                        error: ''
+                                                                    },
+                                                                    () =>
+                                                                        this.checkIsValid()
+                                                                );
+                                                            } else {
+                                                                this.setState({
+                                                                    error: localeString(
+                                                                        'views.Swaps.generateInvoiceFailed'
+                                                                    ),
+                                                                    fetchingInvoice:
+                                                                        false
+                                                                });
+                                                            }
+                                                        }
+                                                        this.setState({
+                                                            fetchingInvoice:
+                                                                false
+                                                        });
+                                                    } catch (e: any) {
+                                                        console.error(
+                                                            'Error generating invoice:',
+                                                            e
+                                                        );
+                                                        this.setState({
+                                                            error: localeString(
+                                                                'views.Swaps.generateInvoiceFailed'
+                                                            ),
+                                                            fetchingInvoice:
+                                                                false
+                                                        });
+                                                    }
+                                                }}
+                                                title={
+                                                    !reverse
+                                                        ? localeString(
+                                                              'views.Swaps.generateInvoice'
+                                                          )
+                                                        : localeString(
+                                                              'views.Swaps.generateOnchainAddress'
+                                                          )
+                                                }
+                                                secondary
+                                                disabled={
+                                                    errorMsg ||
+                                                    !!invoice ||
+                                                    loading ||
+                                                    inputSats === 0 ||
+                                                    outputSats === 0 ||
+                                                    fetchingInvoice
+                                                }
+                                            />
+                                        )}
+                                    </View>
+                                    {reverse && (
+                                        <View style={{ paddingHorizontal: 20 }}>
+                                            <TouchableOpacity
+                                                onPress={() => {
+                                                    this.setState({
+                                                        feeSettingToggle:
+                                                            !feeSettingToggle
+                                                    });
+                                                }}
+                                            >
+                                                <View
+                                                    style={{
+                                                        marginTop:
+                                                            reverse &&
+                                                            !BackendUtils.supportsOnchainSends()
+                                                                ? 0
+                                                                : 10,
+                                                        marginBottom: 20
+                                                    }}
+                                                >
+                                                    <Row justify="space-between">
+                                                        <View
+                                                            style={{ flex: 1 }}
+                                                        >
+                                                            <KeyValue
+                                                                keyValue={localeString(
+                                                                    'views.Swaps.setClaimFeeRate'
+                                                                )}
+                                                            />
+                                                        </View>
+                                                        {feeSettingToggle ? (
+                                                            <CaretDown
+                                                                fill={themeColor(
+                                                                    'text'
+                                                                )}
+                                                                width="20"
+                                                                height="20"
+                                                            />
+                                                        ) : (
+                                                            <CaretRight
+                                                                fill={themeColor(
+                                                                    'text'
+                                                                )}
+                                                                width="20"
+                                                                height="20"
+                                                            />
+                                                        )}
+                                                    </Row>
+                                                </View>
+                                            </TouchableOpacity>
+                                            {!isPlausibleSatPerVbyte(fee) &&
+                                                (fee !== '' ||
+                                                    feeRateLookupDone) && (
+                                                    <ErrorMessage
+                                                        message={localeString(
+                                                            'views.Swaps.reverseClaimFeeRateRequired'
+                                                        )}
+                                                    />
+                                                )}
+                                            {/* a usable rate, but a claim quote
+                                                no plausible fee reaches */}
+                                            {isPlausibleSatPerVbyte(fee) &&
+                                                SwapStore.getReverseClaimMinerFee(
+                                                    fee
+                                                ) === undefined && (
+                                                    <ErrorMessage
+                                                        message={localeString(
+                                                            'views.Swaps.invalidReverseSwapResponse'
+                                                        )}
+                                                    />
+                                                )}
+                                            {feeSettingToggle && (
+                                                <>
+                                                    <Text
+                                                        style={{
+                                                            color: themeColor(
+                                                                'secondaryText'
+                                                            )
+                                                        }}
+                                                    >
+                                                        {localeString(
+                                                            'views.Send.feeSatsVbyte'
+                                                        )}
+                                                    </Text>
+                                                    <OnchainFeeInput
+                                                        fee={fee}
+                                                        onChangeFee={(
+                                                            text: string
+                                                        ) =>
+                                                            this.setState({
+                                                                fee: text
+                                                            })
+                                                        }
+                                                        onNavigateAway={
+                                                            this
+                                                                .markNavigatingAway
+                                                        }
+                                                        navigation={navigation}
+                                                    />
+                                                </>
+                                            )}
+                                        </View>
+                                    )}
+
+                                    <View>
+                                        <Button
+                                            title={localeString(
+                                                'views.Swaps.initiate'
+                                            )}
+                                            onPress={async () => {
+                                                if (!reverse) {
+                                                    SwapStore?.createSubmarineSwap(
+                                                        invoice,
+                                                        navigation
+                                                    );
+                                                    return;
+                                                }
+                                                const result =
+                                                    await SwapStore?.createReverseSwap(
+                                                        invoice,
+                                                        Number(
+                                                            this.state.inputSats
+                                                        ),
+                                                        this.state.fee,
+                                                        navigation
+                                                    );
+                                                if (result === 'fees-changed') {
+                                                    this.refreshAmountsForNewQuote();
+                                                }
+                                            }}
+                                            {...(!reverse
+                                                ? {
+                                                      containerStyle: {
+                                                          marginTop: 10
+                                                      }
+                                                  }
+                                                : {})}
+                                            disabled={!isValid}
+                                        />
+                                    </View>
+                                </>
+                            )}
+                        </View>
+                    </ScrollView>
+                </KeyboardAvoidingView>
+            </Screen>
+        );
+    }
+}
