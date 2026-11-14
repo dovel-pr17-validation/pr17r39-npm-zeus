@@ -94,7 +94,7 @@
     "bip32": "5.0.1",
     "bitcoinjs-lib": "6.1.5",
     "bs58check": "4.0.0",
-    "buffer": "5.7.1",
+    "buffer": "6.0.3",
     "create-hash": "1.2.0",
     "crypto-js": "4.2.0",
     "dateformat": "5.0.5",
